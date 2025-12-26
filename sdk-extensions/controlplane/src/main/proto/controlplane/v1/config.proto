@@ -1,0 +1,137 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package io.opentelemetry.extension.controlplane.proto.v1;
+
+option java_package = "io.opentelemetry.sdk.extension.controlplane.proto.v1";
+option java_outer_classname = "ConfigProtos";
+
+import "controlplane/v1/common.proto";
+
+// 配置拉取请求
+message ConfigRequest {
+  // Agent 身份标识
+  AgentIdentity agent_identity = 1;
+  
+  // 当前配置版本 (首次请求为空)
+  ConfigVersion current_version = 2;
+  
+  // 长轮询超时时间 (毫秒)
+  int64 long_poll_timeout_millis = 3;
+}
+
+// 配置拉取响应
+message ConfigResponse {
+  // 响应状态
+  ResponseStatus status = 1;
+  
+  // 配置内容 (如果有变更)
+  AgentConfig config = 2;
+  
+  // 是否有配置变更
+  bool has_changes = 3;
+  
+  // 下次轮询建议间隔 (毫秒)
+  int64 suggested_poll_interval_millis = 4;
+}
+
+// Agent 配置 (所有字段均支持热更新)
+message AgentConfig {
+  // 配置版本
+  ConfigVersion version = 1;
+  
+  // 采样配置
+  SamplerConfig sampler = 2;
+  
+  // 批处理配置
+  BatchConfig batch = 3;
+  
+  // 动态资源属性
+  map<string, string> dynamic_resource_attributes = 4;
+  
+  // 扩展配置 (JSON 格式)
+  string extension_config_json = 5;
+}
+
+// 采样配置
+message SamplerConfig {
+  // 采样器类型
+  enum SamplerType {
+    SAMPLER_TYPE_UNSPECIFIED = 0;
+    SAMPLER_TYPE_ALWAYS_ON = 1;
+    SAMPLER_TYPE_ALWAYS_OFF = 2;
+    SAMPLER_TYPE_TRACE_ID_RATIO = 3;
+    SAMPLER_TYPE_PARENT_BASED = 4;
+    SAMPLER_TYPE_RULE_BASED = 5;
+  }
+  
+  SamplerType type = 1;
+  
+  // 采样率 (0.0 ~ 1.0)
+  double ratio = 2;
+  
+  // 采样规则
+  repeated SamplerRule rules = 3;
+}
+
+// 采样规则
+message SamplerRule {
+  // 规则名称
+  string name = 1;
+  
+  // Span 名称匹配模式 (正则表达式)
+  string span_name_pattern = 2;
+  
+  // 属性匹配条件
+  map<string, string> attribute_match = 3;
+  
+  // 命中规则的采样率
+  double ratio = 4;
+  
+  // 规则优先级 (数值越大优先级越高)
+  int32 priority = 5;
+}
+
+// 批处理配置
+message BatchConfig {
+  // 批处理大小
+  int32 max_export_batch_size = 1;
+  
+  // 队列大小
+  int32 max_queue_size = 2;
+  
+  // 调度延迟 (毫秒)
+  int64 schedule_delay_millis = 3;
+  
+  // 导出超时 (毫秒)
+  int64 export_timeout_millis = 4;
+}
+
+// 配置确认请求 (通过状态上报实现)
+message ConfigAcknowledgement {
+  // 配置版本
+  string config_version = 1;
+  
+  // 确认状态
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_APPLIED = 1;      // 完全生效
+    STATUS_PARTIAL = 2;      // 部分生效
+    STATUS_FAILED = 3;       // 应用失败
+  }
+  
+  Status status = 2;
+  
+  // 已生效的配置字段
+  repeated string applied_fields = 3;
+  
+  // 失败的配置字段
+  repeated string failed_fields = 4;
+  
+  // 错误信息
+  string error_message = 5;
+}

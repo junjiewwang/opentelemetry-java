@@ -69,6 +69,9 @@ include(":sdk-extensions:autoconfigure")
 include(":sdk-extensions:autoconfigure-spi")
 include(":sdk-extensions:incubator")
 include(":sdk-extensions:jaeger-remote-sampler")
+// ===== Custom Control Plane Extension (START) =====
+include(":sdk-extensions:controlplane")
+// ===== Custom Control Plane Extension (END) =====
 include(":testing-internal")
 include(":animal-sniffer-signature")
 
