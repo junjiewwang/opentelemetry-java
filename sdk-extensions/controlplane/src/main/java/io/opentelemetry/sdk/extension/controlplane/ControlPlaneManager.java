@@ -20,6 +20,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -61,16 +62,25 @@ public final class ControlPlaneManager implements Closeable {
   // 连接状态
   private final AtomicReference<ConnectionState> connectionState;
 
+  // 统计计数器
+  private final AtomicLong configPollCount = new AtomicLong(0);
+  private final AtomicLong taskPollCount = new AtomicLong(0);
+  private final AtomicLong statusReportCount = new AtomicLong(0);
+  private final AtomicLong lastStatusLogTime = new AtomicLong(0);
+  private static final long STATUS_LOG_INTERVAL_MS = 60_000; // 每分钟输出一次状态日志
+
   /** Connection state. */
   public enum ConnectionState {
-    /** Connected. */
+    /** Connected - successfully communicated with control plane server. */
     CONNECTED,
-    /** Connecting. */
+    /** Connecting - attempting to connect but not yet verified. */
     CONNECTING,
-    /** Disconnected. */
+    /** Disconnected - connection failed or not started. */
     DISCONNECTED,
-    /** Waiting for OTLP recovery. */
-    WAITING_FOR_OTLP
+    /** Waiting for OTLP recovery - paused due to OTLP health issues. */
+    WAITING_FOR_OTLP,
+    /** Server unavailable - server endpoint exists but control plane API not available. */
+    SERVER_UNAVAILABLE
   }
 
   private ControlPlaneManager(Builder builder) {
@@ -232,6 +242,10 @@ public final class ControlPlaneManager implements Closeable {
 
   private void scheduleConfigPoll() {
     long intervalMillis = config.getConfigPollInterval().toMillis();
+    logger.log(
+        Level.INFO,
+        "Scheduling config poll task with interval: {0}ms",
+        intervalMillis);
     configPollTask =
         scheduler.scheduleWithFixedDelay(
             this::pollConfig, 0, intervalMillis, TimeUnit.MILLISECONDS);
@@ -239,6 +253,10 @@ public final class ControlPlaneManager implements Closeable {
 
   private void scheduleTaskPoll() {
     long intervalMillis = config.getTaskPollInterval().toMillis();
+    logger.log(
+        Level.INFO,
+        "Scheduling task poll task with interval: {0}ms",
+        intervalMillis);
     taskPollTask =
         scheduler.scheduleWithFixedDelay(
             this::pollTasks, 1000, intervalMillis, TimeUnit.MILLISECONDS);
@@ -246,6 +264,10 @@ public final class ControlPlaneManager implements Closeable {
 
   private void scheduleStatusReport() {
     long intervalMillis = config.getStatusReportInterval().toMillis();
+    logger.log(
+        Level.INFO,
+        "Scheduling status report task with interval: {0}ms",
+        intervalMillis);
     statusReportTask =
         scheduler.scheduleWithFixedDelay(
             this::reportStatus, 5000, intervalMillis, TimeUnit.MILLISECONDS);
@@ -253,51 +275,93 @@ public final class ControlPlaneManager implements Closeable {
 
   private void scheduleCleanup() {
     // 每小时清理一次过期结果
+    logger.log(Level.INFO, "Scheduling cleanup task with interval: 1 hour");
     cleanupTask =
         scheduler.scheduleWithFixedDelay(
             () -> resultPersistence.cleanupExpired(), 1, 1, TimeUnit.HOURS);
   }
 
   private void pollConfig() {
+    long count = configPollCount.incrementAndGet();
     if (!shouldConnect()) {
+      logPeriodicStatus();
       return;
     }
 
     try {
-      // TODO: 实现配置轮询逻辑
-      logger.log(Level.FINE, "Polling config...");
+      logger.log(Level.FINE, "Polling config (count: {0})...", count);
 
-      // 更新连接状态
-      connectionState.set(ConnectionState.CONNECTED);
+      // 尝试从控制平面获取配置
+      boolean success = client.fetchConfig();
+
+      if (success) {
+        // 请求成功，更新连接状态为 CONNECTED
+        ConnectionState previousState = connectionState.getAndSet(ConnectionState.CONNECTED);
+        if (previousState != ConnectionState.CONNECTED) {
+          logger.log(
+              Level.INFO,
+              "Control plane connected, state changed: {0} -> CONNECTED",
+              previousState);
+        }
+      } else {
+        // 请求失败（如 404、500 等），说明服务端不可用
+        ConnectionState previousState = connectionState.get();
+        if (previousState != ConnectionState.SERVER_UNAVAILABLE) {
+          connectionState.set(ConnectionState.SERVER_UNAVAILABLE);
+          logger.log(
+              Level.WARNING,
+              "Control plane server unavailable (API endpoint may not exist), state changed: {0} -> SERVER_UNAVAILABLE",
+              previousState);
+        }
+      }
+      logPeriodicStatus();
     } catch (RuntimeException e) {
-      logger.log(Level.WARNING, "Failed to poll config", e);
-      connectionState.set(ConnectionState.DISCONNECTED);
+      ConnectionState previousState = connectionState.getAndSet(ConnectionState.DISCONNECTED);
+      logger.log(
+          Level.WARNING,
+          "Failed to poll config (count: {0}, state: {1} -> DISCONNECTED): {2}",
+          new Object[] {count, previousState, e.getMessage()});
     }
   }
 
   private void pollTasks() {
-    if (!shouldConnect()) {
+    long count = taskPollCount.incrementAndGet();
+    // 只有在 CONNECTED 状态才轮询任务
+    if (connectionState.get() != ConnectionState.CONNECTED) {
+      logger.log(
+          Level.FINE,
+          "Skip task poll (count: {0}), not connected (state: {1})",
+          new Object[] {count, connectionState.get()});
       return;
     }
 
     try {
+      logger.log(Level.FINE, "Polling tasks (count: {0})...", count);
       // TODO: 实现任务轮询逻辑
-      logger.log(Level.FINE, "Polling tasks...");
+      // client.fetchTasks();
     } catch (RuntimeException e) {
-      logger.log(Level.WARNING, "Failed to poll tasks", e);
+      logger.log(
+          Level.WARNING,
+          "Failed to poll tasks (count: {0}): {1}",
+          new Object[] {count, e.getMessage()});
     }
   }
 
   private void reportStatus() {
+    long count = statusReportCount.incrementAndGet();
     try {
-      // 状态上报不依赖 OTLP 健康状态
+      // 状态上报不依赖连接状态，即使 SERVER_UNAVAILABLE 也尝试上报
+      logger.log(Level.FINE, "Reporting status (count: {0})...", count);
       // TODO: 实现状态上报逻辑
-      logger.log(Level.FINE, "Reporting status...");
+      // client.reportStatus(agentIdentity, connectionState.get(), healthMonitor.getState());
 
       // 重传失败的任务结果
       retryFailedResults();
     } catch (RuntimeException e) {
-      logger.log(Level.WARNING, "Failed to report status", e);
+      logger.log(
+          Level.WARNING,
+          "Failed to report status (count: {0}): {1}",
+          new Object[] {count, e.getMessage()});
     }
   }
 
@@ -321,16 +385,37 @@ public final class ControlPlaneManager implements Closeable {
   private boolean shouldConnect() {
     // 检查 OTLP 健康状态
     if (!healthMonitor.isHealthy()) {
-      if (connectionState.get() != ConnectionState.WAITING_FOR_OTLP) {
+      ConnectionState previousState = connectionState.get();
+      if (previousState != ConnectionState.WAITING_FOR_OTLP) {
         connectionState.set(ConnectionState.WAITING_FOR_OTLP);
         logger.log(
             Level.INFO,
-            "OTLP is not healthy, waiting for recovery before connecting to control plane");
+            "OTLP is not healthy (state: {0}), waiting for recovery before connecting to control plane",
+healthMonitor.getState());
       }
       return false;
     }
 
     return true;
+  }
+
+  /** 周期性输出状态日志，便于观察控制平面运行情况 */
+  private void logPeriodicStatus() {
+    long now = System.currentTimeMillis();
+    long lastLog = lastStatusLogTime.get();
+    if (now - lastLog >= STATUS_LOG_INTERVAL_MS && lastStatusLogTime.compareAndSet(lastLog, now)) {
+      logger.log(
+          Level.INFO,
+          "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlpHealth: {4}, endpoint: {5}",
+          new Object[] {
+            connectionState.get(),
+            configPollCount.get(),
+            taskPollCount.get(),
+            statusReportCount.get(),
+            healthMonitor.getState(),
+            config.getEndpoint()
+          });
+    }
   }
 
   private void onOtlpHealthStateChanged(

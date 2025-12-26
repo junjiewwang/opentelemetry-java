@@ -175,6 +175,18 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
   }
 
   @Override
+  public boolean fetchConfig() {
+    if (closed.get()) {
+      logger.log(Level.WARNING, "Cannot fetch config: client is closed");
+      return false;
+    }
+
+    // gRPC 尚未实现，返回 false
+    logger.log(Level.WARNING, "gRPC fetchConfig not implemented yet");
+    return false;
+  }
+
+  @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {
       if (managedChannel != null) {

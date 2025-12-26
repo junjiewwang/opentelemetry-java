@@ -180,6 +180,54 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
   }
 
   @Override
+  public boolean fetchConfig() {
+    if (closed.get()) {
+      logger.log(Level.WARNING, "Cannot fetch config: client is closed");
+      return false;
+    }
+
+    // 构建一个简单的 ping 请求来验证连接
+    Request httpRequest =
+        new Request.Builder()
+            .url(baseUrl + "/config")
+            .get()
+            .header(HEADER_ACCEPT_ENCODING, GZIP)
+            .build();
+
+    try (Response response = httpClient.newCall(httpRequest).execute()) {
+      int code = response.code();
+      if (response.isSuccessful()) {
+        logger.log(Level.FINE, "Control plane config fetch successful (HTTP {0})", code);
+        return true;
+      } else if (code == 404) {
+        // API 端点不存在
+        logger.log(
+            Level.WARNING,
+            "Control plane API endpoint not found (HTTP 404), server may not support control plane");
+        return false;
+      } else if (code >= 500) {
+        // 服务器错误
+        logger.log(Level.WARNING, "Control plane server error (HTTP {0})", code);
+        return false;
+      } else {
+        // 其他错误（如 401, 403 等）
+        logger.log(
+            Level.WARNING,
+            "Control plane request failed (HTTP {0}): {1}",
+            new Object[] {code, response.message()});
+        return false;
+      }
+    } catch (IOException e) {
+      // 网络错误
+      logger.log(
+          Level.WARNING,
+          "Control plane connection failed: {0}",
+          e.getMessage());
+      return false;
+    }
+  }
+
+  @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {
       httpClient.dispatcher().executorService().shutdown();

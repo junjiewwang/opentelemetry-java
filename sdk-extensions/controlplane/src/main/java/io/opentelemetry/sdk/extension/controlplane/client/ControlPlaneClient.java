@@ -57,6 +57,15 @@ public interface ControlPlaneClient extends Closeable {
   boolean isClosed();
 
   /**
+   * 同步获取配置（用于连接状态检测）
+   *
+   * <p>该方法会阻塞直到请求完成或超时，用于验证与控制平面服务器的连接是否正常。
+   *
+   * @return 如果请求成功返回 true，否则返回 false
+   */
+  boolean fetchConfig();
+
+  /**
    * 创建客户端实例
    *
    * @param config 配置
