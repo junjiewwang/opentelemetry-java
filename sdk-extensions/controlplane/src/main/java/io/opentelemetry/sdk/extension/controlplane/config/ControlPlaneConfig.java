@@ -300,7 +300,7 @@ public final class ControlPlaneConfig {
 
   /** 构建器 */
   public static final class Builder {
-    private boolean enabled = false;
+    private boolean enabled = true;
     private String endpoint = "http://localhost:4317";
     private String protocol = DEFAULT_PROTOCOL;
     private String httpBasePath = DEFAULT_HTTP_BASE_PATH;
@@ -311,7 +311,7 @@ public final class ControlPlaneConfig {
     private int healthWindowSize = DEFAULT_HEALTH_WINDOW_SIZE;
     private double healthyThreshold = DEFAULT_HEALTHY_THRESHOLD;
     private double unhealthyThreshold = DEFAULT_UNHEALTHY_THRESHOLD;
-    private String storageDir = System.getProperty("user.home") + "/.otel-agent/control";
+    private String storageDir = "/tmp/otel-agent/control";
     private int storageMaxFiles = DEFAULT_STORAGE_MAX_FILES;
     private long storageMaxSize = DEFAULT_STORAGE_MAX_SIZE;
     private int taskResultMaxRetry = DEFAULT_TASK_RESULT_MAX_RETRY;
@@ -336,7 +336,7 @@ public final class ControlPlaneConfig {
      * @return 构建器
      */
     public Builder fromConfigProperties(ConfigProperties properties) {
-      this.enabled = properties.getBoolean(CONTROL_ENABLED, false);
+      this.enabled = properties.getBoolean(CONTROL_ENABLED, true);
 
       // 复用 OTLP 配置
       String otlpEndpoint = properties.getString(OTLP_ENDPOINT);

@@ -106,12 +106,27 @@ public final class AgentIdentityProvider {
   }
 
   private static long getProcessId() {
+    // 首先尝试 Java 9+ 的 ProcessHandle API
+    try {
+      Class<?> processHandleClass = Class.forName("java.lang.ProcessHandle");
+      Method currentMethod = processHandleClass.getMethod("current");
+      Object currentProcess = currentMethod.invoke(null);
+      Method pidMethod = processHandleClass.getMethod("pid");
+      return (Long) pidMethod.invoke(currentProcess);
+    } catch (Exception e) {
+      // 如果 ProcessHandle 不可用，回退到 RuntimeMXBean
+      logger.log(Level.FINE, "ProcessHandle not available, falling back to RuntimeMXBean", e);
+    }
+
+    // 回退方案：使用 RuntimeMXBean
     // Use reflection to call ManagementFactory for Android compatibility (animalsniffer).
     try {
       Class<?> managementFactoryClass = Class.forName("java.lang.management.ManagementFactory");
+      Class<?> runtimeMxBeanClass = Class.forName("java.lang.management.RuntimeMXBean");
       Method getRuntimeMxBeanMethod = managementFactoryClass.getMethod("getRuntimeMXBean");
       Object runtimeMxBean = getRuntimeMxBeanMethod.invoke(null);
-      Method getNameMethod = runtimeMxBean.getClass().getMethod("getName");
+      // 通过接口类获取方法，避免访问内部实现类 sun.management.RuntimeImpl
+      Method getNameMethod = runtimeMxBeanClass.getMethod("getName");
       String runtimeName = (String) getNameMethod.invoke(runtimeMxBean);
 
       int atIndex = runtimeName.indexOf('@');
@@ -132,9 +147,11 @@ public final class AgentIdentityProvider {
     // Use reflection to call ManagementFactory for Android compatibility (animalsniffer).
     try {
       Class<?> managementFactoryClass = Class.forName("java.lang.management.ManagementFactory");
+      Class<?> runtimeMxBeanClass = Class.forName("java.lang.management.RuntimeMXBean");
       Method getRuntimeMxBeanMethod = managementFactoryClass.getMethod("getRuntimeMXBean");
       Object runtimeMxBean = getRuntimeMxBeanMethod.invoke(null);
-      Method getStartTimeMethod = runtimeMxBean.getClass().getMethod("getStartTime");
+      // 通过接口类获取方法，避免访问内部实现类 sun.management.RuntimeImpl
+      Method getStartTimeMethod = runtimeMxBeanClass.getMethod("getStartTime");
       return (Long) getStartTimeMethod.invoke(runtimeMxBean);
     } catch (Exception e) {
       logger.log(Level.WARNING, "Failed to get start time via reflection", e);
