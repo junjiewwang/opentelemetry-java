@@ -29,18 +29,26 @@ final class HealthMonitoringSpanExporter implements SpanExporter {
   HealthMonitoringSpanExporter(SpanExporter delegate, OtlpHealthMonitor healthMonitor) {
     this.delegate = delegate;
     this.healthMonitor = healthMonitor;
+    logger.log(
+        Level.INFO,
+        "HealthMonitoringSpanExporter created, wrapping: {0}",
+        delegate.getClass().getName());
   }
 
   @Override
   public CompletableResultCode export(Collection<SpanData> spans) {
+    logger.log(Level.FINE, "HealthMonitoringSpanExporter.export() called with {0} spans", spans.size());
+    
     CompletableResultCode result = delegate.export(spans);
 
     result.whenComplete(
         () -> {
           if (result.isSuccess()) {
             healthMonitor.recordSuccess();
+            logger.log(Level.FINE, "Export succeeded, recorded success");
           } else {
             healthMonitor.recordFailure("Export failed");
+            logger.log(Level.FINE, "Export failed, recorded failure");
           }
         });
 

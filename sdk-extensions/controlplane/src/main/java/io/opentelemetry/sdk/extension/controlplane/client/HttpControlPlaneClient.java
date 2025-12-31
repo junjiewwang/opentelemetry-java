@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.zip.GZIPInputStream;
+import javax.annotation.Nullable;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.MediaType;
@@ -47,6 +48,9 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
   private final String baseUrl;
   private final AtomicBoolean closed;
 
+  // 缓存的 Authorization Header（final，启动时设置）
+  @Nullable private final String authorizationHeader;
+
   /**
    * 创建 HTTP 控制平面客户端
    *
@@ -58,6 +62,9 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     this.baseUrl = config.getControlPlaneUrl();
     this.closed = new AtomicBoolean(false);
 
+    // 直接从 config 获取预解析的 Authorization Header
+    this.authorizationHeader = config.getAuthorizationHeader();
+
     // 构建 OkHttpClient，支持长轮询超时
     Duration longPollTimeout = config.getLongPollTimeout();
     this.httpClient =
@@ -68,7 +75,17 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
             .retryOnConnectionFailure(true)
             .build();
 
-    logger.log(Level.INFO, "HTTP Control Plane client initialized, baseUrl: {0}", baseUrl);
+    if (this.authorizationHeader != null) {
+      logger.log(
+          Level.INFO,
+          "HTTP Control Plane client initialized with authentication, baseUrl: {0}, tokenSource: {1}",
+          new Object[] {baseUrl, config.getAuthTokenSource()});
+    } else {
+      logger.log(
+          Level.INFO,
+          "HTTP Control Plane client initialized without authentication, baseUrl: {0}",
+          baseUrl);
+    }
   }
 
   @Override
@@ -82,11 +99,8 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = serializeConfigRequest(request);
 
     Request httpRequest =
-        new Request.Builder()
-            .url(baseUrl + "/config")
+        buildRequest(baseUrl + "/config")
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
-            .header("Content-Type", "application/x-protobuf")
-            .header(HEADER_ACCEPT_ENCODING, GZIP)
             .build();
 
     executeAsync(
@@ -108,11 +122,8 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = serializeTaskRequest(request);
 
     Request httpRequest =
-        new Request.Builder()
-            .url(baseUrl + "/tasks")
+        buildRequest(baseUrl + "/tasks")
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
-            .header("Content-Type", "application/x-protobuf")
-            .header(HEADER_ACCEPT_ENCODING, GZIP)
             .build();
 
     executeAsync(
@@ -134,11 +145,8 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = request.getStatusData();
 
     Request httpRequest =
-        new Request.Builder()
-            .url(baseUrl + "/status")
+        buildRequest(baseUrl + "/status")
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
-            .header("Content-Type", "application/x-protobuf")
-            .header(HEADER_ACCEPT_ENCODING, GZIP)
             .build();
 
     executeAsync(
@@ -159,10 +167,8 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = serializeChunkedTaskResult(chunk);
 
     Request httpRequest =
-        new Request.Builder()
-            .url(baseUrl + "/upload-chunk")
+        buildRequest(baseUrl + "/upload-chunk")
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
-            .header("Content-Type", "application/x-protobuf")
             .build();
 
     executeAsync(
@@ -186,12 +192,12 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
       return false;
     }
 
-    // 构建一个简单的 ping 请求来验证连接
+    // 构建 POST 请求来获取配置（服务端只支持 POST 方法）
+    // 使用空的请求体作为简单的连接检查
+    String emptyRequest = "{}";
     Request httpRequest =
-        new Request.Builder()
-            .url(baseUrl + "/config")
-            .get()
-            .header(HEADER_ACCEPT_ENCODING, GZIP)
+        buildRequest(baseUrl + "/config")
+            .post(RequestBody.create(emptyRequest.getBytes(StandardCharsets.UTF_8), PROTOBUF_TYPE))
             .build();
 
     try (Response response = httpClient.newCall(httpRequest).execute()) {
@@ -204,6 +210,12 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
         logger.log(
             Level.WARNING,
             "Control plane API endpoint not found (HTTP 404), server may not support control plane");
+        return false;
+      } else if (code == 405) {
+        // 方法不允许（理论上不应该再出现此错误）
+        logger.log(
+            Level.WARNING,
+            "Control plane API method not allowed (HTTP 405), please check server configuration");
         return false;
       } else if (code >= 500) {
         // 服务器错误
@@ -257,6 +269,27 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
           "OTLP is not healthy, control plane request may be delayed. State: {0}",
           healthMonitor.getState());
     }
+  }
+
+  /**
+   * 构建带鉴权的 Request.Builder
+   *
+   * @param url 请求 URL
+   * @return 配置好的 Request.Builder
+   */
+  private Request.Builder buildRequest(String url) {
+    Request.Builder builder =
+        new Request.Builder()
+            .url(url)
+            .header("Content-Type", "application/x-protobuf")
+            .header(HEADER_ACCEPT_ENCODING, GZIP);
+
+    // 添加缓存的 Authorization Header
+    if (authorizationHeader != null) {
+      builder.header("Authorization", authorizationHeader);
+    }
+
+    return builder;
   }
 
   private <T> void executeAsync(

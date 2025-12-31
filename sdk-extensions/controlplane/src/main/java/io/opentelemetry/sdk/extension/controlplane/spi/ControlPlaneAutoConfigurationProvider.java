@@ -108,6 +108,11 @@ public final class ControlPlaneAutoConfigurationProvider
   private static SpanExporter wrapExporterWithHealthMonitor(
       SpanExporter exporter, ConfigProperties config) {
 
+    logger.log(
+        Level.INFO,
+        "Wrapping SpanExporter with HealthMonitoringSpanExporter: {0}",
+        exporter.getClass().getName());
+
     // 创建健康监控器 (如果尚未创建)
     if (healthMonitor == null) {
       synchronized (ControlPlaneAutoConfigurationProvider.class) {
@@ -118,6 +123,14 @@ public final class ControlPlaneAutoConfigurationProvider
                   controlConfig.getHealthWindowSize(),
                   controlConfig.getHealthyThreshold(),
                   controlConfig.getUnhealthyThreshold());
+          logger.log(
+              Level.INFO,
+              "Created OtlpHealthMonitor with windowSize={0}, healthyThreshold={1}, unhealthyThreshold={2}",
+              new Object[] {
+                controlConfig.getHealthWindowSize(),
+                controlConfig.getHealthyThreshold(),
+                controlConfig.getUnhealthyThreshold()
+              });
         }
       }
     }

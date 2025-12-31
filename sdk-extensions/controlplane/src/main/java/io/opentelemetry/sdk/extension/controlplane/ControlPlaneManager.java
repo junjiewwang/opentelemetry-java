@@ -11,9 +11,17 @@ import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
+import io.opentelemetry.sdk.extension.controlplane.status.AgentStatusAggregator;
+import io.opentelemetry.sdk.extension.controlplane.status.ControlPlaneStateCollector;
+import io.opentelemetry.sdk.extension.controlplane.status.HeartbeatReporter;
+import io.opentelemetry.sdk.extension.controlplane.status.IdentityCollector;
+import io.opentelemetry.sdk.extension.controlplane.status.OtlpHealthCollector;
+import io.opentelemetry.sdk.extension.controlplane.status.SystemResourceCollector;
+import io.opentelemetry.sdk.extension.controlplane.status.UptimeCollector;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -49,6 +57,12 @@ public final class ControlPlaneManager implements Closeable {
   private final DynamicSampler dynamicSampler;
   private final TaskResultPersistence resultPersistence;
   private final AgentIdentityProvider.AgentIdentity agentIdentity;
+
+  // 状态收集和心跳上报
+  private final AgentStatusAggregator statusAggregator;
+  private final HeartbeatReporter heartbeatReporter;
+  private final ControlPlaneStateCollector controlPlaneStateCollector;
+  private final UptimeCollector uptimeCollector;
 
   private final ScheduledExecutorService scheduler;
   private final AtomicBoolean started;
@@ -107,6 +121,22 @@ public final class ControlPlaneManager implements Closeable {
     this.closed = new AtomicBoolean(false);
     this.connectionState = new AtomicReference<>(ConnectionState.DISCONNECTED);
 
+    // 初始化状态收集器
+    this.statusAggregator = new AgentStatusAggregator();
+    this.controlPlaneStateCollector = new ControlPlaneStateCollector();
+    this.uptimeCollector = new UptimeCollector();
+    initializeStatusCollectors();
+
+    // 初始化心跳上报器
+    this.heartbeatReporter =
+        HeartbeatReporter.builder()
+            .setConfig(this.config)
+            .setClient(this.client)
+            .setStatusAggregator(this.statusAggregator)
+            .setScheduler(this.scheduler)
+            .setListener(this::onHeartbeatComplete)
+            .build();
+
     // 注册健康状态监听器
     this.healthMonitor.addListener(this::onOtlpHealthStateChanged);
   }
@@ -118,6 +148,21 @@ public final class ControlPlaneManager implements Closeable {
    */
   public static Builder builder() {
     return new Builder();
+  }
+
+  /** 初始化状态收集器 */
+  private void initializeStatusCollectors() {
+    // 按优先级注册收集器
+    statusAggregator.registerCollector(new IdentityCollector());        // 优先级 0
+    statusAggregator.registerCollector(uptimeCollector);                 // 优先级 10
+    statusAggregator.registerCollector(controlPlaneStateCollector);      // 优先级 15
+    statusAggregator.registerCollector(new OtlpHealthCollector(healthMonitor)); // 优先级 20
+    statusAggregator.registerCollector(new SystemResourceCollector(config.isIncludeSystemResource())); // 优先级 30
+
+    logger.log(
+        Level.FINE,
+        "Initialized {0} status collectors: {1}",
+        new Object[] {statusAggregator.getCollectorCount(), statusAggregator.getCollectorNames()});
   }
 
   /** Starts the control plane manager. */
@@ -153,6 +198,9 @@ public final class ControlPlaneManager implements Closeable {
     // 启动清理任务
     scheduleCleanup();
 
+    // 启动心跳上报
+    heartbeatReporter.start();
+
     connectionState.set(ConnectionState.CONNECTING);
     logger.log(Level.INFO, "Control plane manager started");
   }
@@ -179,6 +227,12 @@ public final class ControlPlaneManager implements Closeable {
       cleanupTask.cancel(false);
     }
 
+    // 停止心跳上报
+    heartbeatReporter.stop();
+
+    // 更新运行状态
+    uptimeCollector.setRunningState(UptimeCollector.RunningState.STOPPED);
+
     connectionState.set(ConnectionState.DISCONNECTED);
     logger.log(Level.INFO, "Control plane manager stopped");
   }
@@ -198,6 +252,7 @@ public final class ControlPlaneManager implements Closeable {
         scheduler.shutdownNow();
       }
 
+      heartbeatReporter.close();
       client.close();
       logger.log(Level.INFO, "Control plane manager closed");
     }
@@ -238,6 +293,24 @@ public final class ControlPlaneManager implements Closeable {
    */
   public DynamicSampler getDynamicSampler() {
     return dynamicSampler;
+  }
+
+  /**
+   * Gets the status aggregator.
+   *
+   * @return the status aggregator
+   */
+  public AgentStatusAggregator getStatusAggregator() {
+    return statusAggregator;
+  }
+
+  /**
+   * Gets the heartbeat reporter.
+   *
+   * @return the heartbeat reporter
+   */
+  public HeartbeatReporter getHeartbeatReporter() {
+    return heartbeatReporter;
   }
 
   private void scheduleConfigPoll() {
@@ -283,6 +356,7 @@ public final class ControlPlaneManager implements Closeable {
 
   private void pollConfig() {
     long count = configPollCount.incrementAndGet();
+    controlPlaneStateCollector.setConfigPollCount(count);
     if (!shouldConnect()) {
       logPeriodicStatus();
       return;
@@ -297,6 +371,8 @@ public final class ControlPlaneManager implements Closeable {
       if (success) {
         // 请求成功，更新连接状态为 CONNECTED
         ConnectionState previousState = connectionState.getAndSet(ConnectionState.CONNECTED);
+        controlPlaneStateCollector.setConnectionState(ConnectionState.CONNECTED.name());
+        controlPlaneStateCollector.recordConfigFetch();
         if (previousState != ConnectionState.CONNECTED) {
           logger.log(
               Level.INFO,
@@ -308,6 +384,7 @@ public final class ControlPlaneManager implements Closeable {
         ConnectionState previousState = connectionState.get();
         if (previousState != ConnectionState.SERVER_UNAVAILABLE) {
           connectionState.set(ConnectionState.SERVER_UNAVAILABLE);
+          controlPlaneStateCollector.setConnectionState(ConnectionState.SERVER_UNAVAILABLE.name());
           logger.log(
               Level.WARNING,
               "Control plane server unavailable (API endpoint may not exist), state changed: {0} -> SERVER_UNAVAILABLE",
@@ -326,6 +403,7 @@ public final class ControlPlaneManager implements Closeable {
 
   private void pollTasks() {
     long count = taskPollCount.incrementAndGet();
+    controlPlaneStateCollector.setTaskPollCount(count);
     // 只有在 CONNECTED 状态才轮询任务
     if (connectionState.get() != ConnectionState.CONNECTED) {
       logger.log(
@@ -349,6 +427,7 @@ public final class ControlPlaneManager implements Closeable {
 
   private void reportStatus() {
     long count = statusReportCount.incrementAndGet();
+    controlPlaneStateCollector.setStatusReportCount(count);
     try {
       // 状态上报不依赖连接状态，即使 SERVER_UNAVAILABLE 也尝试上报
       logger.log(Level.FINE, "Reporting status (count: {0})...", count);
@@ -399,23 +478,64 @@ healthMonitor.getState());
     return true;
   }
 
+  /** 心跳完成回调 */
+  private void onHeartbeatComplete(
+      boolean success,
+      @Nullable java.util.Map<String, Object> statusData,
+      @Nullable String error) {
+    // 更新统计计数（引用实例变量，避免 MethodCanBeStatic 警告）
+    controlPlaneStateCollector.recordStatusReport();
+
+    if (success) {
+      logger.log(Level.FINE, "Heartbeat completed successfully");
+    } else {
+      logger.log(Level.WARNING, "Heartbeat failed: {0}", error);
+    }
+  }
+
   /** 周期性输出状态日志，便于观察控制平面运行情况 */
   private void logPeriodicStatus() {
     long now = System.currentTimeMillis();
     long lastLog = lastStatusLogTime.get();
     if (now - lastLog >= STATUS_LOG_INTERVAL_MS && lastStatusLogTime.compareAndSet(lastLog, now)) {
+      // 构建详细的 OTLP 健康信息
+      String otlpHealthInfo = buildOtlpHealthInfo();
+      
       logger.log(
           Level.INFO,
-          "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlpHealth: {4}, endpoint: {5}",
+          "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlpHealth: [{4}], configUrl: {5}",
           new Object[] {
             connectionState.get(),
             configPollCount.get(),
             taskPollCount.get(),
             statusReportCount.get(),
-            healthMonitor.getState(),
-            config.getEndpoint()
+            otlpHealthInfo,
+            config.getControlPlaneUrl() + "/config"
           });
     }
+  }
+
+  /** 构建详细的 OTLP 健康信息 */
+  private String buildOtlpHealthInfo() {
+    OtlpHealthMonitor.HealthState state = healthMonitor.getState();
+    long successCount = healthMonitor.getSuccessCount();
+    long failureCount = healthMonitor.getFailureCount();
+    double successRate = healthMonitor.getSuccessRate();
+    long totalSamples = successCount + failureCount;
+    
+    // 当没有采样数据时，显示更友好的提示
+    if (totalSamples == 0) {
+      return "state=UNKNOWN, no samples yet (waiting for span exports)";
+    }
+    
+    // 格式: state=HEALTHY, success/fail=95/5, rate=95.0%
+    return String.format(
+        Locale.ROOT,
+        "state=%s, success/fail=%d/%d, rate=%.1f%%",
+        state,
+        successCount,
+        failureCount,
+        successRate * 100);
   }
 
   private void onOtlpHealthStateChanged(
