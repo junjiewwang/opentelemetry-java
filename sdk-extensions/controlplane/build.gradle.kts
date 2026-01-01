@@ -23,6 +23,13 @@ dependencies {
   implementation(project(":exporters:sender:okhttp"))
   implementation("com.squareup.okhttp3:okhttp")
 
+  // JSON 序列化 (用于 Arthas Tunnel 协议)
+  implementation("com.fasterxml.jackson.core:jackson-databind")
+
+  // Arthas 核心依赖
+//  implementation("com.taobao.arthas:arthas-core:4.0.3")
+//  implementation("com.taobao.arthas:arthas-client:4.0.3")
+
   // gRPC 支持（可选）
   compileOnly("io.grpc:grpc-api")
   compileOnly("io.grpc:grpc-protobuf")

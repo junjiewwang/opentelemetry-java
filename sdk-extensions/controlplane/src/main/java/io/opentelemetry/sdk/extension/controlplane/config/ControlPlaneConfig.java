@@ -181,7 +181,7 @@ public final class ControlPlaneConfig {
    *
    * <p>优先级:
    * <ol>
-   *   <li>Resource Attributes 中的 service.auth.token</li>
+   *   <li>Resource Attributes 中的 token</li>
    *   <li>OTLP Headers 中的 Authorization</li>
    * </ol>
    *
@@ -191,10 +191,10 @@ public final class ControlPlaneConfig {
    */
   private static AuthTokenResult resolveAuthToken(
       @Nullable String resourceAttributes, @Nullable String otlpHeaders) {
-    // 优先级 1: Resource Attributes 中的 service.auth.token
+    // 优先级 1: Resource Attributes 中的 token
     String token = extractTokenFromResourceAttributes(resourceAttributes);
     if (token != null && !token.isEmpty()) {
-      return new AuthTokenResult(token, "resource.attributes[service.auth.token]");
+      return new AuthTokenResult(token, "resource.attributes[token]");
     }
 
     // 优先级 2: OTLP Headers 中的 Authorization

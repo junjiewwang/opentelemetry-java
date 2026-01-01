@@ -5,8 +5,20 @@
 
 package io.opentelemetry.sdk.extension.controlplane;
 
+import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasConfig;
+import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
+import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
+import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
+import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
+import io.opentelemetry.sdk.extension.controlplane.core.HealthCheckCoordinator;
+import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager;
+import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager.TaskConfig;
+import io.opentelemetry.sdk.extension.controlplane.core.tasks.CleanupTask;
+import io.opentelemetry.sdk.extension.controlplane.core.tasks.ConfigPollTask;
+import io.opentelemetry.sdk.extension.controlplane.core.tasks.StatusReportTask;
+import io.opentelemetry.sdk.extension.controlplane.core.tasks.TaskPollTask;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
@@ -21,36 +33,56 @@ import io.opentelemetry.sdk.extension.controlplane.status.UptimeCollector;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.Locale;
+import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
 /**
- * Control plane manager.
+ * 控制平面管理器。
  *
- * <p>Coordinates control plane components including:
+ * <p>作为控制平面的门面（Facade），协调各个子组件的工作，包括：
  *
  * <ul>
  *   <li>配置轮询
  *   <li>任务轮询
  *   <li>状态上报
  *   <li>健康监控
+ *   <li>Arthas 集成
+ * </ul>
+ *
+ * <p>重构后的职责分配：
+ *
+ * <ul>
+ *   <li>{@link ConnectionStateManager} - 连接状态管理
+ *   <li>{@link ScheduledTaskManager} - 调度任务管理
+ *   <li>{@link HealthCheckCoordinator} - 健康检查协调
+ *   <li>{@link ControlPlaneStatistics} - 统计信息管理
  * </ul>
  */
 public final class ControlPlaneManager implements Closeable {
 
   private static final Logger logger = Logger.getLogger(ControlPlaneManager.class.getName());
 
+  // 任务名称常量
+  private static final String TASK_CONFIG_POLL = "config-poll";
+  private static final String TASK_TASK_POLL = "task-poll";
+  private static final String TASK_STATUS_REPORT = "status-report";
+  private static final String TASK_CLEANUP = "cleanup";
+
+  // 配置
   private final ControlPlaneConfig config;
+
+  // 核心组件
+  private final ConnectionStateManager connectionStateManager;
+  private final ScheduledTaskManager taskManager;
+  private final HealthCheckCoordinator healthCheckCoordinator;
+  private final ControlPlaneStatistics statistics;
+
+  // 业务组件
   private final ControlPlaneClient client;
   private final OtlpHealthMonitor healthMonitor;
   private final DynamicConfigManager configManager;
@@ -64,62 +96,29 @@ public final class ControlPlaneManager implements Closeable {
   private final ControlPlaneStateCollector controlPlaneStateCollector;
   private final UptimeCollector uptimeCollector;
 
-  private final ScheduledExecutorService scheduler;
+  // Arthas 集成
+  @Nullable private final ArthasIntegration arthasIntegration;
+
+  // 生命周期状态
   private final AtomicBoolean started;
   private final AtomicBoolean closed;
 
-  @Nullable private ScheduledFuture<?> configPollTask;
-  @Nullable private ScheduledFuture<?> taskPollTask;
-  @Nullable private ScheduledFuture<?> statusReportTask;
-  @Nullable private ScheduledFuture<?> cleanupTask;
-
-  // 连接状态
-  private final AtomicReference<ConnectionState> connectionState;
-
-  // 统计计数器
-  private final AtomicLong configPollCount = new AtomicLong(0);
-  private final AtomicLong taskPollCount = new AtomicLong(0);
-  private final AtomicLong statusReportCount = new AtomicLong(0);
-  private final AtomicLong lastStatusLogTime = new AtomicLong(0);
-  private static final long STATUS_LOG_INTERVAL_MS = 60_000; // 每分钟输出一次状态日志
-
-  /** Connection state. */
-  public enum ConnectionState {
-    /** Connected - successfully communicated with control plane server. */
-    CONNECTED,
-    /** Connecting - attempting to connect but not yet verified. */
-    CONNECTING,
-    /** Disconnected - connection failed or not started. */
-    DISCONNECTED,
-    /** Waiting for OTLP recovery - paused due to OTLP health issues. */
-    WAITING_FOR_OTLP,
-    /** Server unavailable - server endpoint exists but control plane API not available. */
-    SERVER_UNAVAILABLE
-  }
-
   private ControlPlaneManager(Builder builder) {
+    // 验证必需参数
     this.config = Objects.requireNonNull(builder.config, "config is required");
     this.healthMonitor = Objects.requireNonNull(builder.healthMonitor, "healthMonitor is required");
     this.configManager = Objects.requireNonNull(builder.configManager, "configManager is required");
     this.dynamicSampler =
         Objects.requireNonNull(builder.dynamicSampler, "dynamicSampler is required");
+
+    // 初始化核心组件
+    this.connectionStateManager = new ConnectionStateManager();
+    this.taskManager = ScheduledTaskManager.createDefault();
+
+    // 初始化业务组件
     this.resultPersistence = TaskResultPersistence.create(this.config);
     this.agentIdentity = AgentIdentityProvider.get();
-
     this.client = ControlPlaneClient.create(this.config, this.healthMonitor);
-
-    this.scheduler =
-        Executors.newScheduledThreadPool(
-            4,
-            r -> {
-              Thread t = new Thread(r, "otel-controlplane");
-              t.setDaemon(true);
-              return t;
-            });
-
-    this.started = new AtomicBoolean(false);
-    this.closed = new AtomicBoolean(false);
-    this.connectionState = new AtomicReference<>(ConnectionState.DISCONNECTED);
 
     // 初始化状态收集器
     this.statusAggregator = new AgentStatusAggregator();
@@ -127,24 +126,40 @@ public final class ControlPlaneManager implements Closeable {
     this.uptimeCollector = new UptimeCollector();
     initializeStatusCollectors();
 
+    // 初始化健康检查协调器
+    this.healthCheckCoordinator =
+        new HealthCheckCoordinator(this.healthMonitor, this.connectionStateManager);
+
+    // 初始化统计管理器
+    this.statistics =
+        new ControlPlaneStatistics(
+            this.controlPlaneStateCollector,
+            this.connectionStateManager,
+            this.healthCheckCoordinator,
+            this.config.getControlPlaneUrl() + "/config");
+
     // 初始化心跳上报器
     this.heartbeatReporter =
         HeartbeatReporter.builder()
             .setConfig(this.config)
             .setClient(this.client)
             .setStatusAggregator(this.statusAggregator)
-            .setScheduler(this.scheduler)
+            .setScheduler(this.taskManager.getScheduler())
             .setListener(this::onHeartbeatComplete)
             .build();
 
-    // 注册健康状态监听器
-    this.healthMonitor.addListener(this::onOtlpHealthStateChanged);
+    // Arthas 集成
+    this.arthasIntegration = builder.arthasIntegration;
+
+    // 生命周期状态
+    this.started = new AtomicBoolean(false);
+    this.closed = new AtomicBoolean(false);
   }
 
   /**
-   * Creates a new builder.
+   * 创建 Builder
    *
-   * @return the builder
+   * @return Builder 实例
    */
   public static Builder builder() {
     return new Builder();
@@ -152,12 +167,12 @@ public final class ControlPlaneManager implements Closeable {
 
   /** 初始化状态收集器 */
   private void initializeStatusCollectors() {
-    // 按优先级注册收集器
-    statusAggregator.registerCollector(new IdentityCollector());        // 优先级 0
-    statusAggregator.registerCollector(uptimeCollector);                 // 优先级 10
-    statusAggregator.registerCollector(controlPlaneStateCollector);      // 优先级 15
-    statusAggregator.registerCollector(new OtlpHealthCollector(healthMonitor)); // 优先级 20
-    statusAggregator.registerCollector(new SystemResourceCollector(config.isIncludeSystemResource())); // 优先级 30
+    statusAggregator.registerCollector(new IdentityCollector());
+    statusAggregator.registerCollector(uptimeCollector);
+    statusAggregator.registerCollector(controlPlaneStateCollector);
+    statusAggregator.registerCollector(new OtlpHealthCollector(healthMonitor));
+    statusAggregator.registerCollector(
+        new SystemResourceCollector(config.isIncludeSystemResource()));
 
     logger.log(
         Level.FINE,
@@ -165,7 +180,7 @@ public final class ControlPlaneManager implements Closeable {
         new Object[] {statusAggregator.getCollectorCount(), statusAggregator.getCollectorNames()});
   }
 
-  /** Starts the control plane manager. */
+  /** 启动控制平面管理器 */
   public void start() {
     if (!config.isEnabled()) {
       logger.log(Level.INFO, "Control plane is disabled");
@@ -186,26 +201,60 @@ public final class ControlPlaneManager implements Closeable {
     configManager.registerComponent(
         "sampler", cfg -> dynamicSampler.update((io.opentelemetry.sdk.trace.samplers.Sampler) cfg));
 
-    // 启动配置轮询
-    scheduleConfigPoll();
+    // 启动健康检查协调器
+    healthCheckCoordinator.start();
 
-    // 启动任务轮询
-    scheduleTaskPoll();
-
-    // 启动状态上报
-    scheduleStatusReport();
-
-    // 启动清理任务
-    scheduleCleanup();
+    // 调度各项任务
+    scheduleTasks();
 
     // 启动心跳上报
     heartbeatReporter.start();
 
-    connectionState.set(ConnectionState.CONNECTING);
+    // 启动 Arthas 集成
+    if (arthasIntegration != null) {
+      arthasIntegration.start(taskManager.getScheduler());
+    }
+
+    connectionStateManager.markConnecting();
     logger.log(Level.INFO, "Control plane manager started");
   }
 
-  /** Stops the control plane manager. */
+  /** 调度所有任务 */
+  private void scheduleTasks() {
+    // 配置轮询任务
+    taskManager.scheduleTask(
+        TaskConfig.create(
+            TASK_CONFIG_POLL,
+            new ConfigPollTask(
+                client, connectionStateManager, healthCheckCoordinator, statistics),
+            config.getConfigPollInterval()));
+
+    // 任务轮询任务
+    taskManager.scheduleTask(
+        TaskConfig.create(
+            TASK_TASK_POLL,
+            new TaskPollTask(connectionStateManager, statistics),
+            Duration.ofSeconds(1),
+            config.getTaskPollInterval()));
+
+    // 状态上报任务
+    taskManager.scheduleTask(
+        TaskConfig.create(
+            TASK_STATUS_REPORT,
+            new StatusReportTask(resultPersistence, statistics),
+            Duration.ofSeconds(5),
+            config.getStatusReportInterval()));
+
+    // 清理任务（每小时）
+    taskManager.scheduleTask(
+        TaskConfig.create(
+            TASK_CLEANUP,
+            new CleanupTask(resultPersistence),
+            Duration.ofHours(1),
+            Duration.ofHours(1)));
+  }
+
+  /** 停止控制平面管理器 */
   public void stop() {
     if (!started.get() || closed.get()) {
       return;
@@ -213,27 +262,24 @@ public final class ControlPlaneManager implements Closeable {
 
     logger.log(Level.INFO, "Stopping control plane manager...");
 
-    // 取消定时任务
-    if (configPollTask != null) {
-      configPollTask.cancel(false);
-    }
-    if (taskPollTask != null) {
-      taskPollTask.cancel(false);
-    }
-    if (statusReportTask != null) {
-      statusReportTask.cancel(false);
-    }
-    if (cleanupTask != null) {
-      cleanupTask.cancel(false);
-    }
+    // 取消所有任务
+    taskManager.cancelAllTasks();
 
     // 停止心跳上报
     heartbeatReporter.stop();
 
+    // 停止健康检查协调器
+    healthCheckCoordinator.stop();
+
+    // 停止 Arthas 集成
+    if (arthasIntegration != null) {
+      arthasIntegration.stop();
+    }
+
     // 更新运行状态
     uptimeCollector.setRunningState(UptimeCollector.RunningState.STOPPED);
+    connectionStateManager.setState(ConnectionState.DISCONNECTED);
 
-    connectionState.set(ConnectionState.DISCONNECTED);
     logger.log(Level.INFO, "Control plane manager stopped");
   }
 
@@ -242,249 +288,119 @@ public final class ControlPlaneManager implements Closeable {
     if (closed.compareAndSet(false, true)) {
       stop();
 
-      scheduler.shutdown();
-      try {
-        if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-          scheduler.shutdownNow();
-        }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        scheduler.shutdownNow();
-      }
-
+      taskManager.close();
       heartbeatReporter.close();
       client.close();
+
+      if (arthasIntegration != null) {
+        arthasIntegration.close();
+      }
+
       logger.log(Level.INFO, "Control plane manager closed");
     }
   }
 
+  // ==================== Getter 方法 ====================
+
   /**
-   * Gets the connection state.
+   * 获取连接状态
    *
-   * @return the connection state
+   * @return 连接状态
    */
   public ConnectionState getConnectionState() {
-    ConnectionState state = connectionState.get();
-    return state != null ? state : ConnectionState.DISCONNECTED;
+    return connectionStateManager.getState();
   }
 
   /**
-   * Gets the health monitor.
+   * 获取健康监控器
    *
-   * @return the health monitor
+   * @return 健康监控器
    */
   public OtlpHealthMonitor getHealthMonitor() {
     return healthMonitor;
   }
 
   /**
-   * Gets the dynamic config manager.
+   * 获取动态配置管理器
    *
-   * @return the config manager
+   * @return 配置管理器
    */
   public DynamicConfigManager getConfigManager() {
     return configManager;
   }
 
   /**
-   * Gets the dynamic sampler.
+   * 获取动态采样器
    *
-   * @return the dynamic sampler
+   * @return 动态采样器
    */
   public DynamicSampler getDynamicSampler() {
     return dynamicSampler;
   }
 
   /**
-   * Gets the status aggregator.
+   * 获取状态聚合器
    *
-   * @return the status aggregator
+   * @return 状态聚合器
    */
   public AgentStatusAggregator getStatusAggregator() {
     return statusAggregator;
   }
 
   /**
-   * Gets the heartbeat reporter.
+   * 获取心跳上报器
    *
-   * @return the heartbeat reporter
+   * @return 心跳上报器
    */
   public HeartbeatReporter getHeartbeatReporter() {
     return heartbeatReporter;
   }
 
-  private void scheduleConfigPoll() {
-    long intervalMillis = config.getConfigPollInterval().toMillis();
-    logger.log(
-        Level.INFO,
-        "Scheduling config poll task with interval: {0}ms",
-        intervalMillis);
-    configPollTask =
-        scheduler.scheduleWithFixedDelay(
-            this::pollConfig, 0, intervalMillis, TimeUnit.MILLISECONDS);
+  /**
+   * 获取 Arthas 集成
+   *
+   * @return Arthas 集成，如果未启用则返回 null
+   */
+  @Nullable
+  public ArthasIntegration getArthasIntegration() {
+    return arthasIntegration;
   }
 
-  private void scheduleTaskPoll() {
-    long intervalMillis = config.getTaskPollInterval().toMillis();
-    logger.log(
-        Level.INFO,
-        "Scheduling task poll task with interval: {0}ms",
-        intervalMillis);
-    taskPollTask =
-        scheduler.scheduleWithFixedDelay(
-            this::pollTasks, 1000, intervalMillis, TimeUnit.MILLISECONDS);
+  /**
+   * 获取连接状态管理器
+   *
+   * @return 连接状态管理器
+   */
+  public ConnectionStateManager getConnectionStateManager() {
+    return connectionStateManager;
   }
 
-  private void scheduleStatusReport() {
-    long intervalMillis = config.getStatusReportInterval().toMillis();
-    logger.log(
-        Level.INFO,
-        "Scheduling status report task with interval: {0}ms",
-        intervalMillis);
-    statusReportTask =
-        scheduler.scheduleWithFixedDelay(
-            this::reportStatus, 5000, intervalMillis, TimeUnit.MILLISECONDS);
+  /**
+   * 获取调度任务管理器
+   *
+   * @return 调度任务管理器
+   */
+  public ScheduledTaskManager getTaskManager() {
+    return taskManager;
   }
 
-  private void scheduleCleanup() {
-    // 每小时清理一次过期结果
-    logger.log(Level.INFO, "Scheduling cleanup task with interval: 1 hour");
-    cleanupTask =
-        scheduler.scheduleWithFixedDelay(
-            () -> resultPersistence.cleanupExpired(), 1, 1, TimeUnit.HOURS);
+  /**
+   * 获取统计信息管理器
+   *
+   * @return 统计信息管理器
+   */
+  public ControlPlaneStatistics getStatistics() {
+    return statistics;
   }
 
-  private void pollConfig() {
-    long count = configPollCount.incrementAndGet();
-    controlPlaneStateCollector.setConfigPollCount(count);
-    if (!shouldConnect()) {
-      logPeriodicStatus();
-      return;
-    }
-
-    try {
-      logger.log(Level.FINE, "Polling config (count: {0})...", count);
-
-      // 尝试从控制平面获取配置
-      boolean success = client.fetchConfig();
-
-      if (success) {
-        // 请求成功，更新连接状态为 CONNECTED
-        ConnectionState previousState = connectionState.getAndSet(ConnectionState.CONNECTED);
-        controlPlaneStateCollector.setConnectionState(ConnectionState.CONNECTED.name());
-        controlPlaneStateCollector.recordConfigFetch();
-        if (previousState != ConnectionState.CONNECTED) {
-          logger.log(
-              Level.INFO,
-              "Control plane connected, state changed: {0} -> CONNECTED",
-              previousState);
-        }
-      } else {
-        // 请求失败（如 404、500 等），说明服务端不可用
-        ConnectionState previousState = connectionState.get();
-        if (previousState != ConnectionState.SERVER_UNAVAILABLE) {
-          connectionState.set(ConnectionState.SERVER_UNAVAILABLE);
-          controlPlaneStateCollector.setConnectionState(ConnectionState.SERVER_UNAVAILABLE.name());
-          logger.log(
-              Level.WARNING,
-              "Control plane server unavailable (API endpoint may not exist), state changed: {0} -> SERVER_UNAVAILABLE",
-              previousState);
-        }
-      }
-      logPeriodicStatus();
-    } catch (RuntimeException e) {
-      ConnectionState previousState = connectionState.getAndSet(ConnectionState.DISCONNECTED);
-      logger.log(
-          Level.WARNING,
-          "Failed to poll config (count: {0}, state: {1} -> DISCONNECTED): {2}",
-          new Object[] {count, previousState, e.getMessage()});
-    }
-  }
-
-  private void pollTasks() {
-    long count = taskPollCount.incrementAndGet();
-    controlPlaneStateCollector.setTaskPollCount(count);
-    // 只有在 CONNECTED 状态才轮询任务
-    if (connectionState.get() != ConnectionState.CONNECTED) {
-      logger.log(
-          Level.FINE,
-          "Skip task poll (count: {0}), not connected (state: {1})",
-          new Object[] {count, connectionState.get()});
-      return;
-    }
-
-    try {
-      logger.log(Level.FINE, "Polling tasks (count: {0})...", count);
-      // TODO: 实现任务轮询逻辑
-      // client.fetchTasks();
-    } catch (RuntimeException e) {
-      logger.log(
-          Level.WARNING,
-          "Failed to poll tasks (count: {0}): {1}",
-          new Object[] {count, e.getMessage()});
-    }
-  }
-
-  private void reportStatus() {
-    long count = statusReportCount.incrementAndGet();
-    controlPlaneStateCollector.setStatusReportCount(count);
-    try {
-      // 状态上报不依赖连接状态，即使 SERVER_UNAVAILABLE 也尝试上报
-      logger.log(Level.FINE, "Reporting status (count: {0})...", count);
-      // TODO: 实现状态上报逻辑
-      // client.reportStatus(agentIdentity, connectionState.get(), healthMonitor.getState());
-
-      // 重传失败的任务结果
-      retryFailedResults();
-    } catch (RuntimeException e) {
-      logger.log(
-          Level.WARNING,
-          "Failed to report status (count: {0}): {1}",
-          new Object[] {count, e.getMessage()});
-    }
-  }
-
-  private void retryFailedResults() {
-    for (String taskId : resultPersistence.getPendingRetryTaskIds()) {
-      try {
-        resultPersistence
-            .read(taskId)
-            .ifPresent(
-                data -> {
-                  // TODO: 实现结果重传逻辑
-                  logger.log(Level.FINE, "Retrying task result: {0}", taskId);
-                });
-      } catch (RuntimeException e) {
-        logger.log(Level.WARNING, "Failed to retry task result: " + taskId, e);
-        resultPersistence.markForRetry(taskId);
-      }
-    }
-  }
-
-  private boolean shouldConnect() {
-    // 检查 OTLP 健康状态
-    if (!healthMonitor.isHealthy()) {
-      ConnectionState previousState = connectionState.get();
-      if (previousState != ConnectionState.WAITING_FOR_OTLP) {
-        connectionState.set(ConnectionState.WAITING_FOR_OTLP);
-        logger.log(
-            Level.INFO,
-            "OTLP is not healthy (state: {0}), waiting for recovery before connecting to control plane",
-healthMonitor.getState());
-      }
-      return false;
-    }
-
-    return true;
-  }
+  // ==================== 回调方法 ====================
 
   /** 心跳完成回调 */
   private void onHeartbeatComplete(
       boolean success,
-      @Nullable java.util.Map<String, Object> statusData,
+      @Nullable Map<String, Object> statusData,
       @Nullable String error) {
-    // 更新统计计数（引用实例变量，避免 MethodCanBeStatic 警告）
-    controlPlaneStateCollector.recordStatusReport();
+    statistics.recordStatusReport();
 
     if (success) {
       logger.log(Level.FINE, "Heartbeat completed successfully");
@@ -493,69 +409,7 @@ healthMonitor.getState());
     }
   }
 
-  /** 周期性输出状态日志，便于观察控制平面运行情况 */
-  private void logPeriodicStatus() {
-    long now = System.currentTimeMillis();
-    long lastLog = lastStatusLogTime.get();
-    if (now - lastLog >= STATUS_LOG_INTERVAL_MS && lastStatusLogTime.compareAndSet(lastLog, now)) {
-      // 构建详细的 OTLP 健康信息
-      String otlpHealthInfo = buildOtlpHealthInfo();
-      
-      logger.log(
-          Level.INFO,
-          "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlpHealth: [{4}], configUrl: {5}",
-          new Object[] {
-            connectionState.get(),
-            configPollCount.get(),
-            taskPollCount.get(),
-            statusReportCount.get(),
-            otlpHealthInfo,
-            config.getControlPlaneUrl() + "/config"
-          });
-    }
-  }
-
-  /** 构建详细的 OTLP 健康信息 */
-  private String buildOtlpHealthInfo() {
-    OtlpHealthMonitor.HealthState state = healthMonitor.getState();
-    long successCount = healthMonitor.getSuccessCount();
-    long failureCount = healthMonitor.getFailureCount();
-    double successRate = healthMonitor.getSuccessRate();
-    long totalSamples = successCount + failureCount;
-    
-    // 当没有采样数据时，显示更友好的提示
-    if (totalSamples == 0) {
-      return "state=UNKNOWN, no samples yet (waiting for span exports)";
-    }
-    
-    // 格式: state=HEALTHY, success/fail=95/5, rate=95.0%
-    return String.format(
-        Locale.ROOT,
-        "state=%s, success/fail=%d/%d, rate=%.1f%%",
-        state,
-        successCount,
-        failureCount,
-        successRate * 100);
-  }
-
-  private void onOtlpHealthStateChanged(
-      OtlpHealthMonitor.HealthState previousState, OtlpHealthMonitor.HealthState newState) {
-    logger.log(
-        Level.INFO,
-        "OTLP health state changed: {0} -> {1}",
-        new Object[] {previousState, newState});
-
-    if (newState == OtlpHealthMonitor.HealthState.HEALTHY
-        && connectionState.get() == ConnectionState.WAITING_FOR_OTLP) {
-      // OTLP 恢复健康，尝试重新连接
-      connectionState.set(ConnectionState.CONNECTING);
-      logger.log(Level.INFO, "OTLP recovered, reconnecting to control plane");
-    } else if (newState == OtlpHealthMonitor.HealthState.UNHEALTHY) {
-      // OTLP 不健康，暂停连接
-      connectionState.set(ConnectionState.WAITING_FOR_OTLP);
-      logger.log(Level.INFO, "OTLP became unhealthy, pausing control plane connection");
-    }
-  }
+  // ==================== Builder ====================
 
   /** Builder for {@link ControlPlaneManager}. */
   public static final class Builder {
@@ -563,13 +417,14 @@ healthMonitor.getState());
     @Nullable private OtlpHealthMonitor healthMonitor;
     @Nullable private DynamicConfigManager configManager;
     @Nullable private DynamicSampler dynamicSampler;
+    @Nullable private ArthasIntegration arthasIntegration;
 
     private Builder() {}
 
     /**
-     * Sets the configuration.
+     * 设置配置
      *
-     * @param config the control plane configuration
+     * @param config 控制平面配置
      * @return this builder
      */
     public Builder setConfig(ControlPlaneConfig config) {
@@ -578,9 +433,9 @@ healthMonitor.getState());
     }
 
     /**
-     * Sets the health monitor.
+     * 设置健康监控器
      *
-     * @param healthMonitor the health monitor
+     * @param healthMonitor 健康监控器
      * @return this builder
      */
     public Builder setHealthMonitor(OtlpHealthMonitor healthMonitor) {
@@ -589,9 +444,9 @@ healthMonitor.getState());
     }
 
     /**
-     * Sets the config manager.
+     * 设置配置管理器
      *
-     * @param configManager the config manager
+     * @param configManager 配置管理器
      * @return this builder
      */
     public Builder setConfigManager(DynamicConfigManager configManager) {
@@ -600,9 +455,9 @@ healthMonitor.getState());
     }
 
     /**
-     * Sets the dynamic sampler.
+     * 设置动态采样器
      *
-     * @param dynamicSampler the dynamic sampler
+     * @param dynamicSampler 动态采样器
      * @return this builder
      */
     public Builder setDynamicSampler(DynamicSampler dynamicSampler) {
@@ -611,9 +466,76 @@ healthMonitor.getState());
     }
 
     /**
-     * Builds the control plane manager.
+     * 设置 Arthas 集成
      *
-     * @return the control plane manager
+     * @param arthasIntegration Arthas 集成
+     * @return this builder
+     */
+    public Builder setArthasIntegration(ArthasIntegration arthasIntegration) {
+      this.arthasIntegration = arthasIntegration;
+      return this;
+    }
+
+    /**
+     * 设置 Arthas 配置并创建集成
+     *
+     * <p>如果 ArthasConfig 没有显式配置 Tunnel 端点，将自动基于 ControlPlaneConfig 的 OTLP endpoint 生成默认值。
+     * 默认规则：http(s)://host:port → ws(s)://host:port/v1/arthas/ws
+     *
+     * @param arthasConfig Arthas 配置
+     * @return this builder
+     */
+    public Builder setArthasConfig(ArthasConfig arthasConfig) {
+      if (arthasConfig != null && arthasConfig.isEnabled()) {
+        // 如果没有显式配置 Tunnel 端点，注入 OTLP endpoint 用于生成默认值
+        if (!arthasConfig.hasExplicitTunnelEndpoint() && this.config != null) {
+          arthasConfig =
+              ArthasConfig.builder()
+                  .setEnabled(arthasConfig.isEnabled())
+                  .setVersion(arthasConfig.getVersion())
+                  .setMaxSessionsPerAgent(arthasConfig.getMaxSessionsPerAgent())
+                  .setSessionIdleTimeout(arthasConfig.getSessionIdleTimeout())
+                  .setSessionMaxDuration(arthasConfig.getSessionMaxDuration())
+                  .setIdleShutdownDelay(arthasConfig.getIdleShutdownDelay())
+                  .setMaxRunningDuration(arthasConfig.getMaxRunningDuration())
+                  .setTunnelEndpoint(arthasConfig.getExplicitTunnelEndpoint())
+                  .setTunnelReconnectInterval(arthasConfig.getTunnelReconnectInterval())
+                  .setTunnelMaxReconnectAttempts(arthasConfig.getTunnelMaxReconnectAttempts())
+                  .setTunnelConnectTimeout(arthasConfig.getTunnelConnectTimeout())
+                  .setTunnelPingInterval(arthasConfig.getTunnelPingInterval())
+                  .setLibPath(arthasConfig.getLibPath())
+                  .setDisabledCommands(arthasConfig.getDisabledCommands())
+                  .setCommandTimeout(arthasConfig.getCommandTimeout())
+                  .setOutputBufferSize(arthasConfig.getOutputBufferSize())
+                  .setOutputFlushInterval(arthasConfig.getOutputFlushInterval())
+                  .setBaseOtlpEndpoint(this.config.getEndpoint())
+                  .build();
+
+          logger.log(
+              Level.INFO,
+              "Arthas tunnel endpoint not explicitly configured, using default based on OTLP endpoint: {0}",
+              arthasConfig.getTunnelEndpoint());
+        }
+        this.arthasIntegration = ArthasIntegration.create(arthasConfig);
+      }
+      return this;
+    }
+
+    /**
+     * 启用 Arthas 功能（使用默认配置）
+     *
+     * <p>Tunnel 端点将自动基于 ControlPlaneConfig 的 OTLP endpoint 生成。
+     *
+     * @return this builder
+     */
+    public Builder enableArthas() {
+      return setArthasConfig(ArthasConfig.builder().setEnabled(true).build());
+    }
+
+    /**
+     * 构建控制平面管理器
+     *
+     * @return 控制平面管理器
      */
     public ControlPlaneManager build() {
       if (config == null) {

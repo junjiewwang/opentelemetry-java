@@ -17,13 +17,13 @@ class ControlPlaneConfigTest {
   void defaultValues() {
     ControlPlaneConfig config = ControlPlaneConfig.builder().build();
 
-    assertThat(config.isEnabled()).isFalse();
+    assertThat(config.isEnabled()).isTrue(); // 默认启用控制平面
     assertThat(config.getProtocol()).isEqualTo("grpc");
     assertThat(config.getHttpBasePath()).isEqualTo("/v1/control");
     assertThat(config.getLongPollTimeout()).isEqualTo(Duration.ofSeconds(60));
     assertThat(config.getConfigPollInterval()).isEqualTo(Duration.ofSeconds(30));
     assertThat(config.getTaskPollInterval()).isEqualTo(Duration.ofSeconds(10));
-    assertThat(config.getStatusReportInterval()).isEqualTo(Duration.ofSeconds(60));
+    assertThat(config.getStatusReportInterval()).isEqualTo(Duration.ofSeconds(30));
     assertThat(config.getCompressionThreshold()).isEqualTo(1024L);
     assertThat(config.getChunkedThreshold()).isEqualTo(50 * 1024 * 1024L);
     assertThat(config.getMaxSize()).isEqualTo(200 * 1024 * 1024L);
