@@ -21,8 +21,7 @@ class ControlPlaneConfigTest {
     assertThat(config.getProtocol()).isEqualTo("grpc");
     assertThat(config.getHttpBasePath()).isEqualTo("/v1/control");
     assertThat(config.getLongPollTimeout()).isEqualTo(Duration.ofSeconds(60));
-    assertThat(config.getConfigPollInterval()).isEqualTo(Duration.ofSeconds(30));
-    assertThat(config.getTaskPollInterval()).isEqualTo(Duration.ofSeconds(10));
+    // configPollInterval 和 taskPollInterval 已由长轮询替代
     assertThat(config.getStatusReportInterval()).isEqualTo(Duration.ofSeconds(30));
     assertThat(config.getCompressionThreshold()).isEqualTo(1024L);
     assertThat(config.getChunkedThreshold()).isEqualTo(50 * 1024 * 1024L);
@@ -37,8 +36,7 @@ class ControlPlaneConfigTest {
             .setEndpoint("http://localhost:4318")
             .setProtocol("http/protobuf")
             .setHttpBasePath("/custom/path")
-            .setLongPollTimeout(Duration.ofSeconds(120))
-            .setConfigPollInterval(Duration.ofSeconds(60))
+            .setLongPollTimeout(Duration.ofMinutes(2))
             .setCompressionThreshold(2048)
             .setChunkedThreshold(100 * 1024 * 1024L)
             .setMaxSize(500 * 1024 * 1024L)

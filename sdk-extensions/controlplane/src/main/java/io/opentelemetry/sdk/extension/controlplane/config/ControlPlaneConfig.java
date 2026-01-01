@@ -39,9 +39,7 @@ public final class ControlPlaneConfig {
   private static final String CONTROL_HTTP_LONG_POLL_TIMEOUT =
       "otel.agent.control.http.long.poll.timeout";
 
-  // 轮询配置
-  private static final String CONFIG_POLL_INTERVAL = "otel.agent.control.config.poll.interval";
-  private static final String TASK_POLL_INTERVAL = "otel.agent.control.task.poll.interval";
+  // 轮询配置（configPollInterval 和 taskPollInterval 已由长轮询替代）
   private static final String STATUS_REPORT_INTERVAL = "otel.agent.control.status.report.interval";
 
   // 健康监控配置
@@ -83,8 +81,6 @@ public final class ControlPlaneConfig {
   private static final String DEFAULT_PROTOCOL = "grpc";
   private static final String DEFAULT_HTTP_BASE_PATH = "/v1/control";
   private static final Duration DEFAULT_LONG_POLL_TIMEOUT = Duration.ofSeconds(60);
-  private static final Duration DEFAULT_CONFIG_POLL_INTERVAL = Duration.ofSeconds(30);
-  private static final Duration DEFAULT_TASK_POLL_INTERVAL = Duration.ofSeconds(10);
   private static final Duration DEFAULT_STATUS_REPORT_INTERVAL = Duration.ofSeconds(30);
   private static final int DEFAULT_HEALTH_WINDOW_SIZE = 100;
   private static final double DEFAULT_HEALTHY_THRESHOLD = 0.9;
@@ -110,8 +106,6 @@ public final class ControlPlaneConfig {
   private final String protocol;
   private final String httpBasePath;
   private final Duration longPollTimeout;
-  private final Duration configPollInterval;
-  private final Duration taskPollInterval;
   private final Duration statusReportInterval;
   private final int healthWindowSize;
   private final double healthyThreshold;
@@ -143,8 +137,6 @@ public final class ControlPlaneConfig {
     this.protocol = builder.protocol;
     this.httpBasePath = builder.httpBasePath;
     this.longPollTimeout = builder.longPollTimeout;
-    this.configPollInterval = builder.configPollInterval;
-    this.taskPollInterval = builder.taskPollInterval;
     this.statusReportInterval = builder.statusReportInterval;
     this.healthWindowSize = builder.healthWindowSize;
     this.healthyThreshold = builder.healthyThreshold;
@@ -313,14 +305,6 @@ public final class ControlPlaneConfig {
     return longPollTimeout;
   }
 
-  public Duration getConfigPollInterval() {
-    return configPollInterval;
-  }
-
-  public Duration getTaskPollInterval() {
-    return taskPollInterval;
-  }
-
   public Duration getStatusReportInterval() {
     return statusReportInterval;
   }
@@ -472,8 +456,6 @@ public final class ControlPlaneConfig {
     private String protocol = DEFAULT_PROTOCOL;
     private String httpBasePath = DEFAULT_HTTP_BASE_PATH;
     private Duration longPollTimeout = DEFAULT_LONG_POLL_TIMEOUT;
-    private Duration configPollInterval = DEFAULT_CONFIG_POLL_INTERVAL;
-    private Duration taskPollInterval = DEFAULT_TASK_POLL_INTERVAL;
     private Duration statusReportInterval = DEFAULT_STATUS_REPORT_INTERVAL;
     private int healthWindowSize = DEFAULT_HEALTH_WINDOW_SIZE;
     private double healthyThreshold = DEFAULT_HEALTHY_THRESHOLD;
@@ -532,16 +514,6 @@ public final class ControlPlaneConfig {
       Duration longPoll = properties.getDuration(CONTROL_HTTP_LONG_POLL_TIMEOUT);
       if (longPoll != null) {
         this.longPollTimeout = longPoll;
-      }
-
-      Duration configPoll = properties.getDuration(CONFIG_POLL_INTERVAL);
-      if (configPoll != null) {
-        this.configPollInterval = configPoll;
-      }
-
-      Duration taskPoll = properties.getDuration(TASK_POLL_INTERVAL);
-      if (taskPoll != null) {
-        this.taskPollInterval = taskPoll;
       }
 
       Duration statusReport = properties.getDuration(STATUS_REPORT_INTERVAL);
@@ -700,16 +672,6 @@ public final class ControlPlaneConfig {
 
     public Builder setLongPollTimeout(Duration longPollTimeout) {
       this.longPollTimeout = Objects.requireNonNull(longPollTimeout, "longPollTimeout");
-      return this;
-    }
-
-    public Builder setConfigPollInterval(Duration configPollInterval) {
-      this.configPollInterval = Objects.requireNonNull(configPollInterval, "configPollInterval");
-      return this;
-    }
-
-    public Builder setTaskPollInterval(Duration taskPollInterval) {
-      this.taskPollInterval = Objects.requireNonNull(taskPollInterval, "taskPollInterval");
       return this;
     }
 

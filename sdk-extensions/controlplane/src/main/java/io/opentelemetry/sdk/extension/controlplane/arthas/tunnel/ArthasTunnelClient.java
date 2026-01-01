@@ -35,6 +35,8 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.T
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.TerminalRejectedPayload;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.TerminalResizeMessage;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
+import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
+import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger.TaskContext;
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ScheduledExecutorService;
@@ -90,6 +92,9 @@ public final class ArthasTunnelClient implements Closeable {
   @Nullable private ScheduledFuture<?> pingTask;
   @Nullable private ScheduledFuture<?> reconnectTask;
   @Nullable private ArthasSessionManager sessionManager;
+
+  /** 任务执行日志记录器 */
+  private final TaskExecutionLogger taskLogger = TaskExecutionLogger.getInstance();
 
   // 消息处理器（用于处理二进制帧输出，预留给未来扩展使用）
   @SuppressWarnings("UnusedVariable")
@@ -340,42 +345,90 @@ public final class ArthasTunnelClient implements Closeable {
   /** 处理 Arthas 启动请求 */
   @SuppressWarnings("UnusedVariable")
   private void handleArthasStart(ArthasStartMessage message) {
+    String taskId = "arthas-start-" + System.currentTimeMillis();
+
+    // 记录任务接收
+    TaskContext context = taskLogger.logTaskReceived(
+        taskId,
+        TaskExecutionLogger.TASK_TYPE_ARTHAS_START,
+        TaskExecutionLogger.SOURCE_TUNNEL_SERVER);
+
+    taskLogger.logTaskStarted(taskId, "tunnel_client");
+
     logger.log(Level.INFO, "Received ARTHAS_START request");
     eventListener.onArthasStartRequested();
     // 发送状态响应
     sendArthasStatus();
+
+    // 记录任务完成
+    taskLogger.logTaskCompleted(taskId, "arthas_start_requested");
   }
 
   /** 处理 Arthas 停止请求 */
   private void handleArthasStop(ArthasStopMessage message) {
+    String taskId = "arthas-stop-" + System.currentTimeMillis();
     String reason = message.getPayload() != null ? message.getPayload().getReason() : null;
+
+    // 记录任务接收
+    taskLogger.logTaskReceived(
+        taskId,
+        TaskExecutionLogger.TASK_TYPE_ARTHAS_STOP,
+        TaskExecutionLogger.SOURCE_TUNNEL_SERVER,
+        TaskExecutionLogger.details()
+            .put("reason", reason)
+            .build());
+
+    taskLogger.logTaskStarted(taskId, "tunnel_client");
+
     logger.log(Level.INFO, "Received ARTHAS_STOP request, reason: {0}", reason);
     eventListener.onArthasStopRequested(reason);
     // 发送状态响应
     sendArthasStatus();
+
+    // 记录任务完成
+    taskLogger.logTaskCompleted(taskId, "arthas_stop_requested:" + reason);
   }
 
   /** 处理终端打开请求 */
   private void handleTerminalOpen(TerminalOpenMessage message) {
-    if (sessionManager == null) {
-      sendTerminalRejected(message.getPayload().getRequestId(), "INTERNAL_ERROR", "Session manager not initialized");
-      return;
-    }
-
     String requestId = message.getPayload().getRequestId();
     String userId = message.getPayload().getUserId();
     int cols = message.getPayload().getCols();
     int rows = message.getPayload().getRows();
+
+    // 记录任务接收
+    taskLogger.logTaskReceived(
+        requestId,
+        TaskExecutionLogger.TASK_TYPE_ARTHAS_SESSION,
+        TaskExecutionLogger.SOURCE_TUNNEL_SERVER,
+        TaskExecutionLogger.details()
+            .put("userId", userId)
+            .put("cols", cols)
+            .put("rows", rows)
+            .build());
+
+    if (sessionManager == null) {
+      taskLogger.logTaskFailed(
+          requestId,
+          TaskExecutionLogger.ERROR_INTERNAL,
+          "Session manager not initialized");
+      sendTerminalRejected(requestId, "INTERNAL_ERROR", "Session manager not initialized");
+      return;
+    }
 
     logger.log(
         Level.INFO,
         "Received TERMINAL_OPEN request: requestId={0}, user={1}, cols={2}, rows={3}",
         new Object[] {requestId, userId, cols, rows});
 
+    taskLogger.logTaskStarted(requestId, "session_manager");
+
     // 请求启动 Arthas（如果尚未启动）
+    taskLogger.logTaskProgress(requestId, "arthas_check", "Ensuring Arthas is started");
     eventListener.onArthasStartRequested();
 
     // 创建会话
+    taskLogger.logTaskProgress(requestId, "session_create", "Creating terminal session");
     SessionCreateRequest request = new SessionCreateRequest(userId, cols, rows);
     SessionCreateResult result = sessionManager.tryCreateSession(request);
 
@@ -391,6 +444,12 @@ public final class ArthasTunnelClient implements Closeable {
                 config.getMaxSessionsPerAgent());
         sendTextMessage(TerminalReadyMessage.create(payload));
         logger.log(Level.INFO, "Terminal session created: {0}", session.getSessionId());
+
+        // 记录任务成功完成
+        taskLogger.logTaskCompleted(
+            requestId,
+            "session_created:" + session.getSessionId(),
+            0);
       }
     } else {
       String rejectReason = result.getRejectReason() != null 
@@ -398,6 +457,9 @@ public final class ArthasTunnelClient implements Closeable {
       String rejectMsg = result.getMessage() != null ? result.getMessage() : "Unknown error";
       sendTerminalRejected(requestId, rejectReason, rejectMsg);
       logger.log(Level.WARNING, "Terminal session rejected: {0}", rejectMsg);
+
+      // 记录任务失败
+      taskLogger.logTaskFailed(requestId, rejectReason, rejectMsg);
     }
   }
 
@@ -412,12 +474,36 @@ public final class ArthasTunnelClient implements Closeable {
     String sessionId = message.getPayload().getSessionId();
     String data = message.getPayload().getData();
 
+    // 仅对包含换行符的输入（表示完整命令）进行任务日志记录
+    boolean isCommand = data.contains("\r") || data.contains("\n");
+    String commandTaskId = null;
+
+    if (isCommand && data.trim().length() > 0) {
+      commandTaskId = "cmd-" + sessionId + "-" + System.currentTimeMillis();
+      taskLogger.logTaskReceived(
+          commandTaskId,
+          TaskExecutionLogger.TASK_TYPE_ARTHAS_COMMAND,
+          TaskExecutionLogger.SOURCE_TERMINAL_INPUT,
+          TaskExecutionLogger.details()
+              .put("sessionId", sessionId)
+              .put("commandLength", data.trim().length())
+              .build());
+      taskLogger.logCommandExecution(commandTaskId, data.trim(), sessionId);
+      taskLogger.logTaskStarted(commandTaskId, "terminal:" + sessionId);
+    }
+
     if (sessionManager != null) {
       sessionManager.markSessionActive(sessionId);
     }
 
     // 通知监听器处理输入
     eventListener.onTerminalInput(sessionId, data);
+
+    // 对于命令输入，记录已转发（实际执行结果由 Arthas 异步返回）
+    if (commandTaskId != null) {
+      taskLogger.logTaskProgress(commandTaskId, "forwarded", "Command forwarded to terminal");
+      // 注意：命令的完成状态由输出回调来记录
+    }
   }
 
   /** 处理终端尺寸调整 */
@@ -437,6 +523,20 @@ public final class ArthasTunnelClient implements Closeable {
   /** 处理终端关闭 */
   private void handleTerminalClose(TerminalCloseMessage message) {
     String sessionId = message.getPayload().getSessionId();
+    String taskId = "close-" + sessionId + "-" + System.currentTimeMillis();
+
+    // 记录任务接收
+    taskLogger.logTaskReceived(
+        taskId,
+        TaskExecutionLogger.TASK_TYPE_ARTHAS_SESSION,
+        TaskExecutionLogger.SOURCE_TUNNEL_SERVER,
+        TaskExecutionLogger.details()
+            .put("sessionId", sessionId)
+            .put("action", "close")
+            .build());
+
+    taskLogger.logTaskStarted(taskId, "session_manager");
+
     logger.log(Level.INFO, "Received TERMINAL_CLOSE: session={0}", sessionId);
 
     if (sessionManager != null) {
@@ -446,6 +546,9 @@ public final class ArthasTunnelClient implements Closeable {
     // 发送关闭确认
     TerminalClosedPayload payload = new TerminalClosedPayload(sessionId, "user_request");
     sendTextMessage(TerminalClosedMessage.create(payload));
+
+    // 记录任务完成
+    taskLogger.logTaskCompleted(taskId, "session_closed:" + sessionId);
   }
 
   /** 发送 Arthas 状态 */

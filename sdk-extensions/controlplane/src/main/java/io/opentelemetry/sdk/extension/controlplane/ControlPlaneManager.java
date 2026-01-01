@@ -15,10 +15,10 @@ import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
 import io.opentelemetry.sdk.extension.controlplane.core.HealthCheckCoordinator;
 import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager.TaskConfig;
+import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollConfig;
+import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollCoordinator;
 import io.opentelemetry.sdk.extension.controlplane.core.tasks.CleanupTask;
-import io.opentelemetry.sdk.extension.controlplane.core.tasks.ConfigPollTask;
 import io.opentelemetry.sdk.extension.controlplane.core.tasks.StatusReportTask;
-import io.opentelemetry.sdk.extension.controlplane.core.tasks.TaskPollTask;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
@@ -47,8 +47,7 @@ import javax.annotation.Nullable;
  * <p>作为控制平面的门面（Facade），协调各个子组件的工作，包括：
  *
  * <ul>
- *   <li>配置轮询
- *   <li>任务轮询
+ *   <li>长轮询（配置和任务）
  *   <li>状态上报
  *   <li>健康监控
  *   <li>Arthas 集成
@@ -61,6 +60,7 @@ import javax.annotation.Nullable;
  *   <li>{@link ScheduledTaskManager} - 调度任务管理
  *   <li>{@link HealthCheckCoordinator} - 健康检查协调
  *   <li>{@link ControlPlaneStatistics} - 统计信息管理
+ *   <li>{@link LongPollCoordinator} - 长轮询协调（配置和任务统一获取）
  * </ul>
  */
 public final class ControlPlaneManager implements Closeable {
@@ -68,8 +68,6 @@ public final class ControlPlaneManager implements Closeable {
   private static final Logger logger = Logger.getLogger(ControlPlaneManager.class.getName());
 
   // 任务名称常量
-  private static final String TASK_CONFIG_POLL = "config-poll";
-  private static final String TASK_TASK_POLL = "task-poll";
   private static final String TASK_STATUS_REPORT = "status-report";
   private static final String TASK_CLEANUP = "cleanup";
 
@@ -81,6 +79,7 @@ public final class ControlPlaneManager implements Closeable {
   private final ScheduledTaskManager taskManager;
   private final HealthCheckCoordinator healthCheckCoordinator;
   private final ControlPlaneStatistics statistics;
+  private final LongPollCoordinator longPollCoordinator;
 
   // 业务组件
   private final ControlPlaneClient client;
@@ -137,6 +136,25 @@ public final class ControlPlaneManager implements Closeable {
             this.connectionStateManager,
             this.healthCheckCoordinator,
             this.config.getControlPlaneUrl() + "/config");
+
+    // 初始化长轮询协调器
+    LongPollConfig longPollConfig =
+        LongPollConfig.builder()
+            .setTimeout(this.config.getLongPollTimeout())
+            .setMinRetryInterval(this.config.getRetryInitialBackoff())
+            .setMaxRetryInterval(this.config.getRetryMaxBackoff())
+            .setBackoffMultiplier(this.config.getRetryBackoffMultiplier())
+            .setMaxConsecutiveErrors(this.config.getRetryMaxAttempts())
+            .build();
+
+    this.longPollCoordinator =
+        new LongPollCoordinator(
+            longPollConfig,
+            this.client,
+            this.connectionStateManager,
+            this.healthCheckCoordinator,
+            this.statistics,
+            this.agentIdentity.getAgentId());
 
     // 初始化心跳上报器
     this.heartbeatReporter =
@@ -204,8 +222,11 @@ public final class ControlPlaneManager implements Closeable {
     // 启动健康检查协调器
     healthCheckCoordinator.start();
 
-    // 调度各项任务
+    // 调度各项任务（不包括配置和任务轮询，由长轮询协调器统一处理）
     scheduleTasks();
+
+    // 启动长轮询协调器（替代 ConfigPollTask 和 TaskPollTask）
+    longPollCoordinator.start();
 
     // 启动心跳上报
     heartbeatReporter.start();
@@ -216,27 +237,11 @@ public final class ControlPlaneManager implements Closeable {
     }
 
     connectionStateManager.markConnecting();
-    logger.log(Level.INFO, "Control plane manager started");
+    logger.log(Level.INFO, "Control plane manager started with long polling");
   }
 
-  /** 调度所有任务 */
+  /** 调度所有任务（不包括配置和任务轮询） */
   private void scheduleTasks() {
-    // 配置轮询任务
-    taskManager.scheduleTask(
-        TaskConfig.create(
-            TASK_CONFIG_POLL,
-            new ConfigPollTask(
-                client, connectionStateManager, healthCheckCoordinator, statistics),
-            config.getConfigPollInterval()));
-
-    // 任务轮询任务
-    taskManager.scheduleTask(
-        TaskConfig.create(
-            TASK_TASK_POLL,
-            new TaskPollTask(connectionStateManager, statistics),
-            Duration.ofSeconds(1),
-            config.getTaskPollInterval()));
-
     // 状态上报任务
     taskManager.scheduleTask(
         TaskConfig.create(
@@ -261,6 +266,9 @@ public final class ControlPlaneManager implements Closeable {
     }
 
     logger.log(Level.INFO, "Stopping control plane manager...");
+
+    // 停止长轮询协调器
+    longPollCoordinator.stop();
 
     // 取消所有任务
     taskManager.cancelAllTasks();
@@ -288,6 +296,7 @@ public final class ControlPlaneManager implements Closeable {
     if (closed.compareAndSet(false, true)) {
       stop();
 
+      longPollCoordinator.close();
       taskManager.close();
       heartbeatReporter.close();
       client.close();
@@ -393,13 +402,20 @@ public final class ControlPlaneManager implements Closeable {
     return statistics;
   }
 
+  /**
+   * 获取长轮询协调器
+   *
+   * @return 长轮询协调器
+   */
+  public LongPollCoordinator getLongPollCoordinator() {
+    return longPollCoordinator;
+  }
+
   // ==================== 回调方法 ====================
 
   /** 心跳完成回调 */
   private void onHeartbeatComplete(
-      boolean success,
-      @Nullable Map<String, Object> statusData,
-      @Nullable String error) {
+      boolean success, @Nullable Map<String, Object> statusData, @Nullable String error) {
     statistics.recordStatusReport();
 
     if (success) {
