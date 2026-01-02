@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.ConfigRequest;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.ConfigResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.PollResult;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import java.util.HashMap;
@@ -21,6 +22,12 @@ import java.util.logging.Logger;
  * 配置长轮询处理器
  *
  * <p>负责从控制平面获取配置更新，支持增量更新（通过 ETag 和版本号）。
+ *
+ * <p>支持两种模式：
+ * <ul>
+ *   <li>独立模式：通过 poll() 方法直接调用 /v1/control/poll/config
+ *   <li>统一模式：通过 processUnifiedResult() 处理 /v1/control/poll 响应中的 CONFIG 部分
+ * </ul>
  */
 public final class ConfigLongPollHandler implements LongPollHandler<ConfigResponse> {
 
@@ -113,6 +120,50 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
     }
   }
 
+  /**
+   * 处理统一轮询响应中的配置结果
+   *
+   * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 CONFIG 部分
+   *
+   * @param result 轮询结果
+   * @return 是否成功处理
+   */
+  public boolean processUnifiedResult(PollResult result) {
+    if (result == null) {
+      return false;
+    }
+
+    if (result.hasChanges()) {
+      String newVersion = result.getConfigVersion();
+      String newEtag = result.getConfigEtag();
+
+      taskLogger.logTaskProgress(
+          currentTaskId,
+          "config_changed",
+          "Config version: " + newVersion + ", etag: " + newEtag);
+
+      // 更新本地状态
+      if (newVersion != null) {
+        this.currentConfigVersion = newVersion;
+      }
+      if (newEtag != null) {
+        this.currentConfigEtag = newEtag;
+      }
+
+      logger.log(
+          Level.INFO,
+          "Config updated via unified poll, version: {0}, etag: {1}",
+          new Object[] {currentConfigVersion, currentConfigEtag});
+
+      // TODO: 处理配置数据（result.getConfigData()）
+      
+      return true;
+    } else {
+      taskLogger.logTaskProgress(currentTaskId, "config_unchanged", "No config changes");
+      return true;
+    }
+  }
+
   @Override
   public void handleError(Throwable error) {
     logger.log(Level.WARNING, "Config poll failed: {0}", error.getMessage());
@@ -126,7 +177,9 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   }
 
   /**
-   * 发起配置轮询请求
+   * 发起配置轮询请求（独立模式）
+   *
+   * <p>直接调用 /v1/control/poll/config 端点
    *
    * @return 配置响应 Future
    */

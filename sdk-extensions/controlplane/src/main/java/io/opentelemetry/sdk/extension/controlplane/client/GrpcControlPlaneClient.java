@@ -9,6 +9,7 @@ import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -122,6 +123,20 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
   }
 
   @Override
+  public CompletableFuture<UnifiedPollResponse> poll(UnifiedPollRequest request) {
+    checkNotClosed();
+    checkOtlpHealth();
+
+    // TODO: 当前返回占位实现
+    return CompletableFuture.completedFuture(
+        new DefaultUnifiedPollResponse(
+            /* success= */ false,
+            /* hasAnyChanges= */ false,
+            Collections.emptyMap(),
+            "gRPC not implemented yet"));
+  }
+
+  @Override
   public CompletableFuture<ConfigResponse> getConfig(ConfigRequest request) {
     checkNotClosed();
     checkOtlpHealth();
@@ -227,6 +242,44 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
   }
 
   // ===== 默认响应实现 (与 HTTP 客户端共享) =====
+
+  private static final class DefaultUnifiedPollResponse implements UnifiedPollResponse {
+    private final boolean success;
+    private final boolean hasAnyChanges;
+    private final Map<String, PollResult> results;
+    private final String errorMessage;
+
+    DefaultUnifiedPollResponse(
+        boolean success,
+        boolean hasAnyChanges,
+        Map<String, PollResult> results,
+        String errorMessage) {
+      this.success = success;
+      this.hasAnyChanges = hasAnyChanges;
+      this.results = results;
+      this.errorMessage = errorMessage;
+    }
+
+    @Override
+    public boolean isSuccess() {
+      return success;
+    }
+
+    @Override
+    public boolean hasAnyChanges() {
+      return hasAnyChanges;
+    }
+
+    @Override
+    public Map<String, PollResult> getResults() {
+      return results;
+    }
+
+    @Override
+    public String getErrorMessage() {
+      return errorMessage;
+    }
+  }
 
   private static final class DefaultConfigResponse implements ConfigResponse {
     private final boolean success;

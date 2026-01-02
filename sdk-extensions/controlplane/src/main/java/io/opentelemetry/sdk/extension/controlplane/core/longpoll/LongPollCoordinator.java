@@ -6,6 +6,9 @@
 package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.UnifiedPollRequest;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.UnifiedPollResponse;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
@@ -16,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -34,10 +38,10 @@ import javax.annotation.Nullable;
  *
  * <ul>
  *   <li>管理长轮询请求的发起和响应处理
+ *   <li>使用统一的 /v1/control/poll 端点同时获取配置和任务
  *   <li>通过 LongPollHandler 实现业务逻辑解耦
  *   <li>支持动态注册/注销 Handler（开闭原则）
  *   <li>实现指数退避重试机制
- *   <li>使用 Selector 模式管理多个长轮询通道
  *   <li>监控连接状态并自动重连
  * </ul>
  *
@@ -65,9 +69,11 @@ public final class LongPollCoordinator implements Closeable {
   private final LongPollConfig config;
 
   // 依赖组件
+  private final ControlPlaneClient client;
   private final ConnectionStateManager connectionStateManager;
   private final HealthCheckCoordinator healthCheckCoordinator;
   private final ControlPlaneStatistics statistics;
+  private final String agentId;
 
   // Handler 列表（支持动态注册，遵循开闭原则）
   private final List<LongPollHandler<?>> handlers;
@@ -105,9 +111,11 @@ public final class LongPollCoordinator implements Closeable {
       ControlPlaneStatistics statistics,
       String agentId) {
     this.config = config;
+    this.client = client;
     this.connectionStateManager = connectionStateManager;
     this.healthCheckCoordinator = healthCheckCoordinator;
     this.statistics = statistics;
+    this.agentId = agentId;
 
     this.state = new AtomicReference<>(State.IDLE);
     this.running = new AtomicBoolean(false);
@@ -279,8 +287,8 @@ public final class LongPollCoordinator implements Closeable {
         state.set(State.POLLING);
         taskLogger.logTaskStarted(taskId, Thread.currentThread().getName());
 
-        // 执行合并长轮询
-        boolean success = executeCombinedPoll(taskId, count);
+        // 执行统一长轮询
+        boolean success = executeUnifiedPoll(taskId, count);
 
         if (success) {
           // 成功后重置退避和连续错误计数
@@ -357,16 +365,16 @@ public final class LongPollCoordinator implements Closeable {
   }
 
   /**
-   * 执行合并长轮询（同时获取配置和任务）
+   * 执行统一长轮询（使用 /v1/control/poll 端点）
    *
-   * <p>遍历所有注册的 Handler，统一发起请求并通过 Selector 模式管理响应。 遵循开闭原则：新增轮询类型只需注册
+   * <p>一次请求同时获取配置和任务更新，然后分发给各 Handler 处理。 遵循开闭原则：新增轮询类型只需注册
    * Handler，无需修改此方法。
    *
    * @param taskId 任务ID
    * @param count 轮询计数
    * @return 是否成功
    */
-  private boolean executeCombinedPoll(String taskId, long count) {
+  private boolean executeUnifiedPoll(String taskId, long count) {
     if (handlers.isEmpty()) {
       logger.log(Level.WARNING, "No handlers registered, skipping poll");
       return true;
@@ -375,46 +383,172 @@ public final class LongPollCoordinator implements Closeable {
     taskLogger.logTaskProgress(
         taskId,
         "polling",
-        "Sending combined long poll request for " + handlers.size() + " handlers");
+        "Sending unified long poll request to /v1/control/poll");
 
-    // 创建 Selector
-    LongPollSelector selector = new LongPollSelector();
-
-    // 遍历所有 Handler，设置任务 ID 并注册到 Selector
+    // 设置任务 ID 到所有 Handler（用于日志追踪）
     for (LongPollHandler<?> handler : handlers) {
-      // 设置任务 ID（用于日志追踪）
       handler.setCurrentTaskId(taskId);
-
-      // 发起请求并注册到 Selector
-      registerHandlerToSelector(selector, handler);
     }
 
-    // 使用 Selector 等待并处理所有响应（由各 Handler 处理业务逻辑）
-    long timeout = config.getTimeoutMillis() + 5000;
-    LongPollSelector.SelectResult result = selector.selectAll(timeout);
+    // 记录轮询统计
+    statistics.recordConfigPoll();
+    statistics.recordTaskPoll();
 
-    logger.log(
-        Level.FINE,
-        "Long poll completed (count: {0}, handlers: {1}): {2}",
-        new Object[] {count, handlers.size(), result});
+    // 构建统一请求
+    UnifiedPollRequest request = createUnifiedPollRequest();
 
-    // 超时不算失败（长轮询的正常行为）
-    // 只有当有失败且无成功时才算失败
-    return result.getFailureCount() == 0 || result.getSuccessCount() > 0;
+    try {
+      // 发起统一轮询请求
+      CompletableFuture<UnifiedPollResponse> future = client.poll(request);
+      
+      // 等待响应（带超时）
+      long timeout = config.getTimeoutMillis() + 5000;
+      UnifiedPollResponse response = future.get(timeout, TimeUnit.MILLISECONDS);
+
+      // 处理响应
+      return processUnifiedResponse(count, response);
+
+    } catch (java.util.concurrent.TimeoutException e) {
+      // 超时是长轮询的正常行为
+      logger.log(Level.FINE, "Long poll timeout (normal behavior), count: {0}", count);
+      return true;
+    } catch (java.util.concurrent.ExecutionException e) {
+      Throwable cause = e.getCause() != null ? e.getCause() : e;
+      logger.log(Level.WARNING, "Long poll execution failed: {0}", cause.getMessage());
+      notifyHandlersError(cause);
+      return false;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
   }
 
   /**
-   * 将 Handler 注册到 Selector
+   * 处理统一轮询响应
    *
-   * <p>独立方法便于类型安全和未来扩展
+   * <p>将响应中的各类型结果分发给对应的 Handler 处理
    *
-   * @param selector 选择器
-   * @param handler 处理器
-   * @param <R> 响应类型
+   * @param count 轮询计数
+   * @param response 统一响应
+   * @return 是否成功
    */
-  private static <R> void registerHandlerToSelector(
-      LongPollSelector selector, LongPollHandler<R> handler) {
-    selector.register(handler, handler.poll());
+  private boolean processUnifiedResponse(long count, UnifiedPollResponse response) {
+    
+    if (!response.isSuccess()) {
+      logger.log(Level.WARNING, "Unified poll failed: {0}", response.getErrorMessage());
+      return false;
+    }
+
+    state.set(State.PROCESSING);
+    
+    int successCount = 0;
+    int failureCount = 0;
+
+    // 遍历响应中的各类型结果，分发给对应的 Handler
+    for (LongPollHandler<?> handler : handlers) {
+      String typeKey = handler.getType().name();
+      PollResult result = response.getResults().get(typeKey);
+
+      if (result != null) {
+        try {
+          // 使用类型安全的方式处理响应
+          boolean processed = processHandlerResult(handler, result);
+          if (processed) {
+            successCount++;
+          }
+        } catch (RuntimeException e) {
+          logger.log(
+              Level.WARNING,
+              "Handler {0} failed to process result: {1}",
+              new Object[] {typeKey, e.getMessage()});
+          handler.handleError(e);
+          failureCount++;
+        }
+      }
+    }
+
+    logger.log(
+        Level.FINE,
+        "Unified poll completed (count: {0}): success={1}, failure={2}, hasAnyChanges={3}",
+        new Object[] {count, successCount, failureCount, response.hasAnyChanges()});
+
+    // 记录成功统计
+    if (response.getConfigResult() != null) {
+      statistics.recordConfigFetchSuccess();
+    }
+
+    // 只有当有失败且无成功时才算失败
+    return failureCount == 0 || successCount > 0;
+  }
+
+  /**
+   * 处理单个 Handler 的结果
+   *
+   * @param handler 处理器
+   * @param result 轮询结果
+   * @return 是否成功处理
+   */
+  private static boolean processHandlerResult(LongPollHandler<?> handler, PollResult result) {
+    LongPollType type = handler.getType();
+
+    if (type == LongPollType.CONFIG) {
+      ConfigLongPollHandler configHandler = (ConfigLongPollHandler) handler;
+      return configHandler.processUnifiedResult(result);
+    } else if (type == LongPollType.TASK) {
+      TaskLongPollHandler taskHandler = (TaskLongPollHandler) handler;
+      return taskHandler.processUnifiedResult(result);
+    }
+
+    logger.log(Level.WARNING, "Unknown handler type: {0}", type);
+    return false;
+  }
+
+  /**
+   * 通知所有 Handler 发生错误
+   *
+   * @param error 错误
+   */
+  private void notifyHandlersError(Throwable error) {
+    for (LongPollHandler<?> handler : handlers) {
+      try {
+        handler.handleError(error);
+      } catch (RuntimeException e) {
+        logger.log(Level.WARNING, "Handler error notification failed: {0}", e.getMessage());
+      }
+    }
+  }
+
+  /**
+   * 创建统一轮询请求
+   *
+   * @return 统一轮询请求
+   */
+  private UnifiedPollRequest createUnifiedPollRequest() {
+    // 从 ConfigHandler 获取当前配置版本和 ETag
+    String configVersion = getCurrentConfigVersion();
+    String configEtag = getCurrentConfigEtag();
+
+    return new UnifiedPollRequest() {
+      @Override
+      public String getAgentId() {
+        return agentId;
+      }
+
+      @Override
+      public String getCurrentConfigVersion() {
+        return configVersion;
+      }
+
+      @Override
+      public String getCurrentConfigEtag() {
+        return configEtag;
+      }
+
+      @Override
+      public long getTimeoutMillis() {
+        return config.getTimeoutMillis();
+      }
+    };
   }
 
   // ===== Getters =====

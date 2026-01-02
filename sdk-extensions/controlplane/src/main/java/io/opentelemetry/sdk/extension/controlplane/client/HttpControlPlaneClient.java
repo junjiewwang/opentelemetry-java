@@ -12,8 +12,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,14 +36,29 @@ import okhttp3.ResponseBody;
  * HTTP/Protobuf 控制平面客户端实现
  *
  * <p>使用 HTTP 长轮询方式与控制平面服务通信，数据格式为 Protobuf。
+ *
+ * <p>API 端点：
+ * <ul>
+ *   <li>POST /v1/control/poll - 统一长轮询（配置+任务）
+ *   <li>POST /v1/control/poll/config - 仅配置长轮询
+ *   <li>POST /v1/control/poll/tasks - 仅任务长轮询
+ * </ul>
  */
 public final class HttpControlPlaneClient implements ControlPlaneClient {
 
   private static final Logger logger = Logger.getLogger(HttpControlPlaneClient.class.getName());
   private static final MediaType PROTOBUF_TYPE = MediaType.parse("application/x-protobuf");
+  private static final MediaType JSON_TYPE = MediaType.parse("application/json");
   private static final String HEADER_CONTENT_ENCODING = "Content-Encoding";
   private static final String HEADER_ACCEPT_ENCODING = "Accept-Encoding";
   private static final String GZIP = "gzip";
+
+  // API 路径常量（相对于 baseUrl，baseUrl 应为 http://host:port/v1/control）
+  private static final String PATH_UNIFIED_POLL = "/poll";
+  private static final String PATH_CONFIG_POLL = "/poll/config";
+  private static final String PATH_TASKS_POLL = "/poll/tasks";
+  private static final String PATH_STATUS = "/status";
+  private static final String PATH_UPLOAD_CHUNK = "/upload-chunk";
 
   private final OtlpHealthMonitor healthMonitor;
   private final OkHttpClient httpClient;
@@ -89,6 +106,30 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
   }
 
   @Override
+  public CompletableFuture<UnifiedPollResponse> poll(UnifiedPollRequest request) {
+    checkNotClosed();
+    checkOtlpHealth();
+
+    CompletableFuture<UnifiedPollResponse> future = new CompletableFuture<>();
+
+    // 构建请求体
+    byte[] requestBody = serializeUnifiedPollRequest(request);
+
+    Request httpRequest =
+        buildRequest(baseUrl + PATH_UNIFIED_POLL)
+            .post(RequestBody.create(requestBody, JSON_TYPE))
+            .build();
+
+    executeAsync(
+        httpRequest,
+        future,
+        responseBody -> parseUnifiedPollResponse(responseBody),
+        DefaultUnifiedPollResponse::error);
+
+    return future;
+  }
+
+  @Override
   public CompletableFuture<ConfigResponse> getConfig(ConfigRequest request) {
     checkNotClosed();
     checkOtlpHealth();
@@ -99,7 +140,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = serializeConfigRequest(request);
 
     Request httpRequest =
-        buildRequest(baseUrl + "/config")
+        buildRequest(baseUrl + PATH_CONFIG_POLL)
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
             .build();
 
@@ -122,7 +163,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = serializeTaskRequest(request);
 
     Request httpRequest =
-        buildRequest(baseUrl + "/tasks")
+        buildRequest(baseUrl + PATH_TASKS_POLL)
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
             .build();
 
@@ -145,7 +186,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = request.getStatusData();
 
     Request httpRequest =
-        buildRequest(baseUrl + "/status")
+        buildRequest(baseUrl + PATH_STATUS)
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
             .build();
 
@@ -167,7 +208,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     byte[] requestBody = serializeChunkedTaskResult(chunk);
 
     Request httpRequest =
-        buildRequest(baseUrl + "/upload-chunk")
+        buildRequest(baseUrl + PATH_UPLOAD_CHUNK)
             .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
             .build();
 
@@ -196,8 +237,8 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     // 使用空的请求体作为简单的连接检查
     String emptyRequest = "{}";
     Request httpRequest =
-        buildRequest(baseUrl + "/config")
-            .post(RequestBody.create(emptyRequest.getBytes(StandardCharsets.UTF_8), PROTOBUF_TYPE))
+        buildRequest(baseUrl + PATH_UNIFIED_POLL)
+            .post(RequestBody.create(emptyRequest.getBytes(StandardCharsets.UTF_8), JSON_TYPE))
             .build();
 
     try (Response response = httpClient.newCall(httpRequest).execute()) {
@@ -231,10 +272,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
       }
     } catch (IOException e) {
       // 网络错误
-      logger.log(
-          Level.WARNING,
-          "Control plane connection failed: {0}",
-          e.getMessage());
+      logger.log(Level.WARNING, "Control plane connection failed: {0}", e.getMessage());
       return false;
     }
   }
@@ -281,7 +319,6 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     Request.Builder builder =
         new Request.Builder()
             .url(url)
-            .header("Content-Type", "application/x-protobuf")
             .header(HEADER_ACCEPT_ENCODING, GZIP);
 
     // 添加缓存的 Authorization Header
@@ -304,8 +341,13 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
             new Callback() {
               @Override
               public void onFailure(Call call, IOException e) {
-                logger.log(Level.WARNING, "HTTP request failed: {0}", e.getMessage());
-                String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown error";
+                String endpoint = request.url().encodedPath();
+                logger.log(
+                    Level.WARNING,
+                    "HTTP request failed: endpoint={0}, error={1}",
+                    new Object[] {endpoint, e.getMessage()});
+                String errorMsg =
+                    "endpoint=" + endpoint + ", " + (e.getMessage() != null ? e.getMessage() : "Unknown error");
                 future.complete(errorFactory.create(errorMsg));
               }
 
@@ -313,7 +355,13 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
               public void onResponse(Call call, Response response) {
                 try (ResponseBody body = response.body()) {
                   if (!response.isSuccessful()) {
-                    String errorMsg = "HTTP " + response.code() + ": " + response.message();
+                    String endpoint = request.url().encodedPath();
+                    String errorMsg =
+                        "HTTP " + response.code() + ": " + response.message() + " (endpoint: " + endpoint + ")";
+                    logger.log(
+                        Level.FINE,
+                        "HTTP request unsuccessful: endpoint={0}, code={1}, message={2}",
+                        new Object[] {endpoint, response.code(), response.message()});
                     future.complete(errorFactory.create(errorMsg));
                     return;
                   }
@@ -353,7 +401,20 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     }
   }
 
-  // ===== 序列化方法 (简化版本，实际应使用 Protobuf) =====
+  // ===== 序列化方法 =====
+
+  private static byte[] serializeUnifiedPollRequest(UnifiedPollRequest request) {
+    // 按照新的 API 格式序列化
+    String json =
+        String.format(
+            Locale.ROOT,
+            "{\"agent_id\":\"%s\",\"current_config_version\":\"%s\",\"current_config_etag\":\"%s\",\"timeout_millis\":%d}",
+            request.getAgentId(),
+            request.getCurrentConfigVersion(),
+            request.getCurrentConfigEtag(),
+            request.getTimeoutMillis());
+    return json.getBytes(StandardCharsets.UTF_8);
+  }
 
   private static byte[] serializeConfigRequest(ConfigRequest request) {
     // TODO: 使用 Protobuf 序列化
@@ -361,7 +422,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     String json =
         String.format(
             Locale.ROOT,
-            "{\"agentId\":\"%s\",\"configVersion\":\"%s\",\"etag\":\"%s\",\"timeout\":%d}",
+            "{\"agent_id\":\"%s\",\"current_config_version\":\"%s\",\"current_config_etag\":\"%s\",\"timeout_millis\":%d}",
             request.getAgentId(),
             request.getCurrentConfigVersion(),
             request.getCurrentEtag(),
@@ -374,7 +435,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     String json =
         String.format(
             Locale.ROOT,
-            "{\"agentId\":\"%s\",\"timeout\":%d}",
+            "{\"agent_id\":\"%s\",\"timeout_millis\":%d}",
             request.getAgentId(),
             request.getLongPollTimeoutMillis());
     return json.getBytes(StandardCharsets.UTF_8);
@@ -385,7 +446,34 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     return chunk.getChunkData();
   }
 
-  // ===== 解析方法 (简化版本) =====
+  // ===== 解析方法 =====
+
+  @SuppressWarnings("UnusedVariable")
+  private static UnifiedPollResponse parseUnifiedPollResponse(byte[] data) {
+    // TODO: 使用 JSON/Protobuf 反序列化
+    // 这里返回简化的实现
+    String json = new String(data, StandardCharsets.UTF_8);
+    
+    // 简化解析（实际应使用 JSON 解析器）
+    boolean hasAnyChanges = json.contains("\"has_any_changes\":true") 
+        || json.contains("\"has_any_changes\": true");
+    
+    Map<String, PollResult> results = new HashMap<>();
+    
+    // 解析 CONFIG 结果
+    if (json.contains("\"CONFIG\"")) {
+      boolean configHasChanges = json.contains("\"has_changes\":true") 
+          || json.contains("\"has_changes\": true");
+      results.put("CONFIG", new DefaultPollResult("CONFIG", configHasChanges, null, null, null, null));
+    }
+    
+    // 解析 TASK 结果
+    if (json.contains("\"TASK\"")) {
+      results.put("TASK", new DefaultPollResult("TASK", /* hasChanges= */ false, null, null, null, Collections.emptyList()));
+    }
+    
+    return new DefaultUnifiedPollResponse(/* success= */ true, hasAnyChanges, results, "");
+  }
 
   @SuppressWarnings("UnusedVariable")
   private static ConfigResponse parseConfigResponse(byte[] data) {
@@ -425,6 +513,109 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
   }
 
   // ===== 默认响应实现 =====
+
+  /** 默认统一轮询响应实现 */
+  private static final class DefaultUnifiedPollResponse implements UnifiedPollResponse {
+    private final boolean success;
+    private final boolean hasAnyChanges;
+    private final Map<String, PollResult> results;
+    private final String errorMessage;
+
+    DefaultUnifiedPollResponse(
+        boolean success,
+        boolean hasAnyChanges,
+        Map<String, PollResult> results,
+        String errorMessage) {
+      this.success = success;
+      this.hasAnyChanges = hasAnyChanges;
+      this.results = results;
+      this.errorMessage = errorMessage;
+    }
+
+    static UnifiedPollResponse error(String errorMessage) {
+      return new DefaultUnifiedPollResponse(
+          /* success= */ false, /* hasAnyChanges= */ false, Collections.emptyMap(), errorMessage);
+    }
+
+    @Override
+    public boolean isSuccess() {
+      return success;
+    }
+
+    @Override
+    public boolean hasAnyChanges() {
+      return hasAnyChanges;
+    }
+
+    @Override
+    public Map<String, PollResult> getResults() {
+      return results;
+    }
+
+    @Override
+    public String getErrorMessage() {
+      return errorMessage;
+    }
+  }
+
+  /** 默认轮询结果实现 */
+  private static final class DefaultPollResult implements PollResult {
+    private final String type;
+    private final boolean hasChanges;
+    @Nullable private final byte[] configData;
+    @Nullable private final String configVersion;
+    @Nullable private final String configEtag;
+    @Nullable private final List<TaskInfo> tasks;
+
+    DefaultPollResult(
+        String type,
+        boolean hasChanges,
+        @Nullable byte[] configData,
+        @Nullable String configVersion,
+        @Nullable String configEtag,
+        @Nullable List<TaskInfo> tasks) {
+      this.type = type;
+      this.hasChanges = hasChanges;
+      this.configData = configData;
+      this.configVersion = configVersion;
+      this.configEtag = configEtag;
+      this.tasks = tasks;
+    }
+
+    @Override
+    public String getType() {
+      return type;
+    }
+
+    @Override
+    public boolean hasChanges() {
+      return hasChanges;
+    }
+
+    @Override
+    @Nullable
+    public byte[] getConfigData() {
+      return configData;
+    }
+
+    @Override
+    @Nullable
+    public String getConfigVersion() {
+      return configVersion;
+    }
+
+    @Override
+    @Nullable
+    public String getConfigEtag() {
+      return configEtag;
+    }
+
+    @Override
+    @Nullable
+    public List<TaskInfo> getTasks() {
+      return tasks;
+    }
+  }
 
   private static final class DefaultConfigResponse implements ConfigResponse {
     private final boolean success;

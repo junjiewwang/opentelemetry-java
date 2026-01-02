@@ -8,17 +8,36 @@ package io.opentelemetry.sdk.extension.controlplane.client;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
 import java.io.Closeable;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import javax.annotation.Nullable;
 
 /**
  * 控制平面客户端接口
  *
  * <p>定义与控制平面服务通信的标准接口，支持 HTTP/Protobuf 和 gRPC 两种协议实现。
+ *
+ * <p>API 端点：
+ * <ul>
+ *   <li>POST /v1/control/poll - 统一长轮询（配置+任务）
+ *   <li>POST /v1/control/poll/config - 仅配置长轮询
+ *   <li>POST /v1/control/poll/tasks - 仅任务长轮询
+ * </ul>
  */
 public interface ControlPlaneClient extends Closeable {
 
   /**
-   * 拉取配置 (长轮询)
+   * 统一长轮询（同时获取配置和任务）
+   *
+   * <p>这是推荐的主要方法，一次请求同时获取配置更新和待执行任务。
+   *
+   * @param request 统一轮询请求
+   * @return 统一轮询响应的 CompletableFuture
+   */
+  CompletableFuture<UnifiedPollResponse> poll(UnifiedPollRequest request);
+
+  /**
+   * 拉取配置 (长轮询) - 仅配置
    *
    * @param request 配置请求
    * @return 配置响应的 CompletableFuture
@@ -26,7 +45,7 @@ public interface ControlPlaneClient extends Closeable {
   CompletableFuture<ConfigResponse> getConfig(ConfigRequest request);
 
   /**
-   * 拉取任务 (长轮询)
+   * 拉取任务 (长轮询) - 仅任务
    *
    * @param request 任务请求
    * @return 任务响应的 CompletableFuture
@@ -78,6 +97,70 @@ public interface ControlPlaneClient extends Closeable {
     } else {
       return new HttpControlPlaneClient(config, healthMonitor);
     }
+  }
+
+  // ===== 统一轮询请求/响应 DTO =====
+
+  /** 统一轮询请求 */
+  interface UnifiedPollRequest {
+    String getAgentId();
+
+    String getCurrentConfigVersion();
+
+    String getCurrentConfigEtag();
+
+    long getTimeoutMillis();
+  }
+
+  /** 统一轮询响应 */
+  interface UnifiedPollResponse {
+    boolean isSuccess();
+
+    boolean hasAnyChanges();
+
+    /**
+     * 获取各类型的轮询结果
+     *
+     * @return 类型到结果的映射，key 为 "CONFIG" 或 "TASK"
+     */
+    Map<String, PollResult> getResults();
+
+    String getErrorMessage();
+
+    /** 获取配置结果（便捷方法） */
+    @Nullable
+    default PollResult getConfigResult() {
+      return getResults().get("CONFIG");
+    }
+
+    /** 获取任务结果（便捷方法） */
+    @Nullable
+    default PollResult getTaskResult() {
+      return getResults().get("TASK");
+    }
+  }
+
+  /** 单个类型的轮询结果 */
+  interface PollResult {
+    String getType();
+
+    boolean hasChanges();
+
+    /** 配置数据（仅 CONFIG 类型有效） */
+    @Nullable
+    byte[] getConfigData();
+
+    /** 配置版本（仅 CONFIG 类型有效） */
+    @Nullable
+    String getConfigVersion();
+
+    /** 配置 ETag（仅 CONFIG 类型有效） */
+    @Nullable
+    String getConfigEtag();
+
+    /** 任务列表（仅 TASK 类型有效） */
+    @Nullable
+    java.util.List<TaskInfo> getTasks();
   }
 
   // ===== 请求/响应 DTO =====
