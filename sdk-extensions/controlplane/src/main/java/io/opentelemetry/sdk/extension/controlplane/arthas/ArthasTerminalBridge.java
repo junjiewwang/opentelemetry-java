@@ -52,6 +52,7 @@ public final class ArthasTerminalBridge implements Closeable {
   private final AtomicBoolean closed = new AtomicBoolean(false);
 
   @Nullable private ArthasBootstrap arthasBootstrap;
+  @Nullable private ArthasLifecycleManager lifecycleManager;
   @Nullable private ScheduledExecutorService scheduler;
   @Nullable private ScheduledFuture<?> flushTask;
 
@@ -73,6 +74,15 @@ public final class ArthasTerminalBridge implements Closeable {
    */
   public void setArthasBootstrap(ArthasBootstrap bootstrap) {
     this.arthasBootstrap = bootstrap;
+  }
+
+  /**
+   * 设置 Arthas 生命周期管理器
+   *
+   * @param lifecycleManager 生命周期管理器
+   */
+  public void setLifecycleManager(ArthasLifecycleManager lifecycleManager) {
+    this.lifecycleManager = lifecycleManager;
   }
 
   /**
@@ -258,18 +268,48 @@ public final class ArthasTerminalBridge implements Closeable {
    */
   @SuppressWarnings("UnusedVariable")
   private boolean tryBindToArthasSession(SessionTerminal terminal, ArthasSession session) {
-    if (arthasBootstrap == null || !arthasBootstrap.isRunning()) {
+    // 优先检查 LifecycleManager 状态（更准确）
+    if (lifecycleManager != null) {
+      ArthasLifecycleManager.State state = lifecycleManager.getState();
+      if (state != ArthasLifecycleManager.State.RUNNING 
+          && state != ArthasLifecycleManager.State.REGISTERED
+          && state != ArthasLifecycleManager.State.IDLE) {
+        logger.log(Level.FINE, 
+            "Arthas not in running state (via LifecycleManager), current state: {0}", state);
+        return false;
+      }
+    } else if (arthasBootstrap == null || !arthasBootstrap.isRunning()) {
+      // 降级检查 ArthasBootstrap
       logger.log(Level.FINE, "Arthas bootstrap not available or not running");
       return false;
     }
 
-    Object bootstrap = arthasBootstrap.getBootstrapInstance();
+    // 获取 ArthasBootstrap（优先从 lifecycleManager 获取）
+    ArthasBootstrap effectiveBootstrap = arthasBootstrap;
+    if (lifecycleManager != null) {
+      effectiveBootstrap = lifecycleManager.getArthasBootstrap();
+    }
+    
+    if (effectiveBootstrap == null) {
+      logger.log(Level.FINE, "Effective ArthasBootstrap is null");
+      return false;
+    }
+
+    Object bootstrap = effectiveBootstrap.getBootstrapInstance();
     if (bootstrap == null) {
       logger.log(Level.FINE, "Arthas bootstrap instance is null");
       return false;
     }
 
-    ClassLoader loader = arthasBootstrap.getArthasClassLoader();
+    // 检查是否是 Mock 模式（Mock 模式下无法真正绑定会话）
+    if (bootstrap.getClass().getSimpleName().contains("Mock")) {
+      logger.log(Level.INFO, 
+          "Running in mock mode, real Arthas binding not available. " +
+          "Session will operate in echo mode for testing.");
+      return false;
+    }
+
+    ClassLoader loader = effectiveBootstrap.getArthasClassLoader();
     if (loader == null) {
       logger.log(Level.FINE, "Arthas ClassLoader is null");
       return false;

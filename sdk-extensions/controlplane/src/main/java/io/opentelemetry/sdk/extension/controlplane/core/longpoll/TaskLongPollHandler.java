@@ -361,21 +361,38 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
           Level.WARNING,
           "[TASK-NO-EXECUTOR] No executor registered for task type: {0}, taskId={1}",
           new Object[] {task.getTaskType(), task.getTaskId()});
-      // TaskDispatcher.dispatch 内部会处理无执行器的情况并上报
+      // TaskDispatcher.dispatchWithResult 内部会处理无执行器的情况并上报
     }
 
-    // 分发任务
-    boolean dispatched = dispatcher.dispatch(task);
-    if (dispatched) {
+    // 分发任务（使用新的返回详细结果的方法）
+    TaskDispatcher.DispatchResult result = dispatcher.dispatchWithResult(task);
+    
+    if (result.isSuccess()) {
       logger.log(
           Level.INFO,
           "[TASK-DISPATCHED] Task dispatched to executor: taskId={0}, type={1}",
           new Object[] {task.getTaskId(), task.getTaskType()});
+    } else if (result.isAlreadyRunning()) {
+      // 任务已经在运行中，向服务端上报 RUNNING 状态
+      // 这样服务端就知道任务正在执行，不会重复下发
+      logger.log(
+          Level.INFO,
+          "[TASK-ALREADY-RUNNING] Task already running, reporting RUNNING status to server: taskId={0}, type={1}",
+          new Object[] {task.getTaskId(), task.getTaskType()});
+      long nowMillis = System.currentTimeMillis();
+      reportTaskResultToServer(
+          task.getTaskId(),
+          TaskStatus.RUNNING,
+          null,
+          "Task is already running",
+          nowMillis);
     } else {
+      // 其他失败情况（NO_EXECUTOR, EXECUTOR_UNAVAILABLE, DISPATCHER_CLOSED）
+      // TaskDispatcher 内部已经上报了失败状态
       logger.log(
           Level.WARNING,
-          "[TASK-DISPATCH-FAILED] Failed to dispatch task: taskId={0}, type={1}",
-          new Object[] {task.getTaskId(), task.getTaskType()});
+          "[TASK-DISPATCH-FAILED] Failed to dispatch task: taskId={0}, type={1}, reason={2}",
+          new Object[] {task.getTaskId(), task.getTaskType(), result.getMessage()});
     }
   }
 

@@ -43,6 +43,69 @@ import javax.annotation.Nullable;
  */
 public final class TaskDispatcher implements Closeable {
 
+  /** 分发结果状态 */
+  public enum DispatchStatus {
+    /** 分发成功，任务正在执行 */
+    SUCCESS,
+    /** 任务已经在运行中（幂等性检查） */
+    ALREADY_RUNNING,
+    /** 分发器已关闭 */
+    DISPATCHER_CLOSED,
+    /** 没有对应的执行器 */
+    NO_EXECUTOR,
+    /** 执行器不可用 */
+    EXECUTOR_UNAVAILABLE
+  }
+
+  /** 分发结果 */
+  public static final class DispatchResult {
+    private final DispatchStatus status;
+    private final String message;
+
+    private DispatchResult(DispatchStatus status, String message) {
+      this.status = status;
+      this.message = message;
+    }
+
+    public static DispatchResult success() {
+      return new DispatchResult(DispatchStatus.SUCCESS, "Task dispatched successfully");
+    }
+
+    public static DispatchResult alreadyRunning() {
+      return new DispatchResult(DispatchStatus.ALREADY_RUNNING, "Task already running");
+    }
+
+    public static DispatchResult dispatcherClosed() {
+      return new DispatchResult(DispatchStatus.DISPATCHER_CLOSED, "TaskDispatcher is closed");
+    }
+
+    public static DispatchResult noExecutor(String taskType) {
+      return new DispatchResult(DispatchStatus.NO_EXECUTOR, 
+          "No executor registered for task type: " + taskType);
+    }
+
+    public static DispatchResult executorUnavailable(String taskType) {
+      return new DispatchResult(DispatchStatus.EXECUTOR_UNAVAILABLE, 
+          "Executor for " + taskType + " is not available");
+    }
+
+    public DispatchStatus getStatus() {
+      return status;
+    }
+
+    public String getMessage() {
+      return message;
+    }
+
+    public boolean isSuccess() {
+      return status == DispatchStatus.SUCCESS;
+    }
+
+    public boolean isAlreadyRunning() {
+      return status == DispatchStatus.ALREADY_RUNNING;
+    }
+  }
+
   private static final Logger logger = Logger.getLogger(TaskDispatcher.class.getName());
 
   /** 默认任务超时时间：60秒 */
@@ -156,17 +219,32 @@ public final class TaskDispatcher implements Closeable {
   }
 
   /**
-   * 分发任务
+   * 分发任务（返回简单的 boolean）
    *
    * <p>根据任务类型查找执行器，异步执行任务，并在完成后上报结果
    *
    * @param taskInfo 任务信息
    * @return 分发是否成功（不代表执行成功）
+   * @deprecated 推荐使用 {@link #dispatchWithResult(TaskInfo)} 获取详细的分发结果
    */
+  @Deprecated
   public boolean dispatch(TaskInfo taskInfo) {
+    return dispatchWithResult(taskInfo).isSuccess();
+  }
+
+  /**
+   * 分发任务（返回详细结果）
+   *
+   * <p>根据任务类型查找执行器，异步执行任务，并在完成后上报结果。
+   * 返回详细的分发结果，包括状态和原因。
+   *
+   * @param taskInfo 任务信息
+   * @return 分发结果
+   */
+  public DispatchResult dispatchWithResult(TaskInfo taskInfo) {
     if (closed) {
       logger.log(Level.WARNING, "TaskDispatcher is closed, rejecting task: {0}", taskInfo.getTaskId());
-      return false;
+      return DispatchResult.dispatcherClosed();
     }
 
     String taskId = taskInfo.getTaskId();
@@ -178,7 +256,7 @@ public final class TaskDispatcher implements Closeable {
           Level.WARNING,
           "[TASK-DUPLICATE] Task already running, skipping: taskId={0}",
           taskId);
-      return false;
+      return DispatchResult.alreadyRunning();
     }
 
     // 查找执行器
@@ -193,7 +271,7 @@ public final class TaskDispatcher implements Closeable {
       reportResult(taskId, TaskExecutionResult.failed(
           "NO_EXECUTOR",
           "No executor registered for task type: " + taskType));
-      return false;
+      return DispatchResult.noExecutor(taskType);
     }
 
     // 检查执行器是否可用
@@ -207,7 +285,7 @@ public final class TaskDispatcher implements Closeable {
       reportResult(taskId, TaskExecutionResult.failed(
           "EXECUTOR_UNAVAILABLE",
           "Executor for " + taskType + " is not available"));
-      return false;
+      return DispatchResult.executorUnavailable(taskType);
     }
 
     // 构建执行上下文
@@ -288,7 +366,7 @@ public final class TaskDispatcher implements Closeable {
       }
     }, taskExecutor);
 
-    return true;
+    return DispatchResult.success();
   }
 
   /**
@@ -493,6 +571,16 @@ public final class TaskDispatcher implements Closeable {
    */
   public int getRunningTaskCount() {
     return runningTasks.size();
+  }
+
+  /**
+   * 检查任务是否正在运行
+   *
+   * @param taskId 任务 ID
+   * @return 是否正在运行
+   */
+  public boolean isTaskRunning(String taskId) {
+    return runningTasks.contains(taskId);
   }
 
   /**

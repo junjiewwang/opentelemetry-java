@@ -115,7 +115,9 @@ public final class ArthasLifecycleManager implements Closeable {
   public StartResult tryStart(ScheduledExecutorService scheduler) {
     // 检查当前状态
     State currentState = state.get();
-    if (currentState == State.RUNNING || currentState == State.IDLE) {
+    if (currentState == State.RUNNING
+        || currentState == State.REGISTERED
+        || currentState == State.IDLE) {
       logger.log(Level.FINE, "Arthas already running, state: {0}", currentState);
       return StartResult.success();
     }
@@ -132,6 +134,15 @@ public final class ArthasLifecycleManager implements Closeable {
 
     // 尝试切换到启动中状态
     if (!state.compareAndSet(State.STOPPED, State.STARTING)) {
+      State after = state.get();
+      logger.log(
+          Level.FINE,
+          "Start attempt lost race, state changed: {0}",
+          after);
+      // 如果已经在运行/注册/空闲，视为成功（幂等）
+      if (after == State.RUNNING || after == State.REGISTERED || after == State.IDLE) {
+        return StartResult.success();
+      }
       return StartResult.failed("State changed during start attempt");
     }
 
@@ -141,7 +152,8 @@ public final class ArthasLifecycleManager implements Closeable {
 
     // 记录 Instrumentation 状态
     if (arthasBootstrap.getInstrumentation() == null) {
-      startupLogCollector.addLog("WARN", 
+      startupLogCollector.addLog(
+          "WARN",
           "Instrumentation not available - SpyAPI cannot be loaded to Bootstrap ClassLoader");
     } else {
       startupLogCollector.addLog("INFO", "Instrumentation available");
@@ -173,9 +185,19 @@ public final class ArthasLifecycleManager implements Closeable {
       // 启动最大运行时长检查任务
       scheduleMaxDurationCheck(scheduler);
 
-      // 切换到运行中状态
-      state.set(State.RUNNING);
-      startupLogCollector.addLog("INFO", "Arthas state changed to RUNNING");
+      // 切换到运行中状态：只在仍处于 STARTING 时更新，避免覆盖 REGISTERED/IDLE（注册 ACK 可能更早到达）
+      if (state.compareAndSet(State.STARTING, State.RUNNING)) {
+        startupLogCollector.addLog("INFO", "Arthas state changed to RUNNING");
+      } else {
+        State finalState = state.get();
+        logger.log(
+            Level.FINE,
+            "Skip setting RUNNING because state already changed to {0} during startup",
+            finalState);
+        startupLogCollector.addLog(
+            "INFO",
+            "Skip setting RUNNING because state already changed to " + finalState);
+      }
 
       logger.log(Level.INFO, "Arthas started successfully");
 
@@ -188,7 +210,8 @@ public final class ArthasLifecycleManager implements Closeable {
       logger.log(Level.SEVERE, "Failed to start Arthas", e);
       state.set(State.STOPPED);
       startupLogCollector.addLog("ERROR", "Exception during startup: " + e.getMessage());
-      return StartResult.failed("Failed to start Arthas: " + e.getMessage(), startupLogCollector.getLogs());
+      return StartResult.failed(
+          "Failed to start Arthas: " + e.getMessage(), startupLogCollector.getLogs());
     }
   }
 
@@ -246,23 +269,44 @@ public final class ArthasLifecycleManager implements Closeable {
 
   /**
    * 标记已向服务端注册成功
-   * 
+   *
    * <p>当 Tunnel 客户端收到 REGISTER_ACK 消息时调用
    */
   public void markRegistered() {
-    State currentState = state.get();
-    // 只有在 RUNNING 状态下才能切换到 REGISTERED
-    if (currentState == State.RUNNING) {
-      if (state.compareAndSet(State.RUNNING, State.REGISTERED)) {
-        logger.log(Level.INFO, "Arthas registered with server successfully");
-        startupLogCollector.addLog("INFO", "Agent registered with server");
+    while (true) {
+      State currentState = state.get();
+
+      // 终态/已就绪：保持幂等
+      if (currentState == State.REGISTERED || currentState == State.IDLE) {
+        logger.log(Level.FINE, "markRegistered ignored, already in state: {0}", currentState);
+        return;
       }
-    } else if (currentState == State.STARTING) {
-      // 如果还在启动中，先切换到 RUNNING，再切换到 REGISTERED
-      if (state.compareAndSet(State.STARTING, State.REGISTERED)) {
-        logger.log(Level.INFO, "Arthas started and registered with server");
-        startupLogCollector.addLog("INFO", "Agent started and registered with server");
+
+      // STOPPING/STOPPED：注册回调已过期或乱序到达，仅记录
+      if (currentState == State.STOPPING || currentState == State.STOPPED) {
+        logger.log(
+            Level.WARNING,
+            "markRegistered received when Arthas is not running (state={0}), ignoring",
+            currentState);
+        startupLogCollector.addLog(
+            "WARN",
+            "REGISTER_ACK received when state=" + currentState + ", ignored");
+        return;
       }
+
+      // STARTING/RUNNING：尝试切到 REGISTERED
+      if (state.compareAndSet(currentState, State.REGISTERED)) {
+        logger.log(
+            Level.INFO,
+            "Arthas registered with server successfully, state: {0} -> REGISTERED",
+            currentState);
+        startupLogCollector.addLog(
+            "INFO",
+            "Agent registered with server (" + currentState + " -> REGISTERED)");
+        return;
+      }
+
+      // CAS 失败：重试（并发状态变更）
     }
   }
 

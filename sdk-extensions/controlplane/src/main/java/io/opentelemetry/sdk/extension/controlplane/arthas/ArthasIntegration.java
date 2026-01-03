@@ -50,8 +50,9 @@ public final class ArthasIntegration
     // 设置会话管理器到 Tunnel 客户端
     this.tunnelClient.setSessionManager(sessionManager);
 
-    // 设置 Arthas Bootstrap 到终端桥接器
+    // 设置 Arthas Bootstrap 和生命周期管理器到终端桥接器
     this.terminalBridge.setArthasBootstrap(lifecycleManager.getArthasBootstrap());
+    this.terminalBridge.setLifecycleManager(lifecycleManager);
   }
 
   /**
