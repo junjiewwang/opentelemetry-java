@@ -69,6 +69,9 @@ public final class ArthasConfig {
   private static final String ARTHAS_OUTPUT_FLUSH_INTERVAL =
       "otel.agent.arthas.output.flush.interval";
 
+  // 认证配置（从 ControlPlaneConfig 继承）
+  private static final String ARTHAS_AUTH_TOKEN = "otel.agent.arthas.auth.token";
+
   // ===== 默认值 =====
   private static final boolean DEFAULT_ENABLED = false;
   private static final String DEFAULT_VERSION = "4.0.3";
@@ -115,6 +118,9 @@ public final class ArthasConfig {
   // 用于动态生成默认 Tunnel 端点的基础 endpoint
   @Nullable private final String baseOtlpEndpoint;
 
+  // 认证 Token（用于 Tunnel 连接）
+  @Nullable private final String authToken;
+
   private ArthasConfig(Builder builder) {
     this.enabled = builder.enabled;
     this.version = builder.version;
@@ -134,6 +140,7 @@ public final class ArthasConfig {
     this.outputBufferSize = builder.outputBufferSize;
     this.outputFlushInterval = builder.outputFlushInterval;
     this.baseOtlpEndpoint = builder.baseOtlpEndpoint;
+    this.authToken = builder.authToken;
 
     if (this.enabled) {
       logger.log(
@@ -340,6 +347,38 @@ public final class ArthasConfig {
     return baseOtlpEndpoint;
   }
 
+  /**
+   * 获取 Auth Token（不含 Bearer 前缀）
+   *
+   * @return token 或 null
+   */
+  @Nullable
+  public String getAuthToken() {
+    return authToken;
+  }
+
+  /**
+   * 获取完整的 Authorization Header 值
+   *
+   * @return "Bearer {@literal <token>}" 或 null
+   */
+  @Nullable
+  public String getAuthorizationHeader() {
+    if (authToken != null && !authToken.isEmpty()) {
+      return "Bearer " + authToken;
+    }
+    return null;
+  }
+
+  /**
+   * 是否有有效的 Auth Token
+   *
+   * @return 是否有 token
+   */
+  public boolean hasAuthToken() {
+    return authToken != null && !authToken.isEmpty();
+  }
+
   @Override
   public String toString() {
     return "ArthasConfig{"
@@ -374,6 +413,7 @@ public final class ArthasConfig {
     private Duration tunnelPingInterval = DEFAULT_TUNNEL_PING_INTERVAL;
     @Nullable private String libPath;
     @Nullable private String baseOtlpEndpoint;
+    @Nullable private String authToken;
     private Set<String> disabledCommands = new HashSet<>(DEFAULT_DISABLED_COMMANDS);
     private Duration commandTimeout = DEFAULT_COMMAND_TIMEOUT;
     private int outputBufferSize = DEFAULT_OUTPUT_BUFFER_SIZE;
@@ -476,6 +516,12 @@ public final class ArthasConfig {
         this.outputFlushInterval = flushInterval;
       }
 
+      // 认证 Token（可选，通常从 ControlPlaneConfig 继承）
+      String token = properties.getString(ARTHAS_AUTH_TOKEN);
+      if (token != null && !token.isEmpty()) {
+        this.authToken = token;
+      }
+
       return this;
     }
 
@@ -557,6 +603,17 @@ public final class ArthasConfig {
      */
     public Builder setBaseOtlpEndpoint(@Nullable String baseOtlpEndpoint) {
       this.baseOtlpEndpoint = baseOtlpEndpoint;
+      return this;
+    }
+
+    /**
+     * 设置认证 Token
+     *
+     * @param authToken 认证 Token（不含 Bearer 前缀）
+     * @return 构建器
+     */
+    public Builder setAuthToken(@Nullable String authToken) {
+      this.authToken = authToken;
       return this;
     }
 

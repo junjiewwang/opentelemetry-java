@@ -9,6 +9,8 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasConfig;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
+import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollType;
+import io.opentelemetry.sdk.extension.controlplane.core.longpoll.TaskLongPollHandler;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
@@ -31,8 +33,11 @@ import io.opentelemetry.sdk.extension.controlplane.status.OtlpHealthCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.SystemResourceCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.UptimeCollector;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import java.io.Closeable;
 import java.io.IOException;
+import java.lang.instrument.Instrumentation;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
@@ -97,6 +102,9 @@ public final class ControlPlaneManager implements Closeable {
 
   // Arthas 集成
   @Nullable private final ArthasIntegration arthasIntegration;
+
+  // 任务分发器
+  @Nullable private TaskDispatcher taskDispatcher;
 
   // 生命周期状态
   private final AtomicBoolean started;
@@ -236,8 +244,70 @@ public final class ControlPlaneManager implements Closeable {
       arthasIntegration.start(taskManager.getScheduler());
     }
 
+    // 初始化并配置任务分发器
+    initializeTaskDispatcher();
+
     connectionStateManager.markConnecting();
     logger.log(Level.INFO, "Control plane manager started with long polling");
+  }
+
+  /**
+   * 初始化任务分发器
+   *
+   * <p>创建 TaskDispatcher，注册任务执行器，并配置到 TaskLongPollHandler
+   */
+  private void initializeTaskDispatcher() {
+    logger.log(
+        Level.INFO,
+        "[TASK-DISPATCHER-INIT] Initializing TaskDispatcher, arthasIntegration={0}",
+        arthasIntegration != null ? "configured" : "null");
+
+    // 创建任务分发器
+    taskDispatcher = new TaskDispatcher(
+        client,
+        agentIdentity.getAgentId(),
+        taskManager.getScheduler());
+
+    // 注册任务执行器
+    registerTaskExecutors();
+
+    // 配置到 TaskLongPollHandler
+    TaskLongPollHandler taskHandler = longPollCoordinator.getHandler(LongPollType.TASK);
+    if (taskHandler != null) {
+      taskHandler.setTaskDispatcher(taskDispatcher);
+      logger.log(
+          Level.INFO,
+          "[TASK-DISPATCHER-INIT] TaskDispatcher configured with {0} executor(s), registered types: {1}",
+          new Object[] {taskDispatcher.getExecutorCount(), taskDispatcher.getRegisteredTaskTypes()});
+    } else {
+      logger.log(Level.WARNING, "[TASK-DISPATCHER-INIT] TaskLongPollHandler not found, tasks will not be executed");
+    }
+  }
+
+  /**
+   * 注册任务执行器
+   *
+   * <p>遵循开闭原则：新增任务类型只需在此方法中注册对应的执行器
+   */
+  private void registerTaskExecutors() {
+    if (taskDispatcher == null) {
+      return;
+    }
+
+    // 注册 Arthas 附加执行器
+    if (arthasIntegration != null) {
+      ArthasAttachExecutor arthasExecutor = new ArthasAttachExecutor(
+          arthasIntegration.getLifecycleManager(),
+          arthasIntegration.getTunnelClient(),
+          taskManager.getScheduler());
+      taskDispatcher.registerExecutor(arthasExecutor);
+      logger.log(Level.INFO, "Registered ArthasAttachExecutor for arthas_attach tasks");
+    } else {
+      logger.log(Level.INFO, "Arthas integration not configured, arthas_attach tasks will not be supported");
+    }
+
+    // 未来可以在此添加其他任务执行器
+    // taskDispatcher.registerExecutor(new SomeOtherExecutor(...));
   }
 
   /** 调度所有任务（不包括配置和任务轮询） */
@@ -282,6 +352,12 @@ public final class ControlPlaneManager implements Closeable {
     // 停止 Arthas 集成
     if (arthasIntegration != null) {
       arthasIntegration.stop();
+    }
+
+    // 关闭任务分发器
+    if (taskDispatcher != null) {
+      taskDispatcher.close();
+      taskDispatcher = null;
     }
 
     // 更新运行状态
@@ -434,6 +510,7 @@ public final class ControlPlaneManager implements Closeable {
     @Nullable private DynamicConfigManager configManager;
     @Nullable private DynamicSampler dynamicSampler;
     @Nullable private ArthasIntegration arthasIntegration;
+    @Nullable private Instrumentation instrumentation;
 
     private Builder() {}
 
@@ -503,36 +580,69 @@ public final class ControlPlaneManager implements Closeable {
      */
     public Builder setArthasConfig(ArthasConfig arthasConfig) {
       if (arthasConfig != null && arthasConfig.isEnabled()) {
-        // 如果没有显式配置 Tunnel 端点，注入 OTLP endpoint 用于生成默认值
-        if (!arthasConfig.hasExplicitTunnelEndpoint() && this.config != null) {
-          arthasConfig =
-              ArthasConfig.builder()
-                  .setEnabled(arthasConfig.isEnabled())
-                  .setVersion(arthasConfig.getVersion())
-                  .setMaxSessionsPerAgent(arthasConfig.getMaxSessionsPerAgent())
-                  .setSessionIdleTimeout(arthasConfig.getSessionIdleTimeout())
-                  .setSessionMaxDuration(arthasConfig.getSessionMaxDuration())
-                  .setIdleShutdownDelay(arthasConfig.getIdleShutdownDelay())
-                  .setMaxRunningDuration(arthasConfig.getMaxRunningDuration())
-                  .setTunnelEndpoint(arthasConfig.getExplicitTunnelEndpoint())
-                  .setTunnelReconnectInterval(arthasConfig.getTunnelReconnectInterval())
-                  .setTunnelMaxReconnectAttempts(arthasConfig.getTunnelMaxReconnectAttempts())
-                  .setTunnelConnectTimeout(arthasConfig.getTunnelConnectTimeout())
-                  .setTunnelPingInterval(arthasConfig.getTunnelPingInterval())
-                  .setLibPath(arthasConfig.getLibPath())
-                  .setDisabledCommands(arthasConfig.getDisabledCommands())
-                  .setCommandTimeout(arthasConfig.getCommandTimeout())
-                  .setOutputBufferSize(arthasConfig.getOutputBufferSize())
-                  .setOutputFlushInterval(arthasConfig.getOutputFlushInterval())
-                  .setBaseOtlpEndpoint(this.config.getEndpoint())
-                  .build();
+        // 如果没有显式配置 Tunnel 端点或 AuthToken，从 ControlPlaneConfig 继承
+        if (this.config != null 
+            && (!arthasConfig.hasExplicitTunnelEndpoint() || !arthasConfig.hasAuthToken())) {
+          ArthasConfig.Builder builder = ArthasConfig.builder()
+              .setEnabled(arthasConfig.isEnabled())
+              .setVersion(arthasConfig.getVersion())
+              .setMaxSessionsPerAgent(arthasConfig.getMaxSessionsPerAgent())
+              .setSessionIdleTimeout(arthasConfig.getSessionIdleTimeout())
+              .setSessionMaxDuration(arthasConfig.getSessionMaxDuration())
+              .setIdleShutdownDelay(arthasConfig.getIdleShutdownDelay())
+              .setMaxRunningDuration(arthasConfig.getMaxRunningDuration())
+              .setTunnelEndpoint(arthasConfig.getExplicitTunnelEndpoint())
+              .setTunnelReconnectInterval(arthasConfig.getTunnelReconnectInterval())
+              .setTunnelMaxReconnectAttempts(arthasConfig.getTunnelMaxReconnectAttempts())
+              .setTunnelConnectTimeout(arthasConfig.getTunnelConnectTimeout())
+              .setTunnelPingInterval(arthasConfig.getTunnelPingInterval())
+              .setLibPath(arthasConfig.getLibPath())
+              .setDisabledCommands(arthasConfig.getDisabledCommands())
+              .setCommandTimeout(arthasConfig.getCommandTimeout())
+              .setOutputBufferSize(arthasConfig.getOutputBufferSize())
+              .setOutputFlushInterval(arthasConfig.getOutputFlushInterval());
 
-          logger.log(
-              Level.INFO,
-              "Arthas tunnel endpoint not explicitly configured, using default based on OTLP endpoint: {0}",
-              arthasConfig.getTunnelEndpoint());
+          // 继承 OTLP endpoint 用于生成默认 Tunnel 端点
+          if (!arthasConfig.hasExplicitTunnelEndpoint()) {
+            builder.setBaseOtlpEndpoint(this.config.getEndpoint());
+            logger.log(
+                Level.INFO,
+                "Arthas tunnel endpoint not explicitly configured, will use default based on OTLP endpoint");
+          }
+
+          // 继承 AuthToken 用于 Tunnel 认证
+          if (!arthasConfig.hasAuthToken() && this.config.hasAuthToken()) {
+            builder.setAuthToken(this.config.getAuthToken());
+            logger.log(Level.INFO, "Arthas auth token inherited from ControlPlaneConfig");
+          } else if (arthasConfig.hasAuthToken()) {
+            builder.setAuthToken(arthasConfig.getAuthToken());
+          }
+
+          arthasConfig = builder.build();
         }
         this.arthasIntegration = ArthasIntegration.create(arthasConfig);
+        // 如果已经设置了 Instrumentation，传递给 ArthasIntegration
+        if (this.instrumentation != null) {
+          this.arthasIntegration.setInstrumentation(this.instrumentation);
+        }
+      }
+      return this;
+    }
+
+    /**
+     * 设置 Instrumentation 实例
+     *
+     * <p>Instrumentation 用于 Arthas 加载 SpyAPI 到 Bootstrap ClassLoader
+     * 和进行字节码增强。
+     *
+     * @param instrumentation Instrumentation 实例
+     * @return this builder
+     */
+    public Builder setInstrumentation(@Nullable Instrumentation instrumentation) {
+      this.instrumentation = instrumentation;
+      // 如果 ArthasIntegration 已经创建，传递 Instrumentation
+      if (this.arthasIntegration != null && instrumentation != null) {
+        this.arthasIntegration.setInstrumentation(instrumentation);
       }
       return this;
     }

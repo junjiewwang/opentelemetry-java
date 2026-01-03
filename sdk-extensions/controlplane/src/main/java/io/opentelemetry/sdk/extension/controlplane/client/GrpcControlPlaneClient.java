@@ -185,6 +185,16 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
   }
 
   @Override
+  public CompletableFuture<TaskResultResponse> reportTaskResult(TaskResultRequest request) {
+    checkNotClosed();
+
+    // TODO: 当前返回占位实现
+    return CompletableFuture.completedFuture(
+        new DefaultTaskResultResponse(
+            /* success= */ false, "gRPC not implemented yet"));
+  }
+
+  @Override
   public boolean isClosed() {
     return closed.get();
   }
@@ -457,6 +467,26 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
     @Override
     public String getStatus() {
       return status;
+    }
+
+    @Override
+    public String getErrorMessage() {
+      return errorMessage;
+    }
+  }
+
+  private static final class DefaultTaskResultResponse implements TaskResultResponse {
+    private final boolean success;
+    private final String errorMessage;
+
+    DefaultTaskResultResponse(boolean success, String errorMessage) {
+      this.success = success;
+      this.errorMessage = errorMessage;
+    }
+
+    @Override
+    public boolean isSuccess() {
+      return success;
     }
 
     @Override

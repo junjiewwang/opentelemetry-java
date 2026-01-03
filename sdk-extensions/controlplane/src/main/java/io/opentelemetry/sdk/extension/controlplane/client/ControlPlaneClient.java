@@ -69,6 +69,16 @@ public interface ControlPlaneClient extends Closeable {
   CompletableFuture<ChunkedUploadResponse> uploadChunkedResult(ChunkedTaskResult chunk);
 
   /**
+   * 上报任务执行结果
+   *
+   * <p>用于向服务端上报任务的执行状态，包括成功、失败、过期、超时等情况。
+   *
+   * @param request 任务结果请求
+   * @return 任务结果响应的 CompletableFuture
+   */
+  CompletableFuture<TaskResultResponse> reportTaskResult(TaskResultRequest request);
+
+  /**
    * 检查客户端是否已关闭
    *
    * @return 是否已关闭
@@ -223,9 +233,14 @@ public interface ControlPlaneClient extends Closeable {
 
     long getTimeoutMillis();
 
-    long getCreatedAtUnixNano();
+    /** 任务创建时间（毫秒时间戳） */
+    long getCreatedAtMillis();
 
-    long getExpiresAtUnixNano();
+    /** 任务过期时间（毫秒时间戳），0 表示不过期 */
+    long getExpiresAtMillis();
+
+    /** 最大允许的任务延迟（毫秒），从服务端配置获取，0 表示使用默认值 */
+    long getMaxAcceptableDelayMillis();
   }
 
   /** 状态请求 */
@@ -273,6 +288,75 @@ public interface ControlPlaneClient extends Closeable {
 
     String getStatus();
 
+    String getErrorMessage();
+  }
+
+  // ===== 任务结果上报 DTO =====
+
+  /**
+   * 任务执行状态（稳定集合）
+   *
+   * <p>遵循"稳定状态 + 原因码"模式：
+   * <ul>
+   *   <li>status 使用稳定集合（SUCCESS/FAILED/TIMEOUT/CANCELLED/RUNNING/PENDING）
+   *   <li>细分原因通过 error_code 表达（如 TASK_STALE、TASK_EXPIRED、TASK_REJECTED）
+   *   <li>error_message 放可读信息
+   * </ul>
+   */
+  enum TaskStatus {
+    /** 任务待执行 */
+    PENDING,
+    /** 任务执行中 */
+    RUNNING,
+    /** 任务执行成功 */
+    SUCCESS,
+    /** 任务执行失败（包括过期、过旧、被拒绝等，具体原因见 error_code） */
+    FAILED,
+    /** 任务执行超时 */
+    TIMEOUT,
+    /** 任务被取消 */
+    CANCELLED
+  }
+
+  /** 任务结果上报请求 */
+  interface TaskResultRequest {
+    /** 任务 ID */
+    String getTaskId();
+
+    /** Agent ID */
+    String getAgentId();
+
+    /** 任务执行状态 */
+    TaskStatus getStatus();
+
+    /** 错误码（失败时） */
+    @Nullable
+    String getErrorCode();
+
+    /** 错误信息（失败时） */
+    @Nullable
+    String getErrorMessage();
+
+    /** 任务输出结果（成功时，JSON 格式） */
+    @Nullable
+    String getResultJson();
+
+    /** 任务开始执行时间（毫秒时间戳） */
+    long getStartedAtMillis();
+
+    /** 任务完成时间（毫秒时间戳） */
+    long getCompletedAtMillis();
+
+    /** 任务执行耗时（毫秒） */
+    long getExecutionTimeMillis();
+  }
+
+  /** 任务结果上报响应 */
+  interface TaskResultResponse {
+    /** 是否成功 */
+    boolean isSuccess();
+
+    /** 错误信息 */
     String getErrorMessage();
   }
 }

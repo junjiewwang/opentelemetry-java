@@ -9,6 +9,7 @@ import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizer;
 import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizerProvider;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import io.opentelemetry.sdk.extension.controlplane.ControlPlaneManager;
+import io.opentelemetry.sdk.extension.controlplane.InstrumentationHolder;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
@@ -168,13 +169,30 @@ public final class ControlPlaneAutoConfigurationProvider
       DynamicConfigManager configManager = new DynamicConfigManager();
 
       // 创建并启动控制平面管理器
-      controlPlaneManager =
+      ControlPlaneManager.Builder managerBuilder =
           ControlPlaneManager.builder()
               .setConfig(controlConfig)
               .setHealthMonitor(healthMonitor)
               .setConfigManager(configManager)
-              .setDynamicSampler(dynamicSampler)
-              .build();
+              .setDynamicSampler(dynamicSampler);
+
+      // 设置 Instrumentation（如果可用）
+      if (InstrumentationHolder.isAvailable()) {
+        managerBuilder.setInstrumentation(InstrumentationHolder.get());
+        logger.log(Level.INFO, "Instrumentation set for control plane manager");
+      } else {
+        logger.log(Level.WARNING, 
+            "Instrumentation not available, Arthas may not work properly. " +
+            "Make sure InstrumentationHolder.set() is called in premain.");
+      }
+
+      // 根据配置启用 Arthas
+      if (controlConfig.isArthasEnabled()) {
+        managerBuilder.enableArthas();
+        logger.log(Level.INFO, "Arthas integration enabled via configuration");
+      }
+
+      controlPlaneManager = managerBuilder.build();
 
       controlPlaneManager.start();
 

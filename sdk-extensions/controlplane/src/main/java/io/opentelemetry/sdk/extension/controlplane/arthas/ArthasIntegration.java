@@ -7,6 +7,7 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.ArthasTunnelClient;
 import java.io.Closeable;
+import java.lang.instrument.Instrumentation;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -61,6 +62,21 @@ public final class ArthasIntegration
    */
   public static ArthasIntegration create(ArthasConfig config) {
     return new ArthasIntegration(config);
+  }
+
+  /**
+   * 设置 Instrumentation 实例
+   *
+   * <p>Instrumentation 用于加载 SpyAPI 到 Bootstrap ClassLoader
+   * 和传递给 Arthas 进行字节码增强。
+   *
+   * @param instrumentation Instrumentation 实例
+   */
+  public void setInstrumentation(@Nullable Instrumentation instrumentation) {
+    lifecycleManager.setInstrumentation(instrumentation);
+    if (instrumentation != null) {
+      logger.log(Level.INFO, "Instrumentation set for Arthas integration");
+    }
   }
 
   /**
@@ -253,6 +269,13 @@ public final class ArthasIntegration
     logger.log(Level.INFO, "Tunnel connected");
     // 发送当前状态
     tunnelClient.sendArthasStatus();
+  }
+
+  @Override
+  public void onAgentRegistered() {
+    logger.log(Level.INFO, "Agent registered with server successfully");
+    // 通知生命周期管理器已注册
+    lifecycleManager.markRegistered();
   }
 
   @Override

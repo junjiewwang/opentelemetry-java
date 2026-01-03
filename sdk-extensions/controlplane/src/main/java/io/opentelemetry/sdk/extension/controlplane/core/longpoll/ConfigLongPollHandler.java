@@ -88,6 +88,10 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   @Override
   public HandlerResult handleResponse(ConfigResponse response) {
     if (!response.isSuccess()) {
+      logger.log(
+          Level.WARNING,
+          "[CONFIG-ERROR] Config response error from server: {0}",
+          response.getErrorMessage());
       taskLogger.logTaskProgress(
           currentTaskId,
           "config_error",
@@ -98,6 +102,12 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
     statistics.recordConfigFetchSuccess();
 
     if (response.hasChanges()) {
+      // 配置有更新
+      logger.log(
+          Level.INFO,
+          "[CONFIG-RECEIVED] Config updated from server (independent poll), version={0}, etag={1}",
+          new Object[] {response.getConfigVersion(), response.getEtag()});
+      
       taskLogger.logTaskProgress(
           currentTaskId,
           "config_changed",
@@ -107,14 +117,13 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
       this.currentConfigVersion = response.getConfigVersion();
       this.currentConfigEtag = response.getEtag();
 
-      logger.log(
-          Level.INFO,
-          "Config updated, version: {0}, etag: {1}",
-          new Object[] {currentConfigVersion, currentConfigEtag});
-
       return HandlerResult.changed(
           "version=" + currentConfigVersion + ", etag=" + currentConfigEtag);
     } else {
+      // 配置无更新，输出 INFO 级别日志便于确认轮询正常工作
+      logger.log(
+          Level.INFO,
+          "[CONFIG-POLL] No config changes from server (independent poll)");
       taskLogger.logTaskProgress(currentTaskId, "config_unchanged", "No config changes");
       return HandlerResult.noChange();
     }
@@ -130,12 +139,19 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    */
   public boolean processUnifiedResult(PollResult result) {
     if (result == null) {
+      logger.log(Level.FINE, "[CONFIG-POLL] No config result in unified response");
       return false;
     }
 
     if (result.hasChanges()) {
       String newVersion = result.getConfigVersion();
       String newEtag = result.getConfigEtag();
+
+      // 配置有更新
+      logger.log(
+          Level.INFO,
+          "[CONFIG-RECEIVED] Config updated via unified poll, version={0}, etag={1}",
+          new Object[] {newVersion, newEtag});
 
       taskLogger.logTaskProgress(
           currentTaskId,
@@ -150,15 +166,14 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
         this.currentConfigEtag = newEtag;
       }
 
-      logger.log(
-          Level.INFO,
-          "Config updated via unified poll, version: {0}, etag: {1}",
-          new Object[] {currentConfigVersion, currentConfigEtag});
-
       // TODO: 处理配置数据（result.getConfigData()）
       
       return true;
     } else {
+      // 配置无更新，输出 INFO 级别日志便于确认轮询正常工作
+      logger.log(
+          Level.INFO,
+          "[CONFIG-POLL] No config changes via unified poll");
       taskLogger.logTaskProgress(currentTaskId, "config_unchanged", "No config changes");
       return true;
     }
@@ -166,7 +181,10 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
 
   @Override
   public void handleError(Throwable error) {
-    logger.log(Level.WARNING, "Config poll failed: {0}", error.getMessage());
+    logger.log(
+        Level.WARNING,
+        "[CONFIG-ERROR] Config poll failed: {0}",
+        error.getMessage());
     taskLogger.logTaskProgress(
         currentTaskId, "config_error", "Config poll error: " + error.getMessage());
   }

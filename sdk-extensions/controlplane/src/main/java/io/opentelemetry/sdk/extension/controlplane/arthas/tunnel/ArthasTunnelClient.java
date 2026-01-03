@@ -22,6 +22,8 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.E
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.MessageType;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.PingMessage;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.PongMessage;
+import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.RegisterAckMessage;
+import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.RegisterAckPayload;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.RegisterMessage;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.RegisterPayload;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage.TerminalCloseMessage;
@@ -39,6 +41,7 @@ import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger.TaskContext;
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -87,6 +90,9 @@ public final class ArthasTunnelClient implements Closeable {
   private final AtomicReference<WebSocket> webSocketRef = new AtomicReference<>();
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
+
+  /** 最后一次连接错误（用于诊断） */
+  private final AtomicReference<ConnectionError> lastConnectionError = new AtomicReference<>();
 
   @Nullable private ScheduledExecutorService scheduler;
   @Nullable private ScheduledFuture<?> pingTask;
@@ -166,18 +172,27 @@ public final class ArthasTunnelClient implements Closeable {
     }
 
     connectionState.set(ConnectionState.CONNECTING);
+    // 清除上次的错误
+    lastConnectionError.set(null);
     logger.log(Level.INFO, "Connecting to tunnel server: {0}", endpoint);
 
     try {
-      Request request = new Request.Builder()
-          .url(endpoint)
-          .build();
+      Request.Builder requestBuilder = new Request.Builder().url(endpoint);
 
+      // 添加 Authorization Header（如果配置了）
+      String authHeader = config.getAuthorizationHeader();
+      if (authHeader != null && !authHeader.isEmpty()) {
+        requestBuilder.header("Authorization", authHeader);
+        logger.log(Level.FINE, "Added Authorization header to tunnel request");
+      }
+
+      Request request = requestBuilder.build();
       WebSocket ws = httpClient.newWebSocket(request, new TunnelWebSocketListener());
       webSocketRef.set(ws);
       
     } catch (RuntimeException e) {
       logger.log(Level.SEVERE, "Error creating WebSocket connection", e);
+      setConnectionError("CONNECTION_FAILED", "Failed to create WebSocket: " + e.getMessage());
       connectionState.set(ConnectionState.DISCONNECTED);
       scheduleReconnect();
     }
@@ -310,6 +325,9 @@ public final class ArthasTunnelClient implements Closeable {
         case PING:
           handlePing(objectMapper.readValue(text, PingMessage.class));
           break;
+        case REGISTER_ACK:
+          handleRegisterAck(objectMapper.readValue(text, RegisterAckMessage.class));
+          break;
         case ARTHAS_START:
           handleArthasStart(objectMapper.readValue(text, ArthasStartMessage.class));
           break;
@@ -340,6 +358,30 @@ public final class ArthasTunnelClient implements Closeable {
   @SuppressWarnings("UnusedVariable")
   private void handlePing(PingMessage message) {
     sendTextMessage(PongMessage.create());
+  }
+
+  /** 处理注册确认消息 */
+  private void handleRegisterAck(RegisterAckMessage message) {
+    RegisterAckPayload payload = message.getPayload();
+    boolean success = payload != null && payload.isSuccess();
+    String ackMessage = payload != null ? payload.getMessage() : null;
+
+    if (success) {
+      logger.log(Level.INFO, 
+          "[TUNNEL] Agent registration acknowledged by server: {0}", 
+          ackMessage != null ? ackMessage : "success");
+      
+      // 通知监听器注册成功
+      eventListener.onAgentRegistered();
+    } else {
+      logger.log(Level.WARNING, 
+          "[TUNNEL] Agent registration failed: {0}", 
+          ackMessage != null ? ackMessage : "unknown error");
+      
+      // 设置连接错误
+      setConnectionError("REGISTRATION_FAILED", 
+          "Agent registration rejected: " + (ackMessage != null ? ackMessage : "unknown"));
+    }
   }
 
   /** 处理 Arthas 启动请求 */
@@ -587,6 +629,58 @@ public final class ArthasTunnelClient implements Closeable {
     return connectionState.get() == ConnectionState.CONNECTED;
   }
 
+  /**
+   * 获取最后的连接错误
+   *
+   * @return 连接错误信息，如果没有错误或已成功连接则返回 null
+   */
+  @Nullable
+  public ConnectionError getLastConnectionError() {
+    return lastConnectionError.get();
+  }
+
+  /**
+   * 设置连接错误
+   *
+   * @param code 错误码
+   * @param message 错误消息
+   */
+  private void setConnectionError(String code, String message) {
+    lastConnectionError.set(new ConnectionError(code, message, System.currentTimeMillis()));
+  }
+
+  /**
+   * 连接错误信息
+   */
+  public static final class ConnectionError {
+    private final String code;
+    private final String message;
+    private final long timestamp;
+
+    public ConnectionError(String code, String message, long timestamp) {
+      this.code = code;
+      this.message = message;
+      this.timestamp = timestamp;
+    }
+
+    public String getCode() {
+      return code;
+    }
+
+    public String getMessage() {
+      return message;
+    }
+
+    public long getTimestamp() {
+      return timestamp;
+    }
+
+    @Override
+    public String toString() {
+      return String.format("ConnectionError{code='%s', message='%s'}", code, message);
+    }
+  }
+
   @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {
@@ -662,7 +756,41 @@ public final class ArthasTunnelClient implements Closeable {
 
     @Override
     public void onFailure(WebSocket webSocket, Throwable t, @Nullable Response response) {
-      logger.log(Level.WARNING, "WebSocket error: {0}", t.getMessage());
+      String errorMessage = t.getMessage();
+      logger.log(Level.WARNING, "WebSocket error: {0}", errorMessage);
+
+      // 记录详细的连接错误信息
+      String errorCode = "CONNECTION_ERROR";
+      // 确保 errorDetail 非空
+      String errorDetail = errorMessage != null ? errorMessage : "Unknown error";
+      if (response != null) {
+        int code = response.code();
+        String statusMessage = response.message();
+        if (code == 401) {
+          errorCode = "UNAUTHORIZED";
+          errorDetail = String.format(
+              Locale.ROOT,
+              "Authentication failed (HTTP 401). Please check Authorization token. Response: %s",
+              statusMessage);
+        } else if (code == 403) {
+          errorCode = "FORBIDDEN";
+          errorDetail = String.format(
+              Locale.ROOT,
+              "Access denied (HTTP 403). Response: %s", statusMessage);
+        } else if (code >= 400 && code < 500) {
+          errorCode = "CLIENT_ERROR";
+          errorDetail = String.format(
+              Locale.ROOT,
+              "Client error (HTTP %d): %s", code, statusMessage);
+        } else if (code >= 500) {
+          errorCode = "SERVER_ERROR";
+          errorDetail = String.format(
+              Locale.ROOT,
+              "Server error (HTTP %d): %s", code, statusMessage);
+        }
+      }
+      setConnectionError(errorCode, errorDetail);
+
       connectionState.set(ConnectionState.DISCONNECTED);
       webSocketRef.set(null);
 
@@ -686,6 +814,9 @@ public final class ArthasTunnelClient implements Closeable {
 
     /** 达到最大重连次数 */
     void onMaxReconnectReached();
+
+    /** Agent 注册成功（收到 REGISTER_ACK） */
+    void onAgentRegistered();
 
     /** 收到 Arthas 启动请求 */
     void onArthasStartRequested();

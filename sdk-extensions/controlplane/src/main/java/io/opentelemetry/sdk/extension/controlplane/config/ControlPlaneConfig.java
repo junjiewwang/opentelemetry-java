@@ -77,6 +77,9 @@ public final class ControlPlaneConfig {
   private static final String STATUS_INCLUDE_SYSTEM_RESOURCE =
       "otel.agent.control.status.include.system.resource";
 
+  // Arthas 配置
+  private static final String ARTHAS_ENABLED = "otel.agent.control.arthas.enabled";
+
   // ===== 默认值常量 =====
   private static final String DEFAULT_PROTOCOL = "grpc";
   private static final String DEFAULT_HTTP_BASE_PATH = "/v1/control";
@@ -99,6 +102,7 @@ public final class ControlPlaneConfig {
   private static final Duration DEFAULT_RETRY_MAX_BACKOFF = Duration.ofSeconds(30);
   private static final double DEFAULT_RETRY_BACKOFF_MULTIPLIER = 2.0;
   private static final boolean DEFAULT_INCLUDE_SYSTEM_RESOURCE = true;
+  private static final boolean DEFAULT_ARTHAS_ENABLED = true;
 
   // ===== 配置字段 =====
   private final boolean enabled;
@@ -125,6 +129,7 @@ public final class ControlPlaneConfig {
   private final Duration retryMaxBackoff;
   private final double retryBackoffMultiplier;
   private final boolean includeSystemResource;
+  private final boolean arthasEnabled;
   @Nullable private final String headers;
 
   // Auth Token (启动时一次性解析)
@@ -156,6 +161,7 @@ public final class ControlPlaneConfig {
     this.retryMaxBackoff = builder.retryMaxBackoff;
     this.retryBackoffMultiplier = builder.retryBackoffMultiplier;
     this.includeSystemResource = builder.includeSystemResource;
+    this.arthasEnabled = builder.arthasEnabled;
     this.headers = builder.headers;
 
     // 一次性解析 AuthToken
@@ -434,6 +440,15 @@ public final class ControlPlaneConfig {
   }
 
   /**
+   * 是否启用 Arthas 功能
+   *
+   * @return 是否启用 Arthas
+   */
+  public boolean isArthasEnabled() {
+    return arthasEnabled;
+  }
+
+  /**
    * 获取控制平面 URL
    *
    * @return 完整的控制平面 URL
@@ -475,6 +490,7 @@ public final class ControlPlaneConfig {
     private Duration retryMaxBackoff = DEFAULT_RETRY_MAX_BACKOFF;
     private double retryBackoffMultiplier = DEFAULT_RETRY_BACKOFF_MULTIPLIER;
     private boolean includeSystemResource = DEFAULT_INCLUDE_SYSTEM_RESOURCE;
+    private boolean arthasEnabled = DEFAULT_ARTHAS_ENABLED;
     @Nullable private String headers;
     @Nullable private String resourceAttributes;
 
@@ -612,6 +628,9 @@ public final class ControlPlaneConfig {
       this.includeSystemResource =
           properties.getBoolean(STATUS_INCLUDE_SYSTEM_RESOURCE, DEFAULT_INCLUDE_SYSTEM_RESOURCE);
 
+      // Arthas 配置
+      this.arthasEnabled = properties.getBoolean(ARTHAS_ENABLED, DEFAULT_ARTHAS_ENABLED);
+
       return this;
     }
 
@@ -703,6 +722,11 @@ public final class ControlPlaneConfig {
 
     public Builder setIncludeSystemResource(boolean includeSystemResource) {
       this.includeSystemResource = includeSystemResource;
+      return this;
+    }
+
+    public Builder setArthasEnabled(boolean arthasEnabled) {
+      this.arthasEnabled = arthasEnabled;
       return this;
     }
 

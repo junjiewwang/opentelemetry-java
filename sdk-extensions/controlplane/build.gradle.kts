@@ -26,9 +26,12 @@ dependencies {
   // JSON 序列化 (用于 Arthas Tunnel 协议)
   implementation("com.fasterxml.jackson.core:jackson-databind")
 
-  // Arthas 核心依赖
-//  implementation("com.taobao.arthas:arthas-core:4.0.3")
-//  implementation("com.taobao.arthas:arthas-client:4.0.3")
+  // ByteBuddy Agent（可选依赖，用于自动获取 Instrumentation）
+  // 使用 compileOnly 是因为：
+  // 1. InstrumentationHolder 使用反射调用，编译时不需要
+  // 2. 在 opentelemetry-java-instrumentation 中，ByteBuddy 已存在
+  // 3. 如果 classpath 中没有此依赖，会优雅降级（需要手动设置 Instrumentation）
+  compileOnly("net.bytebuddy:byte-buddy-agent:1.14.18")
 
   // gRPC 支持（可选）
   compileOnly("io.grpc:grpc-api")

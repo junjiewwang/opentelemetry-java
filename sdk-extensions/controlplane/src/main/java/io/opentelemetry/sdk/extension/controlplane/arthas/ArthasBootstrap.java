@@ -8,15 +8,18 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.Properties;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.jar.JarFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -38,16 +41,22 @@ public final class ArthasBootstrap {
 
   // Arthas 类名常量
   private static final String ARTHAS_BOOTSTRAP_CLASS = "com.taobao.arthas.core.server.ArthasBootstrap";
+  private static final String SPY_API_CLASS = "java.arthas.SpyAPI";
 
   // Arthas jar 资源路径（嵌入式模式）
   private static final String ARTHAS_CORE_JAR_RESOURCE = "/arthas/arthas-core.jar";
   private static final String ARTHAS_CLIENT_JAR_RESOURCE = "/arthas/arthas-client.jar";
+  private static final String ARTHAS_SPY_JAR_RESOURCE = "/arthas/arthas-spy.jar";
 
   private final ArthasConfig config;
   private final AtomicBoolean initialized = new AtomicBoolean(false);
   private final AtomicBoolean running = new AtomicBoolean(false);
+  private final AtomicBoolean spyLoaded = new AtomicBoolean(false);
   private final AtomicReference<ClassLoader> arthasClassLoader = new AtomicReference<>();
   private final AtomicReference<Object> arthasBootstrapInstance = new AtomicReference<>();
+
+  /** Instrumentation 实例（用于加载 SpyAPI 和传递给 Arthas） */
+  @Nullable private Instrumentation instrumentation;
 
   // 回调接口（预留给未来扩展使用）
   @SuppressWarnings("UnusedVariable")
@@ -60,6 +69,42 @@ public final class ArthasBootstrap {
    */
   public ArthasBootstrap(ArthasConfig config) {
     this.config = config;
+  }
+
+  /**
+   * 创建 Arthas 启动引导器（带 Instrumentation）
+   *
+   * @param config Arthas 配置
+   * @param instrumentation Instrumentation 实例
+   */
+  public ArthasBootstrap(ArthasConfig config, @Nullable Instrumentation instrumentation) {
+    this.config = config;
+    this.instrumentation = instrumentation;
+  }
+
+  /**
+   * 设置 Instrumentation 实例
+   *
+   * <p>Instrumentation 用于：
+   * <ul>
+   *   <li>加载 SpyAPI 到 Bootstrap ClassLoader</li>
+   *   <li>传递给 Arthas 进行字节码增强</li>
+   * </ul>
+   *
+   * @param instrumentation Instrumentation 实例
+   */
+  public void setInstrumentation(@Nullable Instrumentation instrumentation) {
+    this.instrumentation = instrumentation;
+  }
+
+  /**
+   * 获取 Instrumentation 实例
+   *
+   * @return Instrumentation 实例，可能为 null
+   */
+  @Nullable
+  public Instrumentation getInstrumentation() {
+    return instrumentation;
   }
 
   /**
@@ -83,6 +128,13 @@ public final class ArthasBootstrap {
     }
 
     try {
+      // 1. 首先加载 SpyAPI 到 Bootstrap ClassLoader
+      if (!loadSpyApi()) {
+        logger.log(Level.WARNING, "Failed to load SpyAPI, Arthas may not work properly");
+        // 继续执行，因为在某些场景下可能不需要 SpyAPI
+      }
+
+      // 2. 创建 Arthas ClassLoader
       ClassLoader loader = createArthasClassLoader();
       if (loader == null) {
         logger.log(Level.WARNING, "Failed to create Arthas ClassLoader");
@@ -99,6 +151,109 @@ public final class ArthasBootstrap {
       logger.log(Level.SEVERE, "Failed to initialize Arthas", e);
       return false;
     }
+  }
+
+  /**
+   * 加载 SpyAPI 到 Bootstrap ClassLoader
+   *
+   * <p>SpyAPI 必须在 Bootstrap ClassLoader 中加载，这样才能被所有类访问。
+   * 使用 {@link Instrumentation#appendToBootstrapClassLoaderSearch(JarFile)} 实现。
+   *
+   * @return 是否成功加载
+   */
+  private boolean loadSpyApi() {
+    // 检查是否已经加载
+    if (spyLoaded.get()) {
+      logger.log(Level.FINE, "SpyAPI already loaded");
+      return true;
+    }
+
+    // 检查 SpyAPI 是否已在 Bootstrap ClassLoader 中
+    if (isSpyApiLoaded()) {
+      logger.log(Level.INFO, "SpyAPI already present in Bootstrap ClassLoader");
+      spyLoaded.set(true);
+      return true;
+    }
+
+    // 检查 Instrumentation 是否可用
+    if (instrumentation == null) {
+      logger.log(Level.WARNING, 
+          "Instrumentation not available, cannot load SpyAPI to Bootstrap ClassLoader");
+      return false;
+    }
+
+    try {
+      // 查找 arthas-spy.jar
+      File spyJarFile = findSpyJar();
+      if (spyJarFile == null) {
+        logger.log(Level.WARNING, "arthas-spy.jar not found");
+        return false;
+      }
+
+      // 使用 Instrumentation 将 spy jar 添加到 Bootstrap ClassLoader
+      logger.log(Level.INFO, "Loading SpyAPI from: {0}", spyJarFile.getAbsolutePath());
+      instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(spyJarFile));
+
+      // 验证加载成功
+      if (isSpyApiLoaded()) {
+        spyLoaded.set(true);
+        logger.log(Level.INFO, "SpyAPI loaded to Bootstrap ClassLoader successfully");
+        return true;
+      } else {
+        logger.log(Level.WARNING, "SpyAPI jar added but class not found");
+        return false;
+      }
+
+    } catch (IOException e) {
+      logger.log(Level.WARNING, "Failed to load SpyAPI: {0}", e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * 检查 SpyAPI 是否已在 Bootstrap ClassLoader 中
+   *
+   * @return 是否已加载
+   */
+  private static boolean isSpyApiLoaded() {
+    try {
+      Class.forName(SPY_API_CLASS, false, null);
+      return true;
+    } catch (ClassNotFoundException e) {
+      return false;
+    }
+  }
+
+  /**
+   * 查找 arthas-spy.jar 文件
+   *
+   * @return jar 文件，未找到返回 null
+   */
+  @Nullable
+  private File findSpyJar() {
+    // 1. 从配置的外部路径查找
+    String libPath = config.getLibPath();
+    if (libPath != null && !libPath.isEmpty()) {
+      File spyJar = new File(libPath, "arthas-spy.jar");
+      if (spyJar.exists()) {
+        return spyJar;
+      }
+    }
+
+    // 2. 从 classpath 资源提取
+    try {
+      Path tempDir = Files.createTempDirectory("arthas-spy-");
+      tempDir.toFile().deleteOnExit();
+
+      Path spyJar = extractResource(ARTHAS_SPY_JAR_RESOURCE, tempDir, "arthas-spy.jar");
+      if (spyJar != null) {
+        return spyJar.toFile();
+      }
+    } catch (IOException e) {
+      logger.log(Level.WARNING, "Failed to extract arthas-spy.jar: {0}", e.getMessage());
+    }
+
+    return null;
   }
 
   /**
@@ -361,37 +516,37 @@ public final class ArthasBootstrap {
   /**
    * 通过反射启动 Arthas
    *
+   * <p>使用正确的 getInstance(Instrumentation, Map) 方法签名启动 Arthas。
+   *
    * @param loader Arthas ClassLoader
    * @return Arthas Bootstrap 实例
    */
   @Nullable
   private Object startArthasViaReflection(ClassLoader loader) {
-    try {
-      // 获取当前 JVM 的 PID
-      long pid = getCurrentPid();
+    // 检查 Instrumentation
+    if (instrumentation == null) {
+      logger.log(Level.WARNING, 
+          "Instrumentation not available, trying legacy startup method");
+      return startArthasViaReflectionLegacy(loader);
+    }
 
-      // 构建配置
-      Properties arthasProperties = buildArthasProperties();
+    try {
+      // 构建配置 Map
+      Map<String, String> configMap = buildArthasConfigMap();
 
       // 加载 ArthasBootstrap 类
       Class<?> bootstrapClass = loader.loadClass(ARTHAS_BOOTSTRAP_CLASS);
 
-      // 获取 getInstance 方法
-      Method getInstanceMethod = bootstrapClass.getMethod("getInstance", long.class, String.class);
-
-      // 将配置转为字符串
-      StringBuilder configStr = new StringBuilder();
-      for (String key : arthasProperties.stringPropertyNames()) {
-        if (configStr.length() > 0) {
-          configStr.append(";");
-        }
-        configStr.append(key).append("=").append(arthasProperties.getProperty(key));
-      }
+      // 获取 getInstance(Instrumentation, Map) 方法
+      Method getInstanceMethod = bootstrapClass.getMethod(
+          "getInstance", Instrumentation.class, Map.class);
 
       // 调用 getInstance
-      Object bootstrap = getInstanceMethod.invoke(null, pid, configStr.toString());
+      Object bootstrap = getInstanceMethod.invoke(null, instrumentation, configMap);
 
-      logger.log(Level.INFO, "Arthas Bootstrap created for PID: {0}", pid);
+      logger.log(Level.INFO, 
+          "Arthas Bootstrap created with Instrumentation, config keys: {0}", 
+          configMap.keySet());
       return bootstrap;
 
     } catch (ClassNotFoundException e) {
@@ -399,8 +554,58 @@ public final class ArthasBootstrap {
       // 返回非 null 以模拟启动成功（用于测试）
       return new MockArthasBootstrap();
 
+    } catch (NoSuchMethodException e) {
+      // 如果没有 getInstance(Instrumentation, Map) 方法，尝试旧版方法
+      logger.log(Level.INFO, 
+          "getInstance(Instrumentation, Map) not found, trying legacy method");
+      return startArthasViaReflectionLegacy(loader);
+
     } catch (ReflectiveOperationException e) {
       logger.log(Level.SEVERE, "Failed to start Arthas via reflection", e);
+      return null;
+    }
+  }
+
+  /**
+   * 使用旧版方法启动 Arthas（兼容旧版 Arthas）
+   *
+   * @param loader Arthas ClassLoader
+   * @return Arthas Bootstrap 实例
+   */
+  @Nullable
+  private Object startArthasViaReflectionLegacy(ClassLoader loader) {
+    try {
+      // 获取当前 JVM 的 PID
+      long pid = getCurrentPid();
+
+      // 构建配置字符串
+      Map<String, String> configMap = buildArthasConfigMap();
+      StringBuilder configStr = new StringBuilder();
+      for (Map.Entry<String, String> entry : configMap.entrySet()) {
+        if (configStr.length() > 0) {
+          configStr.append(";");
+        }
+        configStr.append(entry.getKey()).append("=").append(entry.getValue());
+      }
+
+      // 加载 ArthasBootstrap 类
+      Class<?> bootstrapClass = loader.loadClass(ARTHAS_BOOTSTRAP_CLASS);
+
+      // 获取 getInstance(long, String) 方法
+      Method getInstanceMethod = bootstrapClass.getMethod("getInstance", long.class, String.class);
+
+      // 调用 getInstance
+      Object bootstrap = getInstanceMethod.invoke(null, pid, configStr.toString());
+
+      logger.log(Level.INFO, "Arthas Bootstrap created (legacy) for PID: {0}", pid);
+      return bootstrap;
+
+    } catch (ClassNotFoundException e) {
+      logger.log(Level.WARNING, "Arthas classes not found in ClassLoader. Running in mock mode.");
+      return new MockArthasBootstrap();
+
+    } catch (ReflectiveOperationException e) {
+      logger.log(Level.SEVERE, "Failed to start Arthas via legacy reflection", e);
       return null;
     }
   }
@@ -427,23 +632,29 @@ public final class ArthasBootstrap {
   }
 
   /**
-   * 构建 Arthas 配置
+   * 构建 Arthas 配置 Map
    *
-   * @return 配置属性
+   * @return 配置 Map
    */
-  private Properties buildArthasProperties() {
-    Properties props = new Properties();
+  private Map<String, String> buildArthasConfigMap() {
+    Map<String, String> configMap = new HashMap<>();
 
     // 禁用 Arthas 默认的 telnet 和 http 服务（我们使用 Tunnel）
-    props.setProperty("arthas.telnetPort", "-1");
-    props.setProperty("arthas.httpPort", "-1");
+    configMap.put("arthas.telnetPort", "-1");
+    configMap.put("arthas.httpPort", "-1");
 
     // 设置 session 超时（Java 8 兼容）
-    props.setProperty(
+    configMap.put(
         "arthas.sessionTimeout",
         String.valueOf(config.getSessionIdleTimeout().toMillis() / 1000));
 
-    return props;
+    // Tunnel 相关配置
+    String tunnelServer = config.getTunnelEndpoint();
+    if (tunnelServer != null && !tunnelServer.isEmpty()) {
+      configMap.put("tunnel-server", tunnelServer);
+    }
+
+    return configMap;
   }
 
   /**

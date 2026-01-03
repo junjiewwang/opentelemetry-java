@@ -11,11 +11,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -59,6 +62,7 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
   private static final String PATH_TASKS_POLL = "/poll/tasks";
   private static final String PATH_STATUS = "/status";
   private static final String PATH_UPLOAD_CHUNK = "/upload-chunk";
+  private static final String PATH_TASK_RESULT = "/tasks/result";
 
   private final OtlpHealthMonitor healthMonitor;
   private final OkHttpClient httpClient;
@@ -217,6 +221,33 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
         future,
         responseBody -> parseChunkedUploadResponse(responseBody),
         DefaultChunkedUploadResponse::error);
+
+    return future;
+  }
+
+  @Override
+  public CompletableFuture<TaskResultResponse> reportTaskResult(TaskResultRequest request) {
+    checkNotClosed();
+
+    CompletableFuture<TaskResultResponse> future = new CompletableFuture<>();
+
+    byte[] requestBody = serializeTaskResultRequest(request);
+
+    Request httpRequest =
+        buildRequest(baseUrl + PATH_TASK_RESULT)
+            .post(RequestBody.create(requestBody, JSON_TYPE))
+            .build();
+
+    logger.log(
+        Level.FINE,
+        "[TASK-RESULT] Reporting task result: taskId={0}, status={1}",
+        new Object[] {request.getTaskId(), request.getStatus()});
+
+    executeAsync(
+        httpRequest,
+        future,
+        responseBody -> parseTaskResultResponse(responseBody),
+        DefaultTaskResultResponse::error);
 
     return future;
   }
@@ -446,33 +477,376 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     return chunk.getChunkData();
   }
 
+  private static byte[] serializeTaskResultRequest(TaskResultRequest request) {
+    // 使用 JSON 序列化
+    StringBuilder json = new StringBuilder();
+    json.append("{");
+    json.append(String.format(Locale.ROOT, "\"task_id\":\"%s\"", escapeJson(request.getTaskId())));
+    json.append(String.format(Locale.ROOT, ",\"agent_id\":\"%s\"", escapeJson(request.getAgentId())));
+    json.append(String.format(Locale.ROOT, ",\"status\":\"%s\"", request.getStatus().name()));
+    
+    if (request.getErrorCode() != null) {
+      json.append(String.format(Locale.ROOT, ",\"error_code\":\"%s\"", escapeJson(request.getErrorCode())));
+    }
+    if (request.getErrorMessage() != null) {
+      json.append(String.format(Locale.ROOT, ",\"error_message\":\"%s\"", escapeJson(request.getErrorMessage())));
+    }
+    if (request.getResultJson() != null) {
+      // resultJson 已经是 JSON，不需要额外转义
+      json.append(String.format(Locale.ROOT, ",\"result\":%s", request.getResultJson()));
+    }
+    
+    json.append(String.format(Locale.ROOT, ",\"started_at_millis\":%d", request.getStartedAtMillis()));
+    json.append(String.format(Locale.ROOT, ",\"completed_at_millis\":%d", request.getCompletedAtMillis()));
+    json.append(String.format(Locale.ROOT, ",\"execution_time_millis\":%d", request.getExecutionTimeMillis()));
+    json.append("}");
+    
+    return json.toString().getBytes(StandardCharsets.UTF_8);
+  }
+
+  /** JSON 字符串转义 */
+  private static String escapeJson(String value) {
+    if (value == null) {
+      return "";
+    }
+    return value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t");
+  }
+
   // ===== 解析方法 =====
 
-  @SuppressWarnings("UnusedVariable")
   private static UnifiedPollResponse parseUnifiedPollResponse(byte[] data) {
-    // TODO: 使用 JSON/Protobuf 反序列化
-    // 这里返回简化的实现
     String json = new String(data, StandardCharsets.UTF_8);
     
-    // 简化解析（实际应使用 JSON 解析器）
+    // 增强日志：使用 INFO 级别输出响应摘要，便于诊断
+    int jsonLen = json.length();
+    String jsonPreview = jsonLen > 500 ? json.substring(0, 500) + "..." : json;
+    logger.log(Level.INFO, "[POLL-PARSE] Received unified poll response: length={0}, preview={1}", 
+        new Object[] {jsonLen, jsonPreview});
+    
+    // 解析顶层字段
     boolean hasAnyChanges = json.contains("\"has_any_changes\":true") 
         || json.contains("\"has_any_changes\": true");
+    
+    logger.log(Level.INFO, "[POLL-PARSE] Top-level: hasAnyChanges={0}, hasCONFIG={1}, hasTASK={2}",
+        new Object[] {hasAnyChanges, json.contains("\"CONFIG\""), json.contains("\"TASK\"")});
     
     Map<String, PollResult> results = new HashMap<>();
     
     // 解析 CONFIG 结果
     if (json.contains("\"CONFIG\"")) {
-      boolean configHasChanges = json.contains("\"has_changes\":true") 
-          || json.contains("\"has_changes\": true");
-      results.put("CONFIG", new DefaultPollResult("CONFIG", configHasChanges, null, null, null, null));
+      PollResult configResult = parseConfigResult(json);
+      if (configResult != null) {
+        results.put("CONFIG", configResult);
+      }
     }
     
     // 解析 TASK 结果
     if (json.contains("\"TASK\"")) {
-      results.put("TASK", new DefaultPollResult("TASK", /* hasChanges= */ false, null, null, null, Collections.emptyList()));
+      PollResult taskResult = parseTaskResult(json);
+      if (taskResult != null) {
+        results.put("TASK", taskResult);
+        int taskCount = taskResult.getTasks() != null ? taskResult.getTasks().size() : 0;
+        logger.log(Level.INFO, "[POLL-PARSE] Parsed TASK result: hasChanges={0}, taskCount={1}",
+            new Object[] {taskResult.hasChanges(), taskCount});
+        
+        // 输出每个任务的摘要信息
+        if (taskResult.getTasks() != null) {
+          for (TaskInfo task : taskResult.getTasks()) {
+            logger.log(Level.INFO, 
+                "[POLL-PARSE] Task in response: taskId={0}, type={1}, priority={2}, params={3}",
+                new Object[] {
+                  task.getTaskId(),
+                  task.getTaskType(),
+                  task.getPriority(),
+                  task.getParametersJson()
+                });
+          }
+        }
+      } else {
+        logger.log(Level.WARNING, "[POLL-PARSE] TASK block found but parseTaskResult returned null");
+      }
+    } else {
+      logger.log(Level.INFO, "[POLL-PARSE] No TASK block in response");
     }
     
     return new DefaultUnifiedPollResponse(/* success= */ true, hasAnyChanges, results, "");
+  }
+
+  /**
+   * 解析 CONFIG 类型的结果
+   */
+  @Nullable
+  private static PollResult parseConfigResult(String json) {
+    // 查找 CONFIG 块
+    int configStart = json.indexOf("\"CONFIG\"");
+    if (configStart < 0) {
+      return null;
+    }
+    
+    // 提取 CONFIG 对象（简化解析，假设结构正确）
+    int blockStart = json.indexOf("{", configStart);
+    int blockEnd = findMatchingBrace(json, blockStart);
+    if (blockStart < 0 || blockEnd < 0) {
+      return new DefaultPollResult("CONFIG", /* hasChanges= */ false, null, null, null, null);
+    }
+    
+    String configBlock = json.substring(blockStart, blockEnd + 1);
+    
+    // 解析 has_changes
+    boolean hasChanges = configBlock.contains("\"has_changes\":true") 
+        || configBlock.contains("\"has_changes\": true");
+    
+    // 解析 config_version
+    String configVersion = extractStringField(configBlock, "config_version");
+    
+    // 解析 config_etag
+    String configEtag = extractStringField(configBlock, "config_etag");
+    
+    return new DefaultPollResult("CONFIG", hasChanges, null, configVersion, configEtag, null);
+  }
+
+  /**
+   * 解析 TASK 类型的结果
+   */
+  @Nullable
+  private static PollResult parseTaskResult(String json) {
+    // 查找 TASK 块
+    int taskStart = json.indexOf("\"TASK\"");
+    if (taskStart < 0) {
+      return null;
+    }
+    
+    // 提取 TASK 对象
+    int blockStart = json.indexOf("{", taskStart);
+    int blockEnd = findMatchingBrace(json, blockStart);
+    if (blockStart < 0 || blockEnd < 0) {
+      return new DefaultPollResult("TASK", /* hasChanges= */ false, null, null, null, Collections.emptyList());
+    }
+    
+    String taskBlock = json.substring(blockStart, blockEnd + 1);
+    
+    // 解析 has_changes
+    boolean hasChanges = taskBlock.contains("\"has_changes\":true") 
+        || taskBlock.contains("\"has_changes\": true");
+    
+    // 解析 tasks 数组
+    List<TaskInfo> tasks = parseTasksArray(taskBlock);
+    
+    logger.log(Level.FINE, "[POLL-PARSE] TASK block: hasChanges={0}, tasks={1}",
+        new Object[] {hasChanges, tasks.size()});
+    
+    return new DefaultPollResult("TASK", hasChanges, null, null, null, tasks);
+  }
+
+  /**
+   * 解析 tasks 数组
+   */
+  private static List<TaskInfo> parseTasksArray(String taskBlock) {
+    List<TaskInfo> tasks = new ArrayList<>();
+    
+    // 查找 tasks 数组
+    int tasksStart = taskBlock.indexOf("\"tasks\"");
+    if (tasksStart < 0) {
+      return tasks;
+    }
+    
+    // 找到数组开始位置
+    int arrayStart = taskBlock.indexOf("[", tasksStart);
+    int arrayEnd = findMatchingBracket(taskBlock, arrayStart);
+    if (arrayStart < 0 || arrayEnd < 0) {
+      return tasks;
+    }
+    
+    String tasksArray = taskBlock.substring(arrayStart + 1, arrayEnd);
+    
+    // 解析数组中的每个任务对象
+    int pos = 0;
+    while (pos < tasksArray.length()) {
+      int objStart = tasksArray.indexOf("{", pos);
+      if (objStart < 0) {
+        break;
+      }
+      
+      int objEnd = findMatchingBrace(tasksArray, objStart);
+      if (objEnd < 0) {
+        break;
+      }
+      
+      String taskObj = tasksArray.substring(objStart, objEnd + 1);
+      TaskInfo taskInfo = parseTaskInfo(taskObj);
+      if (taskInfo != null) {
+        tasks.add(taskInfo);
+      }
+      
+      pos = objEnd + 1;
+    }
+    
+    return tasks;
+  }
+
+  /**
+   * 解析单个任务对象
+   */
+  @Nullable
+  private static TaskInfo parseTaskInfo(String taskObj) {
+    String taskId = extractStringField(taskObj, "task_id");
+    if (taskId == null || taskId.isEmpty()) {
+      return null;
+    }
+    
+    String taskTypeRaw = extractStringField(taskObj, "task_type");
+    String taskType = taskTypeRaw != null ? taskTypeRaw : "UNKNOWN";
+    String parametersJsonRaw = extractObjectField(taskObj, "parameters");
+    String parametersJson = parametersJsonRaw != null ? parametersJsonRaw : "{}";
+    int priority = extractIntField(taskObj, "priority", 0);
+    long timeoutMillis = extractLongField(taskObj, "timeout_millis", 60000);
+    long createdAtMillis = extractLongField(taskObj, "created_at_millis", 0);
+    long expiresAtMillis = extractLongField(taskObj, "expires_at_millis", 0);
+    long maxAcceptableDelayMillis = extractLongField(taskObj, "max_acceptable_delay_millis", 0);
+    
+    logger.log(Level.FINE, "[POLL-PARSE] Parsed task: id={0}, type={1}, priority={2}",
+        new Object[] {taskId, taskType, priority});
+    
+    return new DefaultTaskInfo(
+        taskId, taskType, parametersJson, priority, timeoutMillis, 
+        createdAtMillis, expiresAtMillis, maxAcceptableDelayMillis);
+  }
+
+  // ===== JSON 解析辅助方法 =====
+
+  /**
+   * 提取字符串字段值
+   */
+  @Nullable
+  private static String extractStringField(String json, String fieldName) {
+    Pattern pattern = Pattern.compile("\"" + fieldName + "\"\\s*:\\s*\"([^\"]*)\"");
+    Matcher matcher = pattern.matcher(json);
+    if (matcher.find()) {
+      return matcher.group(1);
+    }
+    return null;
+  }
+
+  /**
+   * 提取嵌套对象字段（返回 JSON 字符串）
+   */
+  @Nullable
+  private static String extractObjectField(String json, String fieldName) {
+    int fieldStart = json.indexOf("\"" + fieldName + "\"");
+    if (fieldStart < 0) {
+      return null;
+    }
+    
+    int objStart = json.indexOf("{", fieldStart);
+    if (objStart < 0) {
+      return null;
+    }
+    
+    int objEnd = findMatchingBrace(json, objStart);
+    if (objEnd < 0) {
+      return null;
+    }
+    
+    return json.substring(objStart, objEnd + 1);
+  }
+
+  /**
+   * 提取整数字段值
+   */
+  private static int extractIntField(String json, String fieldName, int defaultValue) {
+    Pattern pattern = Pattern.compile("\"" + fieldName + "\"\\s*:\\s*(-?\\d+)");
+    Matcher matcher = pattern.matcher(json);
+    if (matcher.find()) {
+      try {
+        return Integer.parseInt(matcher.group(1));
+      } catch (NumberFormatException e) {
+        return defaultValue;
+      }
+    }
+    return defaultValue;
+  }
+
+  /**
+   * 提取长整数字段值
+   */
+  private static long extractLongField(String json, String fieldName, long defaultValue) {
+    Pattern pattern = Pattern.compile("\"" + fieldName + "\"\\s*:\\s*(-?\\d+)");
+    Matcher matcher = pattern.matcher(json);
+    if (matcher.find()) {
+      try {
+        return Long.parseLong(matcher.group(1));
+      } catch (NumberFormatException e) {
+        return defaultValue;
+      }
+    }
+    return defaultValue;
+  }
+
+  /**
+   * 查找匹配的右花括号
+   */
+  private static int findMatchingBrace(String json, int start) {
+    if (start < 0 || start >= json.length() || json.charAt(start) != '{') {
+      return -1;
+    }
+    
+    int depth = 0;
+    boolean inString = false;
+    
+    for (int i = start; i < json.length(); i++) {
+      char c = json.charAt(i);
+      
+      if (c == '"' && (i == 0 || json.charAt(i - 1) != '\\')) {
+        inString = !inString;
+      } else if (!inString) {
+        if (c == '{') {
+          depth++;
+        } else if (c == '}') {
+          depth--;
+          if (depth == 0) {
+            return i;
+          }
+        }
+      }
+    }
+    
+    return -1;
+  }
+
+  /**
+   * 查找匹配的右方括号
+   */
+  private static int findMatchingBracket(String json, int start) {
+    if (start < 0 || start >= json.length() || json.charAt(start) != '[') {
+      return -1;
+    }
+    
+    int depth = 0;
+    boolean inString = false;
+    
+    for (int i = start; i < json.length(); i++) {
+      char c = json.charAt(i);
+      
+      if (c == '"' && (i == 0 || json.charAt(i - 1) != '\\')) {
+        inString = !inString;
+      } else if (!inString) {
+        if (c == '[') {
+          depth++;
+        } else if (c == ']') {
+          depth--;
+          if (depth == 0) {
+            return i;
+          }
+        }
+      }
+    }
+    
+    return -1;
   }
 
   @SuppressWarnings("UnusedVariable")
@@ -498,6 +872,19 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
   private static ChunkedUploadResponse parseChunkedUploadResponse(byte[] data) {
     // TODO: 使用 Protobuf 反序列化
     return new DefaultChunkedUploadResponse(/* success= */ true, "", 0, "CHUNK_RECEIVED", "");
+  }
+
+  private static TaskResultResponse parseTaskResultResponse(byte[] data) {
+    String json = new String(data, StandardCharsets.UTF_8);
+    
+    // 解析响应
+    boolean success = json.contains("\"success\":true") || json.contains("\"success\": true");
+    String errorMessage = extractStringField(json, "error_message");
+    if (errorMessage == null) {
+      errorMessage = extractStringField(json, "message");
+    }
+    
+    return new DefaultTaskResultResponse(success, errorMessage != null ? errorMessage : "");
   }
 
   // ===== 函数式接口 =====
@@ -727,6 +1114,85 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     }
   }
 
+  /** 默认任务信息实现 */
+  private static final class DefaultTaskInfo implements TaskInfo {
+    private final String taskId;
+    private final String taskType;
+    private final String parametersJson;
+    private final int priority;
+    private final long timeoutMillis;
+    private final long createdAtMillis;
+    private final long expiresAtMillis;
+    private final long maxAcceptableDelayMillis;
+
+    DefaultTaskInfo(
+        String taskId,
+        String taskType,
+        @Nullable String parametersJson,
+        int priority,
+        long timeoutMillis,
+        long createdAtMillis,
+        long expiresAtMillis,
+        long maxAcceptableDelayMillis) {
+      this.taskId = taskId != null ? taskId : "";
+      this.taskType = taskType != null ? taskType : "UNKNOWN";
+      this.parametersJson = parametersJson != null ? parametersJson : "{}";
+      this.priority = priority;
+      this.timeoutMillis = timeoutMillis;
+      this.createdAtMillis = createdAtMillis;
+      this.expiresAtMillis = expiresAtMillis;
+      this.maxAcceptableDelayMillis = maxAcceptableDelayMillis;
+    }
+
+    @Override
+    public String getTaskId() {
+      return taskId;
+    }
+
+    @Override
+    public String getTaskType() {
+      return taskType;
+    }
+
+    @Override
+    public String getParametersJson() {
+      return parametersJson;
+    }
+
+    @Override
+    public int getPriority() {
+      return priority;
+    }
+
+    @Override
+    public long getTimeoutMillis() {
+      return timeoutMillis;
+    }
+
+    @Override
+    public long getCreatedAtMillis() {
+      return createdAtMillis;
+    }
+
+    @Override
+    public long getExpiresAtMillis() {
+      return expiresAtMillis;
+    }
+
+    @Override
+    public long getMaxAcceptableDelayMillis() {
+      return maxAcceptableDelayMillis;
+    }
+
+    @Override
+    public String toString() {
+      return String.format(
+          Locale.ROOT,
+          "TaskInfo{id=%s, type=%s, priority=%d, timeout=%dms, maxDelay=%dms}",
+          taskId, taskType, priority, timeoutMillis, maxAcceptableDelayMillis);
+    }
+  }
+
   private static final class DefaultStatusResponse implements StatusResponse {
     private final boolean success;
     private final List<String> acknowledgedTaskIds;
@@ -812,6 +1278,31 @@ public final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public String getStatus() {
       return status;
+    }
+
+    @Override
+    public String getErrorMessage() {
+      return errorMessage;
+    }
+  }
+
+  /** 默认任务结果响应实现 */
+  private static final class DefaultTaskResultResponse implements TaskResultResponse {
+    private final boolean success;
+    private final String errorMessage;
+
+    DefaultTaskResultResponse(boolean success, String errorMessage) {
+      this.success = success;
+      this.errorMessage = errorMessage;
+    }
+
+    static TaskResultResponse error(String errorMessage) {
+      return new DefaultTaskResultResponse(/* success= */ false, errorMessage);
+    }
+
+    @Override
+    public boolean isSuccess() {
+      return success;
     }
 
     @Override

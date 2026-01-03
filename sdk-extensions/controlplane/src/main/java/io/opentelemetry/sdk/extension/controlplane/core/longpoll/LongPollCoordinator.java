@@ -307,8 +307,13 @@ public final class LongPollCoordinator implements Closeable {
           // 记录任务成功
           taskLogger.logTaskCompleted(taskId, "success:poll_count=" + count);
 
-          // 根据服务端建议决定下次轮询时间（通常为 0，立即重试）
-          // 这里不需要 sleep，因为长轮询本身会阻塞等待
+          // 立即重连：收到响应后立即发起下一次长轮询，不等待固定间隔
+          // 长轮询的特点是服务端会 hold 住连接直到有数据或超时，
+          // 所以客户端可以在收到响应后立即重连，不会造成服务端压力
+          logger.log(
+              Level.FINE,
+              "[IMMEDIATE-RECONNECT] Poll completed, immediately starting next poll (count: {0})",
+              count);
           state.set(State.IDLE);
 
         } else {

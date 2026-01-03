@@ -6,7 +6,12 @@
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
 import java.io.Closeable;
+import java.lang.instrument.Instrumentation;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -39,8 +44,10 @@ public final class ArthasLifecycleManager implements Closeable {
     STOPPED,
     /** 启动中 */
     STARTING,
-    /** 运行中 */
+    /** 运行中（本地启动成功） */
     RUNNING,
+    /** 已注册（向服务端注册成功） */
+    REGISTERED,
     /** 空闲（无活跃会话） */
     IDLE,
     /** 停止中 */
@@ -51,6 +58,9 @@ public final class ArthasLifecycleManager implements Closeable {
   private final LifecycleEventListener listener;
   private final AtomicReference<State> state = new AtomicReference<>(State.STOPPED);
   private final ArthasBootstrap arthasBootstrap;
+
+  /** 启动日志收集器（用于记录启动过程中的关键事件） */
+  private final StartupLogCollector startupLogCollector = new StartupLogCollector();
 
   @Nullable private Instant startedAt;
   @Nullable private Instant idleSince;
@@ -76,6 +86,24 @@ public final class ArthasLifecycleManager implements Closeable {
    */
   public ArthasBootstrap getArthasBootstrap() {
     return arthasBootstrap;
+  }
+
+  /**
+   * 设置 Instrumentation 实例
+   *
+   * <p>Instrumentation 用于加载 SpyAPI 到 Bootstrap ClassLoader
+   * 和传递给 Arthas 进行字节码增强。
+   *
+   * @param instrumentation Instrumentation 实例
+   */
+  public void setInstrumentation(@Nullable Instrumentation instrumentation) {
+    arthasBootstrap.setInstrumentation(instrumentation);
+    if (instrumentation != null) {
+      logger.log(Level.INFO, "Instrumentation set for Arthas lifecycle manager");
+      startupLogCollector.addLog("INFO", "Instrumentation configured");
+    } else {
+      startupLogCollector.addLog("WARN", "Instrumentation not available");
+    }
   }
 
   /**
@@ -108,20 +136,36 @@ public final class ArthasLifecycleManager implements Closeable {
     }
 
     logger.log(Level.INFO, "Starting Arthas...");
+    startupLogCollector.clear();
+    startupLogCollector.addLog("INFO", "Arthas startup initiated");
+
+    // 记录 Instrumentation 状态
+    if (arthasBootstrap.getInstrumentation() == null) {
+      startupLogCollector.addLog("WARN", 
+          "Instrumentation not available - SpyAPI cannot be loaded to Bootstrap ClassLoader");
+    } else {
+      startupLogCollector.addLog("INFO", "Instrumentation available");
+    }
 
     try {
       // 1. 初始化 Arthas（加载依赖）
+      startupLogCollector.addLog("INFO", "Initializing Arthas...");
       if (!arthasBootstrap.isInitialized() && !arthasBootstrap.initialize()) {
         state.set(State.STOPPED);
-        return StartResult.failed("Failed to initialize Arthas");
+        startupLogCollector.addLog("ERROR", "Failed to initialize Arthas");
+        return StartResult.failed("Failed to initialize Arthas", startupLogCollector.getLogs());
       }
+      startupLogCollector.addLog("INFO", "Arthas initialized");
 
       // 2. 启动 Arthas
+      startupLogCollector.addLog("INFO", "Starting Arthas bootstrap...");
       ArthasBootstrap.StartResult bootResult = arthasBootstrap.start();
       if (!bootResult.isSuccess()) {
         state.set(State.STOPPED);
-        return StartResult.failed(bootResult.getMessage());
+        startupLogCollector.addLog("ERROR", "Arthas bootstrap failed: " + bootResult.getMessage());
+        return StartResult.failed(bootResult.getMessage(), startupLogCollector.getLogs());
       }
+      startupLogCollector.addLog("INFO", "Arthas bootstrap started");
 
       // 3. 启动成功，更新状态
       startedAt = Instant.now();
@@ -131,18 +175,20 @@ public final class ArthasLifecycleManager implements Closeable {
 
       // 切换到运行中状态
       state.set(State.RUNNING);
+      startupLogCollector.addLog("INFO", "Arthas state changed to RUNNING");
 
       logger.log(Level.INFO, "Arthas started successfully");
 
       // 通知监听器
       listener.onArthasStarted();
 
-      return StartResult.success();
+      return StartResult.success(startupLogCollector.getLogs());
 
     } catch (RuntimeException e) {
       logger.log(Level.SEVERE, "Failed to start Arthas", e);
       state.set(State.STOPPED);
-      return StartResult.failed("Failed to start Arthas: " + e.getMessage());
+      startupLogCollector.addLog("ERROR", "Exception during startup: " + e.getMessage());
+      return StartResult.failed("Failed to start Arthas: " + e.getMessage(), startupLogCollector.getLogs());
     }
   }
 
@@ -199,13 +245,46 @@ public final class ArthasLifecycleManager implements Closeable {
   }
 
   /**
+   * 标记已向服务端注册成功
+   * 
+   * <p>当 Tunnel 客户端收到 REGISTER_ACK 消息时调用
+   */
+  public void markRegistered() {
+    State currentState = state.get();
+    // 只有在 RUNNING 状态下才能切换到 REGISTERED
+    if (currentState == State.RUNNING) {
+      if (state.compareAndSet(State.RUNNING, State.REGISTERED)) {
+        logger.log(Level.INFO, "Arthas registered with server successfully");
+        startupLogCollector.addLog("INFO", "Agent registered with server");
+      }
+    } else if (currentState == State.STARTING) {
+      // 如果还在启动中，先切换到 RUNNING，再切换到 REGISTERED
+      if (state.compareAndSet(State.STARTING, State.REGISTERED)) {
+        logger.log(Level.INFO, "Arthas started and registered with server");
+        startupLogCollector.addLog("INFO", "Agent started and registered with server");
+      }
+    }
+  }
+
+  /**
+   * 检查是否已注册
+   *
+   * @return 是否已向服务端注册成功
+   */
+  public boolean isRegistered() {
+    State s = state.get();
+    return s == State.REGISTERED || s == State.IDLE;
+  }
+
+  /**
    * 标记进入空闲状态（所有会话关闭时调用）
    *
    * @param scheduler 调度器
    */
   public void markIdle(ScheduledExecutorService scheduler) {
     State currentState = state.get();
-    if (currentState != State.RUNNING) {
+    // RUNNING 或 REGISTERED 状态都可以切换到 IDLE
+    if (currentState != State.RUNNING && currentState != State.REGISTERED) {
       return;
     }
 
@@ -230,7 +309,8 @@ public final class ArthasLifecycleManager implements Closeable {
       // 取消空闲关闭任务
       cancelIdleShutdownTask();
 
-      state.set(State.RUNNING);
+      // 恢复到 REGISTERED 状态（如果之前已注册）
+      state.set(State.REGISTERED);
       idleSince = null;
 
       logger.log(Level.INFO, "Arthas resumed from idle state");
@@ -246,7 +326,7 @@ public final class ArthasLifecycleManager implements Closeable {
   /** 检查 Arthas 是否正在运行 */
   public boolean isRunning() {
     State s = state.get();
-    return s == State.RUNNING || s == State.IDLE;
+    return s == State.RUNNING || s == State.REGISTERED || s == State.IDLE;
   }
 
   /** 获取启动时间 */
@@ -334,22 +414,41 @@ public final class ArthasLifecycleManager implements Closeable {
     arthasBootstrap.destroy();
   }
 
+  /**
+   * 获取启动日志收集器
+   *
+   * @return 启动日志收集器
+   */
+  public StartupLogCollector getStartupLogCollector() {
+    return startupLogCollector;
+  }
+
   /** 启动结果 */
   public static final class StartResult {
     private final boolean success;
     @Nullable private final String errorMessage;
+    private final List<String> logs;
 
-    private StartResult(boolean success, @Nullable String errorMessage) {
+    private StartResult(boolean success, @Nullable String errorMessage, List<String> logs) {
       this.success = success;
       this.errorMessage = errorMessage;
+      this.logs = Collections.unmodifiableList(new ArrayList<>(logs));
     }
 
     public static StartResult success() {
-      return new StartResult(/* success= */ true, /* errorMessage= */ null);
+      return new StartResult(/* success= */ true, /* errorMessage= */ null, Collections.emptyList());
+    }
+
+    public static StartResult success(List<String> logs) {
+      return new StartResult(/* success= */ true, /* errorMessage= */ null, logs);
     }
 
     public static StartResult failed(String errorMessage) {
-      return new StartResult(/* success= */ false, errorMessage);
+      return new StartResult(/* success= */ false, errorMessage, Collections.emptyList());
+    }
+
+    public static StartResult failed(String errorMessage, List<String> logs) {
+      return new StartResult(/* success= */ false, errorMessage, logs);
     }
 
     public boolean isSuccess() {
@@ -359,6 +458,98 @@ public final class ArthasLifecycleManager implements Closeable {
     @Nullable
     public String getErrorMessage() {
       return errorMessage;
+    }
+
+    /**
+     * 获取启动过程日志
+     *
+     * @return 日志列表
+     */
+    public List<String> getLogs() {
+      return logs;
+    }
+
+    /**
+     * 获取日志摘要（用于错误消息）
+     *
+     * @return 日志摘要字符串
+     */
+    public String getLogSummary() {
+      if (logs.isEmpty()) {
+        return "";
+      }
+      StringBuilder sb = new StringBuilder();
+      sb.append(" Startup logs: ");
+      for (int i = 0; i < logs.size(); i++) {
+        if (i > 0) {
+          sb.append("; ");
+        }
+        sb.append(logs.get(i));
+      }
+      return sb.toString();
+    }
+  }
+
+  /**
+   * 启动日志收集器
+   *
+   * <p>用于收集 Arthas 启动过程中的关键事件，便于排查问题。
+   */
+  public static final class StartupLogCollector {
+    private final List<String> logs = new ArrayList<>();
+    private static final int MAX_LOGS = 50;
+
+    /**
+     * 添加日志
+     *
+     * @param level 日志级别
+     * @param message 日志消息
+     */
+    public synchronized void addLog(String level, String message) {
+      if (logs.size() >= MAX_LOGS) {
+        logs.remove(0);
+      }
+      String timestamp = String.format(Locale.ROOT, "%tT", System.currentTimeMillis());
+      logs.add(String.format(Locale.ROOT, "[%s] %s: %s", timestamp, level, message));
+    }
+
+    /**
+     * 获取所有日志
+     *
+     * @return 日志列表（副本）
+     */
+    public synchronized List<String> getLogs() {
+      return new ArrayList<>(logs);
+    }
+
+    /**
+     * 获取最近的错误日志
+     *
+     * @return 最近的错误日志，如果没有则返回 null
+     */
+    @Nullable
+    public synchronized String getLastError() {
+      for (int i = logs.size() - 1; i >= 0; i--) {
+        String log = logs.get(i);
+        if (log.contains("ERROR") || log.contains("WARN")) {
+          return log;
+        }
+      }
+      return null;
+    }
+
+    /** 清除所有日志 */
+    public synchronized void clear() {
+      logs.clear();
+    }
+
+    /**
+     * 获取日志数量
+     *
+     * @return 日志数量
+     */
+    public synchronized int size() {
+      return logs.size();
     }
   }
 
