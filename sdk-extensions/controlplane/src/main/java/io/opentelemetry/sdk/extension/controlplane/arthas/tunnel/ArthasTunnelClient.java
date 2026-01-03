@@ -116,14 +116,15 @@ public final class ArthasTunnelClient implements Closeable {
     this.config = config;
     this.eventListener = eventListener;
     this.agentIdentity = AgentIdentityProvider.get();
-    
+
     // 创建 OkHttpClient
-    this.httpClient = new OkHttpClient.Builder()
-        .connectTimeout(config.getTunnelConnectTimeout())
-        .readTimeout(config.getTunnelConnectTimeout())
-        .writeTimeout(config.getTunnelConnectTimeout())
-        .pingInterval(config.getTunnelPingInterval())
-        .build();
+    this.httpClient =
+        new OkHttpClient.Builder()
+            .connectTimeout(config.getTunnelConnectTimeout())
+            .readTimeout(config.getTunnelConnectTimeout())
+            .writeTimeout(config.getTunnelConnectTimeout())
+            .pingInterval(config.getTunnelPingInterval())
+            .build();
   }
 
   /**
@@ -189,7 +190,7 @@ public final class ArthasTunnelClient implements Closeable {
       Request request = requestBuilder.build();
       WebSocket ws = httpClient.newWebSocket(request, new TunnelWebSocketListener());
       webSocketRef.set(ws);
-      
+
     } catch (RuntimeException e) {
       logger.log(Level.SEVERE, "Error creating WebSocket connection", e);
       setConnectionError("CONNECTION_FAILED", "Failed to create WebSocket: " + e.getMessage());
@@ -265,7 +266,9 @@ public final class ArthasTunnelClient implements Closeable {
         scheduler.scheduleWithFixedDelay(
             () -> {
               if (connectionState.get() == ConnectionState.CONNECTED) {
-                sendTextMessage(new PingMessage(TunnelMessage.generateId(), TunnelMessage.currentTimestamp()));
+                sendTextMessage(
+                    new PingMessage(
+                        TunnelMessage.generateId(), TunnelMessage.currentTimestamp()));
               }
             },
             intervalMillis,
@@ -305,11 +308,7 @@ public final class ArthasTunnelClient implements Closeable {
         "Scheduling reconnect in {0}ms (attempt {1})",
         new Object[] {delayMillis, attempts});
 
-    reconnectTask =
-        scheduler.schedule(
-            this::connect,
-            delayMillis,
-            TimeUnit.MILLISECONDS);
+    reconnectTask = scheduler.schedule(this::connect, delayMillis, TimeUnit.MILLISECONDS);
   }
 
   /** 处理收到的文本消息 */
@@ -367,19 +366,22 @@ public final class ArthasTunnelClient implements Closeable {
     String ackMessage = payload != null ? payload.getMessage() : null;
 
     if (success) {
-      logger.log(Level.INFO, 
-          "[TUNNEL] Agent registration acknowledged by server: {0}", 
+      logger.log(
+          Level.INFO,
+          "[TUNNEL] Agent registration acknowledged by server: {0}",
           ackMessage != null ? ackMessage : "success");
-      
+
       // 通知监听器注册成功
       eventListener.onAgentRegistered();
     } else {
-      logger.log(Level.WARNING, 
-          "[TUNNEL] Agent registration failed: {0}", 
+      logger.log(
+          Level.WARNING,
+          "[TUNNEL] Agent registration failed: {0}",
           ackMessage != null ? ackMessage : "unknown error");
-      
+
       // 设置连接错误
-      setConnectionError("REGISTRATION_FAILED", 
+      setConnectionError(
+          "REGISTRATION_FAILED",
           "Agent registration rejected: " + (ackMessage != null ? ackMessage : "unknown"));
     }
   }
@@ -390,10 +392,12 @@ public final class ArthasTunnelClient implements Closeable {
     String taskId = "arthas-start-" + System.currentTimeMillis();
 
     // 记录任务接收
-    TaskContext context = taskLogger.logTaskReceived(
-        taskId,
-        TaskExecutionLogger.TASK_TYPE_ARTHAS_START,
-        TaskExecutionLogger.SOURCE_TUNNEL_SERVER);
+    @SuppressWarnings("UnusedVariable")
+    TaskContext context =
+        taskLogger.logTaskReceived(
+            taskId,
+            TaskExecutionLogger.TASK_TYPE_ARTHAS_START,
+            TaskExecutionLogger.SOURCE_TUNNEL_SERVER);
 
     taskLogger.logTaskStarted(taskId, "tunnel_client");
 
@@ -416,9 +420,7 @@ public final class ArthasTunnelClient implements Closeable {
         taskId,
         TaskExecutionLogger.TASK_TYPE_ARTHAS_STOP,
         TaskExecutionLogger.SOURCE_TUNNEL_SERVER,
-        TaskExecutionLogger.details()
-            .put("reason", reason)
-            .build());
+        TaskExecutionLogger.details().put("reason", reason).build());
 
     taskLogger.logTaskStarted(taskId, "tunnel_client");
 
@@ -443,17 +445,11 @@ public final class ArthasTunnelClient implements Closeable {
         requestId,
         TaskExecutionLogger.TASK_TYPE_ARTHAS_SESSION,
         TaskExecutionLogger.SOURCE_TUNNEL_SERVER,
-        TaskExecutionLogger.details()
-            .put("userId", userId)
-            .put("cols", cols)
-            .put("rows", rows)
-            .build());
+        TaskExecutionLogger.details().put("userId", userId).put("cols", cols).put("rows", rows).build());
 
     if (sessionManager == null) {
       taskLogger.logTaskFailed(
-          requestId,
-          TaskExecutionLogger.ERROR_INTERNAL,
-          "Session manager not initialized");
+          requestId, TaskExecutionLogger.ERROR_INTERNAL, "Session manager not initialized");
       sendTerminalRejected(requestId, "INTERNAL_ERROR", "Session manager not initialized");
       return;
     }
@@ -468,6 +464,31 @@ public final class ArthasTunnelClient implements Closeable {
     // 请求启动 Arthas（如果尚未启动）
     taskLogger.logTaskProgress(requestId, "arthas_check", "Ensuring Arthas is started");
     eventListener.onArthasStartRequested();
+
+    // 如果 Arthas 正处于 STARTING，使用事件总线等待其变为可用（避免瞬时拒绝）。
+    // 注意：此处不阻塞 canCreateSession()，等待逻辑只在请求处理层出现。
+    java.time.Duration waitTimeout = config.getTunnelConnectTimeout();
+    try {
+      // 这里的 eventListener 实际是 ArthasIntegration（构造时传入）。
+      io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration integration =
+          (io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration) eventListener;
+
+      // 用 join() 避免 checked exception；超时由 await 内部通过 TimeoutException 异常完成。
+      integration
+          .awaitState(
+              s ->
+                  s.getArthasState()
+                      != io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager
+                          .State.STARTING,
+              waitTimeout)
+          .join();
+
+    } catch (RuntimeException e) {
+      String msg = "Failed while waiting for Arthas startup: " + e.getMessage();
+      sendTerminalRejected(requestId, "ARTHAS_NOT_RUNNING", msg);
+      taskLogger.logTaskFailed(requestId, "ARTHAS_NOT_RUNNING", msg);
+      return;
+    }
 
     // 创建会话
     taskLogger.logTaskProgress(requestId, "session_create", "Creating terminal session");
@@ -488,14 +509,11 @@ public final class ArthasTunnelClient implements Closeable {
         logger.log(Level.INFO, "Terminal session created: {0}", session.getSessionId());
 
         // 记录任务成功完成
-        taskLogger.logTaskCompleted(
-            requestId,
-            "session_created:" + session.getSessionId(),
-            0);
+        taskLogger.logTaskCompleted(requestId, "session_created:" + session.getSessionId(), 0);
       }
     } else {
-      String rejectReason = result.getRejectReason() != null 
-          ? result.getRejectReason().name() : "UNKNOWN";
+      String rejectReason =
+          result.getRejectReason() != null ? result.getRejectReason().name() : "UNKNOWN";
       String rejectMsg = result.getMessage() != null ? result.getMessage() : "Unknown error";
       sendTerminalRejected(requestId, rejectReason, rejectMsg);
       logger.log(Level.WARNING, "Terminal session rejected: {0}", rejectMsg);
@@ -554,10 +572,7 @@ public final class ArthasTunnelClient implements Closeable {
     int cols = message.getPayload().getCols();
     int rows = message.getPayload().getRows();
 
-    logger.log(
-        Level.FINE,
-        "Terminal resize: session={0}, cols={1}, rows={2}",
-        new Object[] {sessionId, cols, rows});
+    logger.log(Level.FINE, "Terminal resize: session={0}, cols={1}, rows={2}", new Object[] {sessionId, cols, rows});
 
     eventListener.onTerminalResize(sessionId, cols, rows);
   }
@@ -572,10 +587,7 @@ public final class ArthasTunnelClient implements Closeable {
         taskId,
         TaskExecutionLogger.TASK_TYPE_ARTHAS_SESSION,
         TaskExecutionLogger.SOURCE_TUNNEL_SERVER,
-        TaskExecutionLogger.details()
-            .put("sessionId", sessionId)
-            .put("action", "close")
-            .build());
+        TaskExecutionLogger.details().put("sessionId", sessionId).put("action", "close").build());
 
     taskLogger.logTaskStarted(taskId, "session_manager");
 
@@ -601,7 +613,11 @@ public final class ArthasTunnelClient implements Closeable {
 
     ArthasStatusPayload payload =
         new ArthasStatusPayload(
-            state, config.getVersion(), activeSessions, config.getMaxSessionsPerAgent(), uptimeMs);
+            state,
+            config.getVersion(),
+            activeSessions,
+            config.getMaxSessionsPerAgent(),
+            uptimeMs);
 
     sendTextMessage(ArthasStatusMessage.create(payload));
   }
@@ -649,9 +665,7 @@ public final class ArthasTunnelClient implements Closeable {
     lastConnectionError.set(new ConnectionError(code, message, System.currentTimeMillis()));
   }
 
-  /**
-   * 连接错误信息
-   */
+  /** 连接错误信息 */
   public static final class ConnectionError {
     private final String code;
     private final String message;
@@ -699,7 +713,7 @@ public final class ArthasTunnelClient implements Closeable {
       }
 
       connectionState.set(ConnectionState.CLOSED);
-      
+
       // 关闭 OkHttpClient
       httpClient.dispatcher().executorService().shutdown();
       httpClient.connectionPool().evictAll();
@@ -768,25 +782,20 @@ public final class ArthasTunnelClient implements Closeable {
         String statusMessage = response.message();
         if (code == 401) {
           errorCode = "UNAUTHORIZED";
-          errorDetail = String.format(
-              Locale.ROOT,
-              "Authentication failed (HTTP 401). Please check Authorization token. Response: %s",
-              statusMessage);
+          errorDetail =
+              String.format(
+                  Locale.ROOT,
+                  "Authentication failed (HTTP 401). Please check Authorization token. Response: %s",
+                  statusMessage);
         } else if (code == 403) {
           errorCode = "FORBIDDEN";
-          errorDetail = String.format(
-              Locale.ROOT,
-              "Access denied (HTTP 403). Response: %s", statusMessage);
+          errorDetail = String.format(Locale.ROOT, "Access denied (HTTP 403). Response: %s", statusMessage);
         } else if (code >= 400 && code < 500) {
           errorCode = "CLIENT_ERROR";
-          errorDetail = String.format(
-              Locale.ROOT,
-              "Client error (HTTP %d): %s", code, statusMessage);
+          errorDetail = String.format(Locale.ROOT, "Client error (HTTP %d): %s", code, statusMessage);
         } else if (code >= 500) {
           errorCode = "SERVER_ERROR";
-          errorDetail = String.format(
-              Locale.ROOT,
-              "Server error (HTTP %d): %s", code, statusMessage);
+          errorDetail = String.format(Locale.ROOT, "Server error (HTTP %d): %s", code, statusMessage);
         }
       }
       setConnectionError(errorCode, errorDetail);

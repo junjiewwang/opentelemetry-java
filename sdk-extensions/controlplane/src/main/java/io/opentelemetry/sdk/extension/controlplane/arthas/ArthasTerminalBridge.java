@@ -271,9 +271,7 @@ public final class ArthasTerminalBridge implements Closeable {
     // 优先检查 LifecycleManager 状态（更准确）
     if (lifecycleManager != null) {
       ArthasLifecycleManager.State state = lifecycleManager.getState();
-      if (state != ArthasLifecycleManager.State.RUNNING 
-          && state != ArthasLifecycleManager.State.REGISTERED
-          && state != ArthasLifecycleManager.State.IDLE) {
+      if (state != ArthasLifecycleManager.State.RUNNING) {
         logger.log(Level.FINE, 
             "Arthas not in running state (via LifecycleManager), current state: {0}", state);
         return false;

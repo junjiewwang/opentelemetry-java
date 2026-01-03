@@ -11,6 +11,9 @@ import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.Tas
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultResponse;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEvent;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEventManager;
 import java.io.Closeable;
 import java.util.HashMap;
 import java.util.Locale;
@@ -18,10 +21,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -135,6 +140,13 @@ public final class TaskDispatcher implements Closeable {
   /** 是否关闭 */
   private volatile boolean closed = false;
 
+  /** 统一任务状态事件管理器（事件驱动上报入口） */
+  private final TaskStatusEventManager statusEventManager = new TaskStatusEventManager();
+
+  /** 每个任务当前已上报到服务端的最终状态（用于去重/幂等） */
+  private final Map<String, AtomicReference<TaskStatus>> reportedTerminalStatus =
+      new ConcurrentHashMap<>();
+
   /**
    * 创建任务分发器
    *
@@ -177,6 +189,33 @@ public final class TaskDispatcher implements Closeable {
     });
 
     logger.log(Level.INFO, "TaskDispatcher initialized for agent: {0}", agentId);
+
+    // 将事件管理器的事件统一转为 reportResult 上报（实时）
+    this.statusEventManager.addListener(this::onTaskStatusEvent);
+  }
+
+  private void onTaskStatusEvent(TaskStatusEvent event) {
+    if (closed) {
+      return;
+    }
+    String taskId = event.getTaskId();
+    TaskExecutionResult result = event.toExecutionResult();
+
+    // 终态幂等：SUCCESS/FAILED/TIMEOUT/CANCELLED 只上报一次；RUNNING 可重复但会被管理器做节流/合并。
+    if (result.getStatus() != TaskStatus.RUNNING) {
+      AtomicReference<TaskStatus> ref =
+          reportedTerminalStatus.computeIfAbsent(taskId, k -> new AtomicReference<>());
+      TaskStatus prev = ref.get();
+      if (prev == TaskStatus.SUCCESS
+          || prev == TaskStatus.FAILED
+          || prev == TaskStatus.TIMEOUT
+          || prev == TaskStatus.CANCELLED) {
+        return;
+      }
+      ref.set(result.getStatus());
+    }
+
+    reportResult(taskId, result);
   }
 
   /**
@@ -291,6 +330,24 @@ public final class TaskDispatcher implements Closeable {
     // 构建执行上下文
     TaskExecutionContext context = buildContext(taskInfo);
 
+    // 为该任务创建 emitter：执行器可在关键事件发生时实时上报状态
+    TaskStatusEmitter emitter = statusEventManager.createEmitter(taskId, agentId);
+    context = TaskExecutionContext.builder()
+        .taskId(context.getTaskId())
+        .taskType(context.getTaskType())
+        .priority(context.getPriority())
+        .timeoutMillis(context.getTimeoutMillis())
+        .createdAtMillis(context.getCreatedAtMillis())
+        .expiresAtMillis(context.getExpiresAtMillis())
+        .agentId(context.getAgentId())
+        .parameters(context.getParameters())
+        .parametersJson(context.getParametersJson())
+        .client(context.getClient())
+        .scheduler(context.getScheduler())
+        .receivedAtMillis(context.getReceivedAtMillis())
+        .statusEmitter(emitter)
+        .build();
+
     // 记录任务开始
     logger.log(
         Level.INFO,
@@ -300,6 +357,9 @@ public final class TaskDispatcher implements Closeable {
 
     // 异步执行任务
     long startTime = System.currentTimeMillis();
+
+    // 事件驱动：任务一旦开始执行，立即上报 RUNNING（避免服务端误判超时/重复派发）
+    emitter.running("Task started");
     
     CompletableFuture<TaskExecutionResult> executionFuture = executor.execute(context);
     
@@ -317,6 +377,7 @@ public final class TaskDispatcher implements Closeable {
     Object unused1 = timeoutFuture.whenCompleteAsync((result, error) -> {
       long executionTime = System.currentTimeMillis() - startTime;
       runningTasks.remove(taskId);
+      statusEventManager.closeEmitter(taskId);
 
       TaskExecutionResult finalResult;
       if (error != null) {
@@ -328,6 +389,13 @@ public final class TaskDispatcher implements Closeable {
               Level.WARNING,
               "[TASK-TIMEOUT] Task execution timeout: taskId={0}, timeout={1}ms",
               new Object[] {taskId, finalTimeout});
+        } else if (error instanceof CancellationException) {
+          // 取消通常来自本地超时控制或上层关闭
+          finalResult = TaskExecutionResult.cancelled("Task future cancelled: " + error.getMessage());
+          logger.log(
+              Level.WARNING,
+              "[TASK-CANCELLED] Task cancelled: taskId={0}, message={1}",
+              new Object[] {taskId, error.getMessage()});
         } else {
           finalResult = TaskExecutionResult.fromException("EXECUTION_ERROR", error);
           logger.log(
@@ -352,6 +420,11 @@ public final class TaskDispatcher implements Closeable {
 
       // 上报结果到服务端
       reportResult(taskId, finalResult);
+
+      // 记录终态（用于后续事件幂等）
+      reportedTerminalStatus
+          .computeIfAbsent(taskId, k -> new AtomicReference<>())
+          .set(finalResult.getStatus());
 
       // 记录任务完成日志
       if (finalResult.isSuccess()) {
@@ -382,8 +455,8 @@ public final class TaskDispatcher implements Closeable {
     // 调度超时任务
     @SuppressWarnings("FutureReturnValueIgnored")
     Object unused1 = scheduler.schedule(() -> {
-      if (!future.isDone()) {
-        future.cancel(false);
+      if (!timeoutFuture.isDone()) {
+        // 不取消原 future：取消会导致 CancellationException，掩盖超时根因。
         timeoutFuture.completeExceptionally(
             new TimeoutException("Task " + taskId + " execution timeout"));
       }
@@ -392,10 +465,12 @@ public final class TaskDispatcher implements Closeable {
     // 当原始 Future 完成时，完成超时 Future
     @SuppressWarnings("FutureReturnValueIgnored")
     Object unused2 = future.whenComplete((result, error) -> {
-      if (error != null) {
-        timeoutFuture.completeExceptionally(error);
-      } else {
-        timeoutFuture.complete(result);
+      if (!timeoutFuture.isDone()) {
+        if (error != null) {
+          timeoutFuture.completeExceptionally(error);
+        } else {
+          timeoutFuture.complete(result);
+        }
       }
     });
 

@@ -5,6 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
+import io.opentelemetry.sdk.extension.controlplane.InstrumentationHolder;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
 import java.time.Instant;
@@ -16,6 +17,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -46,8 +48,6 @@ public final class ArthasLifecycleManager implements Closeable {
     STARTING,
     /** 运行中（本地启动成功） */
     RUNNING,
-    /** 已注册（向服务端注册成功） */
-    REGISTERED,
     /** 空闲（无活跃会话） */
     IDLE,
     /** 停止中 */
@@ -58,6 +58,9 @@ public final class ArthasLifecycleManager implements Closeable {
   private final LifecycleEventListener listener;
   private final AtomicReference<State> state = new AtomicReference<>(State.STOPPED);
   private final ArthasBootstrap arthasBootstrap;
+
+  /** Tunnel 注册状态（与本地生命周期解耦，但用于任务成功判定/诊断） */
+  private final AtomicBoolean registered = new AtomicBoolean(false);
 
   /** 启动日志收集器（用于记录启动过程中的关键事件） */
   private final StartupLogCollector startupLogCollector = new StartupLogCollector();
@@ -76,7 +79,9 @@ public final class ArthasLifecycleManager implements Closeable {
   public ArthasLifecycleManager(ArthasConfig config, LifecycleEventListener listener) {
     this.config = config;
     this.listener = listener;
-    this.arthasBootstrap = new ArthasBootstrap(config);
+    // 在构造时尽早尝试获取 Instrumentation（如果 agent 已注入）
+    // 这样即便上层 wiring 漏传，也不会导致 Arthas 永久走 legacy。
+    this.arthasBootstrap = new ArthasBootstrap(config, InstrumentationHolder.get());
   }
 
   /**
@@ -97,8 +102,10 @@ public final class ArthasLifecycleManager implements Closeable {
    * @param instrumentation Instrumentation 实例
    */
   public void setInstrumentation(@Nullable Instrumentation instrumentation) {
-    arthasBootstrap.setInstrumentation(instrumentation);
-    if (instrumentation != null) {
+    // 如果调用方显式传入为空，做一次兜底尝试：可能 agent 尚未完成注入，或存在初始化时序。
+    Instrumentation effective = instrumentation != null ? instrumentation : InstrumentationHolder.get();
+    arthasBootstrap.setInstrumentation(effective);
+    if (effective != null) {
       logger.log(Level.INFO, "Instrumentation set for Arthas lifecycle manager");
       startupLogCollector.addLog("INFO", "Instrumentation configured");
     } else {
@@ -113,11 +120,12 @@ public final class ArthasLifecycleManager implements Closeable {
    * @return 启动结果
    */
   public StartResult tryStart(ScheduledExecutorService scheduler) {
+    // 新一轮启动尝试，先清空上次的注册状态
+    registered.set(false);
+
     // 检查当前状态
     State currentState = state.get();
-    if (currentState == State.RUNNING
-        || currentState == State.REGISTERED
-        || currentState == State.IDLE) {
+    if (currentState == State.RUNNING || currentState == State.IDLE) {
       logger.log(Level.FINE, "Arthas already running, state: {0}", currentState);
       return StartResult.success();
     }
@@ -135,12 +143,9 @@ public final class ArthasLifecycleManager implements Closeable {
     // 尝试切换到启动中状态
     if (!state.compareAndSet(State.STOPPED, State.STARTING)) {
       State after = state.get();
-      logger.log(
-          Level.FINE,
-          "Start attempt lost race, state changed: {0}",
-          after);
-      // 如果已经在运行/注册/空闲，视为成功（幂等）
-      if (after == State.RUNNING || after == State.REGISTERED || after == State.IDLE) {
+      logger.log(Level.FINE, "Start attempt lost race, state changed: {0}", after);
+      // 如果已经在运行/空闲，视为成功（幂等）
+      if (after == State.RUNNING || after == State.IDLE) {
         return StartResult.success();
       }
       return StartResult.failed("State changed during start attempt");
@@ -151,6 +156,10 @@ public final class ArthasLifecycleManager implements Closeable {
     startupLogCollector.addLog("INFO", "Arthas startup initiated");
 
     // 记录 Instrumentation 状态
+    if (arthasBootstrap.getInstrumentation() == null) {
+      // 启动前再做一次兜底获取，避免因初始化时序导致 instrumentation 为空
+      arthasBootstrap.setInstrumentation(InstrumentationHolder.get());
+    }
     if (arthasBootstrap.getInstrumentation() == null) {
       startupLogCollector.addLog(
           "WARN",
@@ -185,7 +194,7 @@ public final class ArthasLifecycleManager implements Closeable {
       // 启动最大运行时长检查任务
       scheduleMaxDurationCheck(scheduler);
 
-      // 切换到运行中状态：只在仍处于 STARTING 时更新，避免覆盖 REGISTERED/IDLE（注册 ACK 可能更早到达）
+      // 切换到运行中状态：只在仍处于 STARTING 时更新，避免覆盖 IDLE
       if (state.compareAndSet(State.STARTING, State.RUNNING)) {
         startupLogCollector.addLog("INFO", "Arthas state changed to RUNNING");
       } else {
@@ -250,6 +259,7 @@ public final class ArthasLifecycleManager implements Closeable {
       // 重置状态
       startedAt = null;
       idleSince = null;
+      registered.set(false);
 
       state.set(State.STOPPED);
 
@@ -270,44 +280,19 @@ public final class ArthasLifecycleManager implements Closeable {
   /**
    * 标记已向服务端注册成功
    *
-   * <p>当 Tunnel 客户端收到 REGISTER_ACK 消息时调用
+   * <p>【阶段性重构】Tunnel 注册状态已与 Arthas 生命周期状态解耦。
+   * 该回调仅用于诊断日志，不再推动本地生命周期状态机。
    */
   public void markRegistered() {
-    while (true) {
-      State currentState = state.get();
-
-      // 终态/已就绪：保持幂等
-      if (currentState == State.REGISTERED || currentState == State.IDLE) {
-        logger.log(Level.FINE, "markRegistered ignored, already in state: {0}", currentState);
-        return;
-      }
-
-      // STOPPING/STOPPED：注册回调已过期或乱序到达，仅记录
-      if (currentState == State.STOPPING || currentState == State.STOPPED) {
-        logger.log(
-            Level.WARNING,
-            "markRegistered received when Arthas is not running (state={0}), ignoring",
-            currentState);
-        startupLogCollector.addLog(
-            "WARN",
-            "REGISTER_ACK received when state=" + currentState + ", ignored");
-        return;
-      }
-
-      // STARTING/RUNNING：尝试切到 REGISTERED
-      if (state.compareAndSet(currentState, State.REGISTERED)) {
-        logger.log(
-            Level.INFO,
-            "Arthas registered with server successfully, state: {0} -> REGISTERED",
-            currentState);
-        startupLogCollector.addLog(
-            "INFO",
-            "Agent registered with server (" + currentState + " -> REGISTERED)");
-        return;
-      }
-
-      // CAS 失败：重试（并发状态变更）
-    }
+    registered.set(true);
+    State currentState = state.get();
+    logger.log(
+        Level.FINE,
+        "markRegistered received (tunnel registered), lifecycle state unchanged: {0}",
+        currentState);
+    startupLogCollector.addLog(
+        "INFO",
+        "Tunnel REGISTER_ACK received, lifecycle state unchanged: " + currentState);
   }
 
   /**
@@ -316,8 +301,10 @@ public final class ArthasLifecycleManager implements Closeable {
    * @return 是否已向服务端注册成功
    */
   public boolean isRegistered() {
+    // Tunnel 注册与本地生命周期解耦：只有本地可用且 tunnel 已完成 REGISTER_ACK，才认为“已注册”。
     State s = state.get();
-    return s == State.REGISTERED || s == State.IDLE;
+    boolean localReady = (s == State.RUNNING || s == State.IDLE);
+    return localReady && registered.get();
   }
 
   /**
@@ -327,8 +314,8 @@ public final class ArthasLifecycleManager implements Closeable {
    */
   public void markIdle(ScheduledExecutorService scheduler) {
     State currentState = state.get();
-    // RUNNING 或 REGISTERED 状态都可以切换到 IDLE
-    if (currentState != State.RUNNING && currentState != State.REGISTERED) {
+    // RUNNING 状态可以切换到 IDLE
+    if (currentState != State.RUNNING) {
       return;
     }
 
@@ -353,8 +340,8 @@ public final class ArthasLifecycleManager implements Closeable {
       // 取消空闲关闭任务
       cancelIdleShutdownTask();
 
-      // 恢复到 REGISTERED 状态（如果之前已注册）
-      state.set(State.REGISTERED);
+      // 恢复到 RUNNING 状态
+      state.set(State.RUNNING);
       idleSince = null;
 
       logger.log(Level.INFO, "Arthas resumed from idle state");
@@ -370,7 +357,7 @@ public final class ArthasLifecycleManager implements Closeable {
   /** 检查 Arthas 是否正在运行 */
   public boolean isRunning() {
     State s = state.get();
-    return s == State.RUNNING || s == State.REGISTERED || s == State.IDLE;
+    return s == State.RUNNING || s == State.IDLE;
   }
 
   /** 获取启动时间 */

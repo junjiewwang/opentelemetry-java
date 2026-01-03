@@ -83,6 +83,13 @@ public final class ArthasSessionManager implements Closeable {
    * @return 创建结果
    */
   public SessionCreateResult tryCreateSession(SessionCreateRequest request) {
+    // 0. Capability gating：由上层（Integration）决定当前是否允许创建
+    String reject = listener.canCreateSession(request);
+    if (reject != null) {
+      logger.log(Level.WARNING, "Session creation rejected by capability check: {0}", reject);
+      return SessionCreateResult.rejected(RejectReason.ARTHAS_NOT_RUNNING, reject);
+    }
+
     // 1. 检查会话数量限制
     if (sessions.size() >= config.getMaxSessionsPerAgent()) {
       logger.log(
@@ -428,6 +435,16 @@ public final class ArthasSessionManager implements Closeable {
 
   /** 会话事件监听器 */
   public interface SessionEventListener {
+    /**
+     * 是否允许创建会话（Capability gating）。
+     *
+     * <p>返回 null 表示允许；返回非空字符串表示拒绝原因。
+     */
+    @Nullable
+    default String canCreateSession(SessionCreateRequest request) {
+      return null;
+    }
+
     /** 会话创建时调用 */
     void onSessionCreated(ArthasSession session);
 

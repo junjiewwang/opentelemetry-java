@@ -143,10 +143,11 @@ public final class ArthasConfig {
     this.authToken = builder.authToken;
 
     if (this.enabled) {
+      String effectiveTunnelEndpoint = getTunnelEndpoint();
       logger.log(
           Level.INFO,
-          "Arthas integration enabled, version: {0}, maxSessions: {1}, tunnelEndpoint: {2}",
-          new Object[] {this.version, this.maxSessionsPerAgent, this.tunnelEndpoint});
+          "Arthas integration enabled, version: {0}, maxSessions: {1}, tunnelEndpoint: {2}, effectiveTunnelEndpoint: {3}",
+          new Object[] {this.version, this.maxSessionsPerAgent, this.tunnelEndpoint, effectiveTunnelEndpoint});
     }
   }
 
@@ -657,11 +658,23 @@ public final class ArthasConfig {
     }
 
     private void validate() {
-      if (enabled && tunnelEndpoint == null && baseOtlpEndpoint == null) {
+      if (!enabled) {
+        return;
+      }
+
+      // 注意：tunnelEndpoint 是“显式配置值”。即使它为 null，只要 baseOtlpEndpoint 可用，
+      // getTunnelEndpoint() 仍可生成默认 tunnel ws 地址。
+      if (tunnelEndpoint == null && baseOtlpEndpoint == null) {
         logger.log(
             Level.WARNING,
             "Arthas is enabled but neither tunnel endpoint nor base OTLP endpoint is configured. "
                 + "Arthas will not be able to connect to server.");
+      } else if (tunnelEndpoint == null) {
+        // 仅提示会基于 OTLP endpoint 推导，避免误导用户以为 tunnel endpoint 一定为 null
+        logger.log(
+            Level.FINE,
+            "Arthas tunnel endpoint not explicitly configured, will derive default from base OTLP endpoint: {0}",
+            baseOtlpEndpoint);
       }
     }
   }

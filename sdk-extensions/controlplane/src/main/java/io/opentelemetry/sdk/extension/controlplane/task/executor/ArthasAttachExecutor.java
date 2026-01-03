@@ -6,12 +6,17 @@
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasBootstrap;
+import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager.StartResult;
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.ArthasTunnelClient;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
+import java.util.Objects;
+import java.util.concurrent.ScheduledFuture;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -53,6 +58,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   /** 检查间隔：500ms */
   private static final long CHECK_INTERVAL_MILLIS = 500;
 
+  /** Tunnel 注册等待的检查间隔（与连接检查共用） */
+  private static final long REGISTER_CHECK_INTERVAL_MILLIS = CHECK_INTERVAL_MILLIS;
+
   /** Arthas 生命周期管理器 */
   @Nullable private final ArthasLifecycleManager lifecycleManager;
 
@@ -62,20 +70,34 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   /** 调度器 */
   @Nullable private final ScheduledExecutorService scheduler;
 
+  /** Arthas 集成（用于订阅 Tunnel REGISTER_ACK 事件，完成任务） */
+  @Nullable private final ArthasIntegration arthasIntegration;
+
   /**
    * 创建 Arthas 附加执行器
    *
    * @param lifecycleManager Arthas 生命周期管理器（可为 null，表示 Arthas 未配置）
    * @param tunnelClient Arthas Tunnel 客户端（可为 null，表示 Tunnel 未配置）
    * @param scheduler 调度器
+   * @param arthasIntegration Arthas 集成（可为 null，表示无法订阅注册事件，将回退到轮询）
    */
   public ArthasAttachExecutor(
       @Nullable ArthasLifecycleManager lifecycleManager,
       @Nullable ArthasTunnelClient tunnelClient,
-      @Nullable ScheduledExecutorService scheduler) {
+      @Nullable ScheduledExecutorService scheduler,
+      @Nullable ArthasIntegration arthasIntegration) {
     this.lifecycleManager = lifecycleManager;
     this.tunnelClient = tunnelClient;
     this.scheduler = scheduler;
+    this.arthasIntegration = arthasIntegration;
+  }
+
+  /** 兼容旧构造签名（不带 ArthasIntegration，将回退到轮询等待 REGISTER_ACK） */
+  public ArthasAttachExecutor(
+      @Nullable ArthasLifecycleManager lifecycleManager,
+      @Nullable ArthasTunnelClient tunnelClient,
+      @Nullable ScheduledExecutorService scheduler) {
+    this(lifecycleManager, tunnelClient, scheduler, null);
   }
 
   @Override
@@ -120,38 +142,169 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         "[ARTHAS-ATTACH] Parameters: action={0}, startTimeout={1}ms, connectTimeout={2}ms",
         new Object[] {action, startTimeout, connectTimeout});
 
-    // 异步执行
+    // 事件驱动：如果 Tunnel REGISTER_ACK 事件触发，则立即上报 SUCCESS 并完成 future。
+    // 否则（无 integration / 无 emitter），仍走现有同步逻辑（含轮询等待）。
+    long startTime = System.currentTimeMillis();
     ArthasLifecycleManager manager = lifecycleManager;
-    @SuppressWarnings("FutureReturnValueIgnored")
-    Object unused = CompletableFuture.runAsync(() -> {
-      long startTime = System.currentTimeMillis();
-      try {
-        TaskExecutionResult result = executeAttach(
-            context, action, startTimeout, connectTimeout, manager);
-        long executionTime = System.currentTimeMillis() - startTime;
+    @Nullable TaskStatusEmitter statusEmitter = context.getStatusEmitter();
 
-        // 更新执行时间
-        if (result.isSuccess()) {
-          future.complete(TaskExecutionResult.success(
-              result.getResultJson(), executionTime));
-        } else {
-          future.complete(TaskExecutionResult.builder()
-              .status(result.getStatus())
-              .errorCode(result.getErrorCode())
-              .errorMessage(result.getErrorMessage())
-              .executionTimeMillis(executionTime)
-              .completedAtMillis(System.currentTimeMillis())
-              .build());
-        }
-      } catch (RuntimeException e) {
-        long executionTime = System.currentTimeMillis() - startTime;
-        logger.log(Level.WARNING, "[ARTHAS-ATTACH] Execution failed: {0}", e.getMessage());
-        future.complete(TaskExecutionResult.failed(
-            "ARTHAS_ATTACH_ERROR",
-            "Arthas attach failed: " + e.getMessage(),
-            executionTime));
+    // 只有在“需要等待注册”且“具备事件源+上报通道”时启用事件模式
+    boolean enableEventMode =
+        statusEmitter != null
+            && arthasIntegration != null
+            && tunnelClient != null;
+
+    if (enableEventMode) {
+      // 在 enableEventMode 为 true 的分支内，保证以下引用为非空，供 NullAway 识别
+      TaskStatusEmitter emitter = Objects.requireNonNull(statusEmitter, "statusEmitter");
+      ArthasIntegration integration = Objects.requireNonNull(arthasIntegration, "arthasIntegration");
+
+      // 已注册则直接成功
+      if (manager.isRegistered()) {
+        TaskExecutionResult immediate = buildSuccessResult("Arthas already registered", manager);
+        future.complete(TaskExecutionResult.success(immediate.getResultJson(), 0));
+        return future;
       }
-    });
+
+      ScheduledExecutorService effectiveScheduler = scheduler != null ? scheduler : context.getScheduler();
+      if (effectiveScheduler == null) {
+        future.complete(TaskExecutionResult.failed("NO_SCHEDULER", "No scheduler available for event-based attach"));
+        return future;
+      }
+
+      // 一次性 listener：REGISTER_ACK 到来即完成
+      ArthasIntegration.StatusEventListener listener =
+          new ArthasIntegration.StatusEventListener() {
+            @Override
+            public void onTunnelConnected() {
+              emitter.running("Tunnel connected, waiting for REGISTER_ACK");
+            }
+
+            @Override
+            public void onTunnelRegistered() {
+              try {
+                // 通过事件完成任务：SUCCESS + resultJson
+                TaskExecutionResult ok = buildSuccessResult("Tunnel registered (REGISTER_ACK)", manager);
+                emitter.success(ok.getResultJson());
+
+                long executionTime = System.currentTimeMillis() - startTime;
+                future.complete(TaskExecutionResult.success(ok.getResultJson(), executionTime));
+              } finally {
+                integration.removeStatusEventListener(this);
+              }
+            }
+
+            @Override
+            public void onTunnelDisconnected(String reason) {
+              // 断开不一定是最终失败（可能会自动重连），这里只做一次 RUNNING 提示
+              emitter.running("Tunnel disconnected: " + reason);
+            }
+          };
+
+      integration.addStatusEventListener(listener);
+
+      // 启动实际 attach 逻辑（启动 Arthas + 触发 tunnel start/connect）。
+      // 该逻辑会很快返回 RUNNING；最终 SUCCESS 由 onTunnelRegistered 事件完成。
+      @SuppressWarnings("FutureReturnValueIgnored")
+      Object unused =
+          CompletableFuture.runAsync(
+              () -> {
+                try {
+                  TaskExecutionResult r =
+                      executeAttach(context, action, startTimeout, connectTimeout, manager, statusEmitter);
+
+                  // 若在启动阶段就失败（例如 Arthas 启动失败、连接失败、认证失败），应立即失败并解绑 listener。
+                  if (r.isFailed() || r.isTimeout() || r.isCancelled()) {
+                    integration.removeStatusEventListener(listener);
+                    long executionTime = System.currentTimeMillis() - startTime;
+                    future.complete(
+                        TaskExecutionResult.builder()
+                            .status(r.getStatus())
+                            .errorCode(r.getErrorCode())
+                            .errorMessage(r.getErrorMessage())
+                            .executionTimeMillis(executionTime)
+                            .completedAtMillis(System.currentTimeMillis())
+                            .build());
+                  } else {
+                    // r 可能是 RUNNING/成功：
+                    // - RUNNING：等待 REGISTER_ACK 事件完成
+                    // - SUCCESS：如果已注册，会在 executeAttach 返回 success，这里直接完成即可
+                    if (r.isSuccess()) {
+                      integration.removeStatusEventListener(listener);
+                      long executionTime = System.currentTimeMillis() - startTime;
+                      future.complete(TaskExecutionResult.success(r.getResultJson(), executionTime));
+                    } else {
+                      emitter.running("Arthas started, waiting for tunnel registration");
+                    }
+                  }
+                } catch (RuntimeException e) {
+                  integration.removeStatusEventListener(listener);
+                  long executionTime = System.currentTimeMillis() - startTime;
+                  future.complete(
+                      TaskExecutionResult.failed(
+                          "ARTHAS_ATTACH_ERROR",
+                          "Arthas attach failed: " + e.getMessage(),
+                          executionTime));
+                }
+              });
+
+      // 超时兜底：如果 REGISTER_ACK 一直不来，按 connectTimeout 触发失败并解绑 listener。
+      // 这里不做轮询，仅使用 scheduler 的一次性定时器。
+      ScheduledFuture<?> timeoutFuture =
+          effectiveScheduler.schedule(
+              () -> {
+                if (!future.isDone()) {
+                  integration.removeStatusEventListener(listener);
+                  long executionTime = System.currentTimeMillis() - startTime;
+                  future.complete(
+                      TaskExecutionResult.timeout(
+                          String.format(Locale.ROOT, "Tunnel registration timeout after %dms", connectTimeout),
+                          executionTime));
+                }
+              },
+              connectTimeout,
+              TimeUnit.MILLISECONDS);
+
+      // 完成时取消 timeout 任务
+      @SuppressWarnings("FutureReturnValueIgnored")
+      Object unused2 = future.whenComplete((r, t) -> timeoutFuture.cancel(false));
+
+      return future;
+    }
+
+    // fallback：保留旧行为
+    @SuppressWarnings("FutureReturnValueIgnored")
+    Object unused =
+        CompletableFuture.runAsync(
+            () -> {
+              long start = System.currentTimeMillis();
+              try {
+                TaskExecutionResult result =
+                    executeAttach(context, action, startTimeout, connectTimeout, manager, statusEmitter);
+                long executionTime = System.currentTimeMillis() - start;
+
+                if (result.isSuccess()) {
+                  future.complete(TaskExecutionResult.success(result.getResultJson(), executionTime));
+                } else {
+                  future.complete(
+                      TaskExecutionResult.builder()
+                          .status(result.getStatus())
+                          .errorCode(result.getErrorCode())
+                          .errorMessage(result.getErrorMessage())
+                          .executionTimeMillis(executionTime)
+                          .completedAtMillis(System.currentTimeMillis())
+                          .build());
+                }
+              } catch (RuntimeException e) {
+                long executionTime = System.currentTimeMillis() - start;
+                logger.log(Level.WARNING, "[ARTHAS-ATTACH] Execution failed: {0}", e.getMessage());
+                future.complete(
+                    TaskExecutionResult.failed(
+                        "ARTHAS_ATTACH_ERROR",
+                        "Arthas attach failed: " + e.getMessage(),
+                        executionTime));
+              }
+            });
 
     return future;
   }
@@ -172,7 +325,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       String action,
       long startTimeout,
       long connectTimeout,
-      ArthasLifecycleManager manager) {
+      ArthasLifecycleManager manager,
+      @Nullable TaskStatusEmitter statusEmitter) {
 
     String taskId = context.getTaskId();
 
@@ -182,13 +336,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         Level.INFO,
         "[ARTHAS-ATTACH] Current Arthas state: {0}, taskId={1}",
         new Object[] {currentState, taskId});
-
-    // 如果已经注册成功，直接返回成功
-    if (currentState == ArthasLifecycleManager.State.REGISTERED) {
-      logger.log(Level.INFO, 
-          "[ARTHAS-ATTACH] Arthas already registered with server, taskId={0}", taskId);
-      return buildSuccessResult("Arthas already running and registered", manager);
-    }
 
     // 如果已经运行或空闲，直接返回成功
     if (currentState == ArthasLifecycleManager.State.RUNNING
@@ -239,7 +386,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // Step 4: 连接 Tunnel（如果配置了）
     if (tunnelClient != null) {
       logger.log(Level.INFO, "[ARTHAS-ATTACH] Connecting to tunnel server..., taskId={0}", taskId);
-      TaskExecutionResult connectResult = connectToTunnel(connectTimeout);
+      TaskExecutionResult connectResult = connectToTunnel(connectTimeout, manager, statusEmitter);
       if (!connectResult.isSuccess()) {
         return connectResult;
       }
@@ -247,16 +394,26 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       logger.log(Level.INFO, "[ARTHAS-ATTACH] Tunnel client not configured, skipping, taskId={0}", taskId);
     }
 
-    // Step 5: 返回成功
+    // Step 5:
+    // - 如果有事件发射器：此时通常还需要等待 REGISTER_ACK 才能认为真正成功，因此先返回 RUNNING。
+    // - 否则：维持旧行为（阻塞等待注册完成）。
+    if (statusEmitter != null && !manager.isRegistered()) {
+      statusEmitter.running("Tunnel connected, waiting for REGISTER_ACK");
+      return TaskExecutionResult.builder()
+          .status(io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus.RUNNING)
+          .resultJson("{\"status\":\"running\",\"message\":\"Waiting for tunnel registration\"}")
+          .build();
+    }
+
     logger.log(Level.INFO, "[ARTHAS-ATTACH] Arthas attach completed successfully, taskId={0}", taskId);
-    return buildSuccessResult("Arthas started and connected successfully", manager);
+    return buildSuccessResult("Arthas started and registered successfully", manager);
   }
 
   /**
-   * 等待 Arthas 运行并注册
+   * 等待 Arthas 本地运行就绪
    *
-   * <p>在超时时间内等待 Arthas 达到 REGISTERED 状态，
-   * 表示已向服务端注册成功，任务可以完成。
+   * <p>【阶段性重构】Tunnel 注册状态已与 Arthas 生命周期解耦。
+   * 该等待仅关注 Arthas 本地状态达到 RUNNING/IDLE。
    */
   private static TaskExecutionResult waitForArthasRunning(
       long timeoutMillis, ArthasLifecycleManager manager) {
@@ -266,20 +423,13 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     while (System.currentTimeMillis() < deadline) {
       ArthasLifecycleManager.State state = manager.getState();
       
-      // REGISTERED 状态表示已向服务端注册成功，任务完成
-      if (state == ArthasLifecycleManager.State.REGISTERED) {
+      if (state == ArthasLifecycleManager.State.RUNNING
+          || state == ArthasLifecycleManager.State.IDLE) {
         long elapsed = System.currentTimeMillis() - startTime;
-        logger.log(Level.INFO, 
-            "[ARTHAS-ATTACH] Arthas registered successfully after {0}ms", elapsed);
+        logger.log(Level.INFO, "[ARTHAS-ATTACH] Arthas is running after {0}ms", elapsed);
         return TaskExecutionResult.success();
       }
       
-      // IDLE 状态也表示已注册（之前注册过，现在空闲）
-      if (state == ArthasLifecycleManager.State.IDLE) {
-        return TaskExecutionResult.success();
-      }
-      
-      // RUNNING 状态表示本地启动成功，但还未注册，继续等待
       // STARTING 状态表示正在启动，继续等待
       
       if (state == ArthasLifecycleManager.State.STOPPED) {
@@ -381,9 +531,12 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   }
 
   /**
-   * 连接到 Tunnel Server
+   * 连接到 Tunnel Server，并等待 REGISTER_ACK（如果调用方需要认为 attach 真正完成）
    */
-  private TaskExecutionResult connectToTunnel(long timeoutMillis) {
+  private TaskExecutionResult connectToTunnel(
+      long timeoutMillis,
+      ArthasLifecycleManager manager,
+      @Nullable TaskStatusEmitter statusEmitter) {
     if (tunnelClient == null) {
       return TaskExecutionResult.success();
     }
@@ -391,7 +544,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // 检查是否已连接
     if (tunnelClient.isConnected()) {
       logger.log(Level.INFO, "[ARTHAS-ATTACH] Already connected to tunnel server");
-      return TaskExecutionResult.success();
+      // 有事件发射器时不阻塞，交给 onAgentRegistered 事件完成
+      return statusEmitter != null ? TaskExecutionResult.success() : waitForTunnelRegistered(timeoutMillis, manager);
     }
 
     // 获取调度器
@@ -418,7 +572,11 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     while (System.currentTimeMillis() < deadline) {
       if (tunnelClient.isConnected()) {
         logger.log(Level.INFO, "[ARTHAS-ATTACH] Successfully connected to tunnel server");
-        return TaskExecutionResult.success();
+        // 连接成功后：有事件发射器则不阻塞；否则继续等待 REGISTER_ACK
+        long remaining = deadline - System.currentTimeMillis();
+        return statusEmitter != null
+            ? TaskExecutionResult.success()
+            : waitForTunnelRegistered(Math.max(0, remaining), manager);
       }
 
       // 检查是否有连接错误（提前失败，不用等到超时）
@@ -467,6 +625,39 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   }
 
   /**
+   * 等待 Tunnel 注册成功（REGISTER_ACK）。
+   *
+   * <p>说明：注册 ACK 事件会通过 {@link io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration#onAgentRegistered()}
+   * 触发，并调用 {@link ArthasLifecycleManager#markRegistered()}。
+   */
+  private static TaskExecutionResult waitForTunnelRegistered(
+      long timeoutMillis, ArthasLifecycleManager manager) {
+    if (timeoutMillis <= 0) {
+      return TaskExecutionResult.timeout("Tunnel registration timeout");
+    }
+
+    long deadline = System.currentTimeMillis() + timeoutMillis;
+    while (System.currentTimeMillis() < deadline) {
+      if (manager.isRegistered()) {
+        logger.log(Level.INFO, "[ARTHAS-ATTACH] Tunnel registered (REGISTER_ACK received)");
+        return TaskExecutionResult.success();
+      }
+
+      try {
+        Thread.sleep(REGISTER_CHECK_INTERVAL_MILLIS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return TaskExecutionResult.failed("INTERRUPTED", "Interrupted while waiting for tunnel registration");
+      }
+    }
+
+    return TaskExecutionResult.timeout(String.format(
+        Locale.ROOT,
+        "Tunnel registration timeout after %dms",
+        timeoutMillis));
+  }
+
+  /**
    * 构建成功结果
    */
   private TaskExecutionResult buildSuccessResult(
@@ -474,10 +665,11 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // 构建结果 JSON
     String resultJson = String.format(
         Locale.ROOT,
-        "{\"status\":\"success\",\"message\":\"%s\",\"arthas_state\":\"%s\",\"tunnel_connected\":%s}",
+        "{\"status\":\"success\",\"message\":\"%s\",\"arthas_state\":\"%s\",\"tunnel_connected\":%s,\"tunnel_registered\":%s}",
         message,
         manager.getState(),
-        tunnelClient != null && tunnelClient.isConnected());
+        tunnelClient != null && tunnelClient.isConnected(),
+        manager.isRegistered());
 
     return TaskExecutionResult.success(resultJson);
   }

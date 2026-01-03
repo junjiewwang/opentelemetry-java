@@ -79,6 +79,14 @@ public final class InstrumentationHolder {
       return inst;
     }
 
+    // 兜底：尝试从 javaagent bootstrap 的 InstrumentationHolder 读取。
+    // 该类在 agent 启动早期就会被设置，并位于 BootstrapClassLoader 可见范围。
+    inst = tryGetFromJavaagentBootstrap();
+    if (inst != null) {
+      set(inst);
+      return inst;
+    }
+
     // 尝试自动获取（只尝试一次）
     if (AUTO_OBTAIN_ATTEMPTED.compareAndSet(false, true)) {
       inst = tryObtainInstrumentation();
@@ -89,6 +97,23 @@ public final class InstrumentationHolder {
     }
 
     return INSTANCE.get();
+  }
+
+  @Nullable
+  private static Instrumentation tryGetFromJavaagentBootstrap() {
+    try {
+      // 使用 BootstrapClassLoader（null）加载，避免被应用/agent classloader 隔离影响。
+      Class<?> holder = Class.forName("io.opentelemetry.javaagent.bootstrap.InstrumentationHolder", false, null);
+      Method getter = holder.getMethod("getInstrumentation");
+      Object value = getter.invoke(null);
+      if (value instanceof Instrumentation) {
+        return (Instrumentation) value;
+      }
+    } catch (Throwable t) {
+      // 静默失败：该兜底在非 javaagent 环境下必然失败。
+      logger.log(Level.FINE, "javaagent bootstrap InstrumentationHolder not available: {0}", t.toString());
+    }
+    return null;
   }
 
   /**

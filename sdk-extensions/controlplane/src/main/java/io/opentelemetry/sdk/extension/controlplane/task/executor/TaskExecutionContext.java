@@ -6,6 +6,7 @@
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Locale;
@@ -41,6 +42,7 @@ public final class TaskExecutionContext {
   // 依赖组件
   @Nullable private final ControlPlaneClient client;
   @Nullable private final ScheduledExecutorService scheduler;
+  @Nullable private final TaskStatusEmitter statusEmitter;
 
   // 执行跟踪
   private final long receivedAtMillis;
@@ -57,6 +59,7 @@ public final class TaskExecutionContext {
     this.parametersJson = builder.parametersJson;
     this.client = builder.client;
     this.scheduler = builder.scheduler;
+    this.statusEmitter = builder.statusEmitter;
     this.receivedAtMillis = builder.receivedAtMillis;
   }
 
@@ -106,6 +109,17 @@ public final class TaskExecutionContext {
   @Nullable
   public ScheduledExecutorService getScheduler() {
     return scheduler;
+  }
+
+  /**
+   * 任务状态/进度事件发射器（可选）。
+   *
+   * <p>用于执行器在关键事件发生时“实时”上报（例如：RUNNING、阶段进度、READY 等），
+   * 避免通过定时轮询或 sleep 检查状态。
+   */
+  @Nullable
+  public TaskStatusEmitter getStatusEmitter() {
+    return statusEmitter;
   }
 
   public long getReceivedAtMillis() {
@@ -240,6 +254,7 @@ public final class TaskExecutionContext {
     private String parametersJson = "{}";
     @Nullable private ControlPlaneClient client;
     @Nullable private ScheduledExecutorService scheduler;
+    @Nullable private TaskStatusEmitter statusEmitter;
     private long receivedAtMillis = System.currentTimeMillis();
 
     public Builder taskId(String taskId) {
@@ -294,6 +309,11 @@ public final class TaskExecutionContext {
 
     public Builder scheduler(@Nullable ScheduledExecutorService scheduler) {
       this.scheduler = scheduler;
+      return this;
+    }
+
+    public Builder statusEmitter(@Nullable TaskStatusEmitter statusEmitter) {
+      this.statusEmitter = statusEmitter;
       return this;
     }
 
