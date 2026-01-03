@@ -70,6 +70,9 @@ public final class ArthasLifecycleManager implements Closeable {
   @Nullable private ScheduledFuture<?> idleShutdownTask;
   @Nullable private ScheduledFuture<?> maxDurationTask;
 
+  // 可选：用于统一事件总线发布状态（避免由上层重复 publish STARTING/STOPPING）
+  @Nullable private ArthasStateEventBus stateEventBus;
+
   /**
    * 创建生命周期管理器
    *
@@ -114,6 +117,15 @@ public final class ArthasLifecycleManager implements Closeable {
   }
 
   /**
+   * 设置统一状态事件总线。
+   *
+   * <p>生命周期管理器是状态变更的唯一权威来源之一，因此在这里发布状态事件可以避免时序分散在上层。
+   */
+  public void setStateEventBus(@Nullable ArthasStateEventBus stateEventBus) {
+    this.stateEventBus = stateEventBus;
+  }
+
+  /**
    * 尝试启动 Arthas
    *
    * @param scheduler 调度器（用于定时任务）
@@ -149,6 +161,11 @@ public final class ArthasLifecycleManager implements Closeable {
         return StartResult.success();
       }
       return StartResult.failed("State changed during start attempt");
+    }
+
+    ArthasStateEventBus bus = this.stateEventBus;
+    if (bus != null) {
+      bus.publishArthasState(State.STARTING);
     }
 
     logger.log(Level.INFO, "Starting Arthas...");
@@ -197,6 +214,9 @@ public final class ArthasLifecycleManager implements Closeable {
       // 切换到运行中状态：只在仍处于 STARTING 时更新，避免覆盖 IDLE
       if (state.compareAndSet(State.STARTING, State.RUNNING)) {
         startupLogCollector.addLog("INFO", "Arthas state changed to RUNNING");
+        if (bus != null) {
+          bus.publishArthasState(State.RUNNING);
+        }
       } else {
         State finalState = state.get();
         logger.log(
@@ -206,6 +226,11 @@ public final class ArthasLifecycleManager implements Closeable {
         startupLogCollector.addLog(
             "INFO",
             "Skip setting RUNNING because state already changed to " + finalState);
+
+        // 即使没有 CAS 到 RUNNING，也同步发布最终状态，确保订阅方一致
+        if (bus != null) {
+          bus.publishArthasState(finalState != null ? finalState : State.STOPPED);
+        }
       }
 
       logger.log(Level.INFO, "Arthas started successfully");
@@ -218,6 +243,9 @@ public final class ArthasLifecycleManager implements Closeable {
     } catch (RuntimeException e) {
       logger.log(Level.SEVERE, "Failed to start Arthas", e);
       state.set(State.STOPPED);
+      if (bus != null) {
+        bus.publishArthasState(State.STOPPED);
+      }
       startupLogCollector.addLog("ERROR", "Exception during startup: " + e.getMessage());
       return StartResult.failed(
           "Failed to start Arthas: " + e.getMessage(), startupLogCollector.getLogs());
@@ -247,6 +275,11 @@ public final class ArthasLifecycleManager implements Closeable {
       return false;
     }
 
+    ArthasStateEventBus bus = this.stateEventBus;
+    if (bus != null) {
+      bus.publishArthasState(State.STOPPING);
+    }
+
     logger.log(Level.INFO, "Stopping Arthas...");
 
     try {
@@ -263,6 +296,10 @@ public final class ArthasLifecycleManager implements Closeable {
 
       state.set(State.STOPPED);
 
+      if (bus != null) {
+        bus.publishArthasState(State.STOPPED);
+      }
+
       logger.log(Level.INFO, "Arthas stopped successfully");
 
       // 通知监听器
@@ -273,6 +310,9 @@ public final class ArthasLifecycleManager implements Closeable {
     } catch (RuntimeException e) {
       logger.log(Level.SEVERE, "Error stopping Arthas", e);
       state.set(State.STOPPED);
+      if (bus != null) {
+        bus.publishArthasState(State.STOPPED);
+      }
       return false;
     }
   }
@@ -322,6 +362,11 @@ public final class ArthasLifecycleManager implements Closeable {
     state.set(State.IDLE);
     idleSince = Instant.now();
 
+    ArthasStateEventBus bus = this.stateEventBus;
+    if (bus != null) {
+      bus.publishArthasState(State.IDLE);
+    }
+
     logger.log(
         Level.INFO,
         "Arthas entered idle state, will shutdown after {0}",
@@ -343,6 +388,11 @@ public final class ArthasLifecycleManager implements Closeable {
       // 恢复到 RUNNING 状态
       state.set(State.RUNNING);
       idleSince = null;
+
+      ArthasStateEventBus bus = this.stateEventBus;
+      if (bus != null) {
+        bus.publishArthasState(State.RUNNING);
+      }
 
       logger.log(Level.INFO, "Arthas resumed from idle state");
     }

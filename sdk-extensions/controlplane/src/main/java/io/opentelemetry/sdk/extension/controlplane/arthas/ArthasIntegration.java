@@ -15,8 +15,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.List;
 import javax.annotation.Nullable;
 
 /**
@@ -48,49 +46,6 @@ public final class ArthasIntegration
 
   @Nullable private ScheduledExecutorService scheduler;
 
-  /** 统一状态事件监听器（轻量事件总线）：供 TaskDispatcher 等外部组件订阅 Arthas/Tunnel 状态变化 */
-  private final ReplayableListeners<StatusEventListener> statusEventListeners =
-      new ReplayableListeners<>(new CopyOnWriteArrayList<>());
-
-  public interface StatusEventListener {
-    void onTunnelConnected();
-
-    void onTunnelRegistered();
-
-    void onTunnelDisconnected(String reason);
-  }
-
-  public void addStatusEventListener(StatusEventListener listener) {
-    // 向后兼容：旧接口仍保留，但底层完全由 stateEventBus 提供无竞态订阅能力。
-    // 这里仍保留一份列表，仅用于 removeStatusEventListener 的语义和避免 breaking change。
-    statusEventListeners.add(listener);
-
-    stateEventBus.subscribe(
-        (event, state, detail) -> {
-          if (!statusEventListeners.snapshot().contains(listener)) {
-            return;
-          }
-          switch (event) {
-            case TUNNEL_CONNECTED:
-              listener.onTunnelConnected();
-              break;
-            case TUNNEL_REGISTERED:
-              listener.onTunnelRegistered();
-              break;
-            case TUNNEL_DISCONNECTED:
-              listener.onTunnelDisconnected(detail != null ? detail : "unknown");
-              break;
-            default:
-              break;
-          }
-        },
-        /* replay= */ true);
-  }
-
-  public void removeStatusEventListener(StatusEventListener listener) {
-    statusEventListeners.remove(listener);
-  }
-
   /** 供外部使用：基于 predicate 等待状态达成（事件驱动，非阻塞/非轮询） */
   public java.util.concurrent.CompletableFuture<ArthasStateEventBus.State> awaitState(
       java.util.function.Predicate<ArthasStateEventBus.State> predicate,
@@ -98,37 +53,11 @@ public final class ArthasIntegration
     return stateEventBus.await(predicate, timeout);
   }
 
-  /**
-   * 小型工具类：监听器容器 + 订阅时无竞态回放。
-   *
-   * <p>目的：把“订阅后立即回放当前状态”的逻辑集中起来，避免散落在各处。
-   */
-  private static final class ReplayableListeners<T> {
-    private final List<T> listeners;
-
-    private ReplayableListeners(List<T> listeners) {
-      this.listeners = listeners;
-    }
-
-    void add(T listener) {
-      listeners.add(listener);
-    }
-
-    void remove(T listener) {
-      listeners.remove(listener);
-    }
-
-    List<T> snapshot() {
-      return listeners;
-    }
-
-
-  }
-
   private ArthasIntegration(ArthasConfig config) {
     this.config = config;
     this.environment = ArthasEnvironmentDetector.detect();
     this.lifecycleManager = new ArthasLifecycleManager(config, this);
+    this.lifecycleManager.setStateEventBus(stateEventBus);
     this.sessionManager = new ArthasSessionManager(config, this);
     this.tunnelClient = new ArthasTunnelClient(config, this);
     this.terminalBridge = new ArthasTerminalBridge(config, this);
@@ -431,9 +360,6 @@ public final class ArthasIntegration
     logger.log(Level.INFO, "Tunnel connected");
     tunnelRegistered.set(false);
     stateEventBus.publishTunnelConnected();
-    for (StatusEventListener l : statusEventListeners.snapshot()) {
-      l.onTunnelConnected();
-    }
     // 发送当前状态
     tunnelClient.sendArthasStatus();
   }
@@ -444,10 +370,6 @@ public final class ArthasIntegration
     tunnelRegistered.set(true);
 
     stateEventBus.publishTunnelRegistered();
-
-    for (StatusEventListener l : statusEventListeners.snapshot()) {
-      l.onTunnelRegistered();
-    }
 
     // 【阶段性重构】不再驱动 lifecycle 状态机，仅用于诊断日志
     lifecycleManager.markRegistered();
@@ -461,9 +383,6 @@ public final class ArthasIntegration
     logger.log(Level.WARNING, "Tunnel disconnected: {0}", reason);
     tunnelRegistered.set(false);
     stateEventBus.publishTunnelDisconnected(reason);
-    for (StatusEventListener l : statusEventListeners.snapshot()) {
-      l.onTunnelDisconnected(reason);
-    }
   }
 
   @Override
@@ -480,7 +399,6 @@ public final class ArthasIntegration
   public void onArthasStartRequested() {
     logger.log(Level.INFO, "Arthas start requested via tunnel");
     if (scheduler != null) {
-      stateEventBus.publishArthasState(ArthasLifecycleManager.State.STARTING);
       ArthasLifecycleManager.StartResult result = lifecycleManager.tryStart(scheduler);
       if (!result.isSuccess()) {
         String errorMsg = result.getErrorMessage() != null ? result.getErrorMessage() : "Unknown error";
@@ -493,7 +411,6 @@ public final class ArthasIntegration
   @Override
   public void onArthasStopRequested(@Nullable String reason) {
     logger.log(Level.INFO, "Arthas stop requested via tunnel, reason: {0}", reason);
-    stateEventBus.publishArthasState(ArthasLifecycleManager.State.STOPPING);
     lifecycleManager.stop();
   }
 

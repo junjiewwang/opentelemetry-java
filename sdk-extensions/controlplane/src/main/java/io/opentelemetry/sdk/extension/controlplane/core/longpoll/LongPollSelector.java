@@ -355,27 +355,50 @@ public final class LongPollSelector {
   public int select(long timeoutMillis) throws InterruptedException {
     long deadline = System.currentTimeMillis() + timeoutMillis;
 
+    // 先快速处理一次，避免已经完成还要进入 await
+    int first = selectNow();
+    if (first > 0) {
+      return first;
+    }
+
     while (System.currentTimeMillis() < deadline) {
+      if (isAllProcessed() || !shouldAnyContinue()) {
+        return 0;
+      }
+
+      long remaining = deadline - System.currentTimeMillis();
+      if (remaining <= 0) {
+        return 0;
+      }
+
+      List<CompletableFuture<?>> pendingFutures = new ArrayList<>();
+      for (PollChannel<?> channel : channels.values()) {
+        if (!channel.isProcessed()) {
+          pendingFutures.add(channel.future);
+        }
+      }
+
+      if (pendingFutures.isEmpty()) {
+        return 0;
+      }
+
+      try {
+        @SuppressWarnings("rawtypes")
+        CompletableFuture[] futureArray = pendingFutures.toArray(new CompletableFuture[0]);
+        CompletableFuture.anyOf(futureArray).get(remaining, TimeUnit.MILLISECONDS);
+      } catch (java.util.concurrent.TimeoutException e) {
+        return 0;
+      } catch (java.util.concurrent.ExecutionException e) {
+        // ignore: 某个 future 异常完成，后续 selectNow 会通过 handler.handleError 处理
+      }
+
       int readyCount = selectNow();
       if (readyCount > 0) {
         return readyCount;
       }
-
-      // 检查是否所有通道都已处理
-      if (isAllProcessed()) {
-        return 0;
-      }
-
-      // 检查是否所有 Handler 都不再继续
-      if (!shouldAnyContinue()) {
-        return 0;
-      }
-
-      // 短暂休眠，避免 CPU 空转
-      Thread.sleep(10);
     }
 
-    return 0; // 超时
+    return 0;
   }
 
   /**

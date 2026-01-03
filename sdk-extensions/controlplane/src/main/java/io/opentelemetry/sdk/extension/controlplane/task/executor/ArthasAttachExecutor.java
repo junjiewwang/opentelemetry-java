@@ -12,11 +12,9 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager
 import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.ArthasTunnelClient;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import java.util.Objects;
-import java.util.concurrent.ScheduledFuture;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -172,36 +170,38 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         return future;
       }
 
-      // 一次性 listener：REGISTER_ACK 到来即完成
-      ArthasIntegration.StatusEventListener listener =
-          new ArthasIntegration.StatusEventListener() {
-            @Override
-            public void onTunnelConnected() {
-              emitter.running("Tunnel connected, waiting for REGISTER_ACK");
-            }
+      // 事件驱动：直接等待 state predicate（REGISTER_ACK 对应 tunnelRegistered=true）
+      CompletableFuture<io.opentelemetry.sdk.extension.controlplane.arthas.ArthasStateEventBus.State>
+          registeredFuture =
+              integration.awaitState(
+                  s -> s.isTunnelRegistered(),
+                  java.time.Duration.ofMillis(connectTimeout));
 
-            @Override
-            public void onTunnelRegistered() {
-              try {
-                // 通过事件完成任务：SUCCESS + resultJson
-                TaskExecutionResult ok = buildSuccessResult("Tunnel registered (REGISTER_ACK)", manager);
-                emitter.success(ok.getResultJson());
-
-                long executionTime = System.currentTimeMillis() - startTime;
-                future.complete(TaskExecutionResult.success(ok.getResultJson(), executionTime));
-              } finally {
-                integration.removeStatusEventListener(this);
-              }
-            }
-
-            @Override
-            public void onTunnelDisconnected(String reason) {
-              // 断开不一定是最终失败（可能会自动重连），这里只做一次 RUNNING 提示
-              emitter.running("Tunnel disconnected: " + reason);
-            }
-          };
-
-      integration.addStatusEventListener(listener);
+      @SuppressWarnings("FutureReturnValueIgnored")
+      Object unusedRegistered =
+          registeredFuture
+              .thenAccept(
+                  s -> {
+                    // 通过事件完成任务：SUCCESS + resultJson
+                    TaskExecutionResult ok = buildSuccessResult("Tunnel registered (REGISTER_ACK)", manager);
+                    emitter.success(ok.getResultJson());
+                    long executionTime = System.currentTimeMillis() - startTime;
+                    future.complete(TaskExecutionResult.success(ok.getResultJson(), executionTime));
+                  })
+              .exceptionally(
+                  e -> {
+                    if (!future.isDone()) {
+                      long executionTime = System.currentTimeMillis() - startTime;
+                      future.complete(
+                          TaskExecutionResult.timeout(
+                              String.format(
+                                  Locale.ROOT,
+                                  "Tunnel registration timeout after %dms",
+                                  connectTimeout),
+                              executionTime));
+                    }
+                    return null;
+                  });
 
       // 启动实际 attach 逻辑（启动 Arthas + 触发 tunnel start/connect）。
       // 该逻辑会很快返回 RUNNING；最终 SUCCESS 由 onTunnelRegistered 事件完成。
@@ -215,7 +215,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
 
                   // 若在启动阶段就失败（例如 Arthas 启动失败、连接失败、认证失败），应立即失败并解绑 listener。
                   if (r.isFailed() || r.isTimeout() || r.isCancelled()) {
-                    integration.removeStatusEventListener(listener);
                     long executionTime = System.currentTimeMillis() - startTime;
                     future.complete(
                         TaskExecutionResult.builder()
@@ -230,7 +229,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                     // - RUNNING：等待 REGISTER_ACK 事件完成
                     // - SUCCESS：如果已注册，会在 executeAttach 返回 success，这里直接完成即可
                     if (r.isSuccess()) {
-                      integration.removeStatusEventListener(listener);
                       long executionTime = System.currentTimeMillis() - startTime;
                       future.complete(TaskExecutionResult.success(r.getResultJson(), executionTime));
                     } else {
@@ -238,7 +236,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                     }
                   }
                 } catch (RuntimeException e) {
-                  integration.removeStatusEventListener(listener);
                   long executionTime = System.currentTimeMillis() - startTime;
                   future.complete(
                       TaskExecutionResult.failed(
@@ -247,27 +244,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                           executionTime));
                 }
               });
-
-      // 超时兜底：如果 REGISTER_ACK 一直不来，按 connectTimeout 触发失败并解绑 listener。
-      // 这里不做轮询，仅使用 scheduler 的一次性定时器。
-      ScheduledFuture<?> timeoutFuture =
-          effectiveScheduler.schedule(
-              () -> {
-                if (!future.isDone()) {
-                  integration.removeStatusEventListener(listener);
-                  long executionTime = System.currentTimeMillis() - startTime;
-                  future.complete(
-                      TaskExecutionResult.timeout(
-                          String.format(Locale.ROOT, "Tunnel registration timeout after %dms", connectTimeout),
-                          executionTime));
-                }
-              },
-              connectTimeout,
-              TimeUnit.MILLISECONDS);
-
-      // 完成时取消 timeout 任务
-      @SuppressWarnings("FutureReturnValueIgnored")
-      Object unused2 = future.whenComplete((r, t) -> timeoutFuture.cancel(false));
 
       return future;
     }
