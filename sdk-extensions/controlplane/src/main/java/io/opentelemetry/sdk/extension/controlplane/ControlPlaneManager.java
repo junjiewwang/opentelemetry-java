@@ -297,10 +297,8 @@ public final class ControlPlaneManager implements Closeable {
     // 注册 Arthas 附加执行器
     if (arthasIntegration != null) {
       ArthasAttachExecutor arthasExecutor = new ArthasAttachExecutor(
-          arthasIntegration.getLifecycleManager(),
-          arthasIntegration.getTunnelClient(),
-          taskManager.getScheduler(),
-          arthasIntegration);
+          arthasIntegration,
+          taskManager.getScheduler());
       taskDispatcher.registerExecutor(arthasExecutor);
       logger.log(Level.INFO, "Registered ArthasAttachExecutor for arthas_attach tasks");
     } else {

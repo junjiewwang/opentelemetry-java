@@ -406,10 +406,17 @@ public final class TaskDispatcher implements Closeable {
       } else {
         finalResult = result;
         if (result.isSuccess()) {
-          logger.log(
-              Level.INFO,
-              "[TASK-SUCCESS] Task completed successfully: taskId={0}, executionTime={1}ms",
-              new Object[] {taskId, executionTime});
+          if (result.getStatus() == TaskStatus.RUNNING) {
+            logger.log(
+                Level.INFO,
+                "[TASK-RUNNING] Task reported running: taskId={0}, executionTime={1}ms",
+                new Object[] {taskId, executionTime});
+          } else {
+            logger.log(
+                Level.INFO,
+                "[TASK-SUCCESS] Task completed successfully: taskId={0}, executionTime={1}ms",
+                new Object[] {taskId, executionTime});
+          }
         } else {
           logger.log(
               Level.WARNING,
@@ -419,16 +426,16 @@ public final class TaskDispatcher implements Closeable {
       }
 
       // 上报结果到服务端
-      reportResult(taskId, finalResult);
-
-      // 记录终态（用于后续事件幂等）
-      reportedTerminalStatus
-          .computeIfAbsent(taskId, k -> new AtomicReference<>())
-          .set(finalResult.getStatus());
+      // 说明：RUNNING 不是终态，终态应由执行器通过 TaskStatusEmitter 上报。
+      if (finalResult.getStatus() != TaskStatus.RUNNING) {
+        reportResult(taskId, finalResult);
+      }
 
       // 记录任务完成日志
       if (finalResult.isSuccess()) {
-        taskLogger.logTaskCompleted(taskId, finalResult.getResultJson());
+        if (finalResult.getStatus() != TaskStatus.RUNNING) {
+          taskLogger.logTaskCompleted(taskId, finalResult.getResultJson());
+        }
       } else {
         String errorCode = finalResult.getErrorCode();
         String errorMessage = finalResult.getErrorMessage();

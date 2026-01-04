@@ -6,15 +6,15 @@
 /**
  * Arthas Tunnel 通信模块
  *
- * <p>提供与 Tunnel Server 的 WebSocket 通信能力，包括：
+ * <p>【模式2架构】由 Arthas 内部 TunnelClient(Netty) 负责 tunnel 连接，
+ * 此包现仅保留协议消息定义。
  *
+ * <p>主要组件：
  * <ul>
- *   <li>WebSocket 连接管理
- *   <li>消息协议定义
- *   <li>自动重连机制
+ *   <li>{@link io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.TunnelMessage} - 消息协议定义</li>
  * </ul>
  *
- * @see io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.ArthasTunnelClient
+ * @see io.opentelemetry.sdk.extension.controlplane.arthas.ArthasTunnelStatusBridge
  */
 @javax.annotation.ParametersAreNonnullByDefault
 package io.opentelemetry.sdk.extension.controlplane.arthas.tunnel;

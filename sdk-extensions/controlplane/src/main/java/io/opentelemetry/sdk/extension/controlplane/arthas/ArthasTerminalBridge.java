@@ -213,6 +213,18 @@ public final class ArthasTerminalBridge implements Closeable {
     return sessionTerminals.size();
   }
 
+  /**
+   * 关闭所有终端
+   *
+   * <p>用于 Arthas 停止时批量关闭所有会话终端。
+   */
+  public void closeAllTerminals() {
+    for (String sessionId : sessionTerminals.keySet()) {
+      destroySessionTerminal(sessionId);
+    }
+    logger.log(Level.INFO, "All terminals closed");
+  }
+
   @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {

@@ -5,44 +5,53 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
-import io.opentelemetry.sdk.extension.controlplane.arthas.tunnel.ArthasTunnelClient;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.Nullable;
 
 /**
  * Arthas 集成入口
  *
- * <p>协调 Arthas 生命周期管理、会话管理、Tunnel 连接、终端桥接等组件。
+ * <p>协调 Arthas 生命周期管理、终端桥接等组件。
+ *
+ * <p>【模式2架构】由 Arthas 内部 TunnelClient(Netty) 负责 tunnel 连接：
+ * <ul>
+ *   <li>终端会话完全走官方 forward 通道，OTel 侧不再实现 TERMINAL_OPEN 协议</li>
+ *   <li>通过 {@link ArthasTunnelStatusBridge} 观察 Arthas 内部 tunnel 状态</li>
+ *   <li>保留 OTel 特有的任务状态上报、就绪判定、诊断日志等功能</li>
+ * </ul>
  */
 public final class ArthasIntegration
     implements Closeable,
         ArthasLifecycleManager.LifecycleEventListener,
-        ArthasSessionManager.SessionEventListener,
-        ArthasTunnelClient.TunnelEventListener,
-        ArthasTerminalBridge.OutputHandler {
+        ArthasTerminalBridge.OutputHandler,
+        ArthasTunnelStatusBridge.TunnelStatusListener {
 
   private static final Logger logger = Logger.getLogger(ArthasIntegration.class.getName());
 
   private final ArthasConfig config;
   private final ArthasLifecycleManager lifecycleManager;
-  private final ArthasSessionManager sessionManager;
-  private final ArthasTunnelClient tunnelClient;
   private final ArthasTerminalBridge terminalBridge;
   private final ArthasEnvironmentDetector.Environment environment;
+
+  /** 【模式2核心】Tunnel 状态桥接器，从 Arthas 内部获取 tunnel 状态 */
+  private final ArthasTunnelStatusBridge tunnelStatusBridge;
 
   /** Tunnel 注册状态（与 Arthas 生命周期解耦） */
   private final AtomicBoolean tunnelRegistered = new AtomicBoolean(false);
 
   /** 统一状态事件总线：集中 publish/subscribe/await */
   private final ArthasStateEventBus stateEventBus = new ArthasStateEventBus();
+
+  /** 就绪门闩：集中判定/等待 Terminal 可交互能力 */
+  private final ArthasReadinessGate readinessGate;
 
   @Nullable private ScheduledExecutorService scheduler;
 
@@ -58,12 +67,16 @@ public final class ArthasIntegration
     this.environment = ArthasEnvironmentDetector.detect();
     this.lifecycleManager = new ArthasLifecycleManager(config, this);
     this.lifecycleManager.setStateEventBus(stateEventBus);
-    this.sessionManager = new ArthasSessionManager(config, this);
-    this.tunnelClient = new ArthasTunnelClient(config, this);
     this.terminalBridge = new ArthasTerminalBridge(config, this);
 
-    // 设置会话管理器到 Tunnel 客户端
-    this.tunnelClient.setSessionManager(sessionManager);
+    // readinessGate 依赖 lifecycleManager，必须在 lifecycleManager 初始化之后构造
+    this.readinessGate = new ArthasReadinessGate(stateEventBus, lifecycleManager);
+
+    // 【模式2核心】创建 Tunnel 状态桥接器（从 Arthas 内部获取 tunnel 状态）
+    this.tunnelStatusBridge = new ArthasTunnelStatusBridge(
+        lifecycleManager.getArthasBootstrap(),
+        this, // TunnelStatusListener
+        lifecycleManager.getStartupLogCollector());
 
     // 设置 Arthas Bootstrap 和生命周期管理器到终端桥接器
     this.terminalBridge.setArthasBootstrap(lifecycleManager.getArthasBootstrap());
@@ -120,15 +133,13 @@ public final class ArthasIntegration
     // 启动终端桥接器
     terminalBridge.start(scheduler);
 
-    // 启动会话清理任务
-    sessionManager.startCleanupTask(scheduler);
-
-    // 启动 Tunnel 客户端
-    tunnelClient.start(scheduler);
+    // 【模式2核心】启动 Tunnel 状态桥接器
+    // 从 Arthas 内部获取 tunnel 状态，桥接到 OTel 状态事件总线
+    tunnelStatusBridge.start(scheduler, 1000); // 每秒轮询一次
 
     logger.log(
         Level.INFO,
-        "Arthas integration started, environment: {0}",
+        "Arthas integration started (Mode2: official tunnel), environment: {0}",
         environment);
   }
 
@@ -136,14 +147,8 @@ public final class ArthasIntegration
   public void stop() {
     logger.log(Level.INFO, "Stopping Arthas integration");
 
-    // 关闭所有会话
-    sessionManager.closeAllSessions();
-
     // 停止 Arthas
     lifecycleManager.stop();
-
-    // 停止会话清理任务
-    sessionManager.stopCleanupTask();
 
     // 关闭终端桥接器
     terminalBridge.close();
@@ -152,7 +157,7 @@ public final class ArthasIntegration
   @Override
   public void close() {
     stop();
-    tunnelClient.close();
+    tunnelStatusBridge.stop();
     lifecycleManager.close();
     logger.log(Level.INFO, "Arthas integration closed");
   }
@@ -167,16 +172,6 @@ public final class ArthasIntegration
   /** 获取生命周期管理器 */
   public ArthasLifecycleManager getLifecycleManager() {
     return lifecycleManager;
-  }
-
-  /** 获取会话管理器 */
-  public ArthasSessionManager getSessionManager() {
-    return sessionManager;
-  }
-
-  /** 获取 Tunnel 客户端 */
-  public ArthasTunnelClient getTunnelClient() {
-    return tunnelClient;
   }
 
   /** 获取终端桥接器 */
@@ -194,30 +189,27 @@ public final class ArthasIntegration
     return lifecycleManager.isRunning();
   }
 
-  /** Tunnel 是否已就绪（连接成功且已注册） */
+  /**
+   * Tunnel 是否已就绪（Arthas 内部 tunnel 已连接且已注册）
+   *
+   * <p>【模式2】状态来源于 Arthas 内部 TunnelClient，通过 {@link ArthasTunnelStatusBridge} 桥接
+   */
   public boolean isTunnelReady() {
-    return tunnelClient.isConnected() && tunnelRegistered.get();
+    return tunnelStatusBridge.isRegistered();
   }
 
   /**
-   * 获取 Tunnel 未就绪的原因（用于诊断/日志）
+   * 获取就绪门闩。
    *
-   * @return 为空表示已就绪
+   * <p>用于将"可交互就绪"的判断/等待收敛到统一组件，避免各处重复实现。
    */
-  @Nullable
-  public String getTunnelNotReadyReason() {
-    if (!tunnelClient.isConnected()) {
-      return "TUNNEL_NOT_CONNECTED";
-    }
-    if (!tunnelRegistered.get()) {
-      return "TUNNEL_NOT_REGISTERED";
-    }
-    return null;
+  public ArthasReadinessGate getReadinessGate() {
+    return readinessGate;
   }
 
   /** 终端是否可绑定到 Arthas（Capability 视角） */
   public boolean isTerminalBindable() {
-    return isTunnelReady() && lifecycleManager.getState() == ArthasLifecycleManager.State.RUNNING;
+    return readinessGate.evaluateNow().isTerminalReady();
   }
 
   /**
@@ -227,15 +219,12 @@ public final class ArthasIntegration
    */
   @Nullable
   public String getTerminalNotBindableReason() {
-    String tunnelReason = getTunnelNotReadyReason();
-    if (tunnelReason != null) {
-      return tunnelReason;
+    ArthasReadinessGate.Result r = readinessGate.evaluateNow();
+    if (r.isTerminalReady()) {
+      return null;
     }
-    ArthasLifecycleManager.State s = lifecycleManager.getState();
-    if (s != ArthasLifecycleManager.State.RUNNING) {
-      return "ARTHAS_NOT_RUNNING:" + s;
-    }
-    return null;
+    // 兼容现有 reason 语义（字符串化原因）
+    return r.toErrorCode() + ":" + r.getReasonCode();
   }
 
   /** 获取状态信息（用于状态上报） */
@@ -243,9 +232,7 @@ public final class ArthasIntegration
     Map<String, Object> status = new LinkedHashMap<>();
     status.put("enabled", config.isEnabled());
     status.put("arthasState", lifecycleManager.getState().name());
-    status.put("activeSessions", sessionManager.getActiveSessionCount());
-    status.put("maxSessions", config.getMaxSessionsPerAgent());
-    status.put("tunnelConnected", tunnelClient.isConnected());
+    status.put("tunnelStatus", tunnelStatusBridge.getCurrentStatus().name());
     status.put("tunnelRegistered", tunnelRegistered.get());
     status.put("tunnelReady", isTunnelReady());
     status.put("terminalBindable", isTerminalBindable());
@@ -271,15 +258,6 @@ public final class ArthasIntegration
   public void onArthasStarted() {
     logger.log(Level.INFO, "Arthas started callback");
     stateEventBus.publishArthasState(lifecycleManager.getState());
-    tunnelClient.sendArthasStatus();
-
-    // 通知所有等待的会话
-    for (String sessionId : sessionManager.getSessionIds()) {
-      ArthasSession session = sessionManager.getSession(sessionId);
-      if (session != null) {
-        terminalBridge.createSessionTerminal(session);
-      }
-    }
   }
 
   @Override
@@ -287,173 +265,106 @@ public final class ArthasIntegration
     logger.log(Level.INFO, "Arthas stopped callback");
     stateEventBus.publishArthasState(lifecycleManager.getState());
     // 关闭所有终端
-    for (String sessionId : sessionManager.getSessionIds()) {
-      terminalBridge.destroySessionTerminal(sessionId);
-      tunnelClient.sendTerminalClosed(sessionId, "arthas_stopped");
-    }
-    sessionManager.closeAllSessions();
-    tunnelClient.sendArthasStatus();
+    terminalBridge.closeAllTerminals();
   }
 
   @Override
   public void onMaxDurationExceeded() {
     logger.log(Level.WARNING, "Arthas max duration exceeded, forcing shutdown");
-    // 通知所有会话即将关闭
-    for (String sessionId : sessionManager.getSessionIds()) {
-      tunnelClient.sendTerminalClosed(sessionId, "max_duration_exceeded");
-    }
-  }
-
-  // ===== SessionEventListener 实现 =====
-
-  @Override
-  @Nullable
-  public String canCreateSession(ArthasSessionManager.SessionCreateRequest request) {
-    // 业务判断必须纯粹：不做阻塞等待。等待逻辑下沉到请求处理层（TERMINAL_OPEN）。
-    String reason = getTerminalNotBindableReason();
-    return reason;
-  }
-
-  @Override
-  public void onSessionCreated(ArthasSession session) {
-    logger.log(Level.INFO, "Session created: {0}", session.getSessionId());
-
-    // Phase 2：Capability gating
-    if (!isTerminalBindable()) {
-      String reason = String.valueOf(getTerminalNotBindableReason());
-      logger.log(
-          Level.WARNING,
-          "Terminal is not bindable right now, session will run in echo mode: sessionId={0}, reason={1}",
-          new Object[] {session.getSessionId(), reason});
-    }
-
-    // 创建会话终端（内部会根据 lifecycle 状态尝试绑定，失败则 echo）
-    terminalBridge.createSessionTerminal(session);
-    
-    // 恢复 Arthas 为活跃状态
-    lifecycleManager.markActive();
-  }
-
-  @Override
-  public void onSessionClosed(ArthasSession session) {
-    logger.log(Level.INFO, "Session closed: {0}", session.getSessionId());
-    
-    // 销毁会话终端
-    terminalBridge.destroySessionTerminal(session.getSessionId());
-    
-    // 通知 Tunnel Server
-    tunnelClient.sendTerminalClosed(session.getSessionId(), "session_closed");
-  }
-
-  @Override
-  public void onAllSessionsClosed() {
-    logger.log(Level.INFO, "All sessions closed, marking Arthas as idle");
-    if (scheduler != null) {
-      lifecycleManager.markIdle(scheduler);
-    }
-  }
-
-  // ===== TunnelEventListener 实现 =====
-
-  @Override
-  public void onConnected() {
-    logger.log(Level.INFO, "Tunnel connected");
-    tunnelRegistered.set(false);
-    stateEventBus.publishTunnelConnected();
-    // 发送当前状态
-    tunnelClient.sendArthasStatus();
-  }
-
-  @Override
-  public void onAgentRegistered() {
-    logger.log(Level.INFO, "Agent registered with server successfully");
-    tunnelRegistered.set(true);
-
-    stateEventBus.publishTunnelRegistered();
-
-    // 【阶段性重构】不再驱动 lifecycle 状态机，仅用于诊断日志
-    lifecycleManager.markRegistered();
-
-    // 注册成功后立即上报一次状态，减少 server/agent 视图不一致窗口
-    tunnelClient.sendArthasStatus();
-  }
-
-  @Override
-  public void onDisconnected(String reason) {
-    logger.log(Level.WARNING, "Tunnel disconnected: {0}", reason);
-    tunnelRegistered.set(false);
-    stateEventBus.publishTunnelDisconnected(reason);
-  }
-
-  @Override
-  public void onError(Throwable error) {
-    logger.log(Level.WARNING, "Tunnel error: {0}", error.getMessage());
-  }
-
-  @Override
-  public void onMaxReconnectReached() {
-    logger.log(Level.SEVERE, "Max reconnect attempts reached, tunnel connection abandoned");
-  }
-
-  @Override
-  public void onArthasStartRequested() {
-    logger.log(Level.INFO, "Arthas start requested via tunnel");
-    if (scheduler != null) {
-      ArthasLifecycleManager.StartResult result = lifecycleManager.tryStart(scheduler);
-      if (!result.isSuccess()) {
-        String errorMsg = result.getErrorMessage() != null ? result.getErrorMessage() : "Unknown error";
-        logger.log(Level.WARNING, "Failed to start Arthas: {0}", errorMsg);
-        tunnelClient.sendError("ARTHAS_START_FAILED", errorMsg, null);
-      }
-    }
-  }
-
-  @Override
-  public void onArthasStopRequested(@Nullable String reason) {
-    logger.log(Level.INFO, "Arthas stop requested via tunnel, reason: {0}", reason);
-    lifecycleManager.stop();
-  }
-
-  @Override
-  public void onTerminalInput(String sessionId, String data) {
-    // 更新会话活跃时间
-    sessionManager.markSessionActive(sessionId);
-
-    // 将输入转发给终端桥接器
-    terminalBridge.handleInput(sessionId, data);
-    
-    logger.log(Level.FINE, "Terminal input forwarded for session {0}", sessionId);
-  }
-
-  @Override
-  public void onTerminalResize(String sessionId, int cols, int rows) {
-    // 调整终端尺寸
-    terminalBridge.handleResize(sessionId, cols, rows);
-    
-    logger.log(
-        Level.FINE,
-        "Terminal resize handled for session {0}: {1}x{2}",
-        new Object[] {sessionId, cols, rows});
-  }
-
-  @Override
-  public String getArthasState() {
-    return lifecycleManager.getState().name();
-  }
-
-  @Override
-  public long getArthasUptimeMs() {
-    return lifecycleManager.getUptimeMillis();
   }
 
   // ===== OutputHandler 实现（终端输出转发） =====
 
   @Override
   public void onOutput(String sessionId, byte[] data) {
-    // 将终端输出通过 WebSocket 发送回服务端
-    tunnelClient.sendBinaryOutput(sessionId, data);
-    
-    logger.log(Level.FINE, "Terminal output sent for session {0}, bytes: {1}", 
+    // 【模式2】终端输出由 Arthas 内部 tunnel 自动转发，此处仅用于本地调试
+    logger.log(Level.FINE, "Terminal output for session {0}, bytes: {1}", 
         new Object[]{sessionId, data.length});
+  }
+
+  // ===== TunnelStatusListener 实现（模式2：从 Arthas 内部获取 tunnel 状态） =====
+
+  /**
+   * 【模式2】Arthas 内部 TunnelClient 连接成功
+   *
+   * <p>由 {@link ArthasTunnelStatusBridge} 轮询检测到状态变化后回调。
+   */
+  @Override
+  public void onTunnelConnected() {
+    logger.log(Level.INFO, "[MODE2] Arthas internal tunnel connected");
+    lifecycleManager.getStartupLogCollector()
+        .addLog("INFO", "Arthas internal TunnelClient connected");
+    stateEventBus.publishTunnelConnected();
+  }
+
+  /**
+   * 【模式2】Arthas 内部 TunnelClient 注册成功
+   *
+   * <p>由 {@link ArthasTunnelStatusBridge} 轮询检测到 agentId 已分配后回调。
+   * 这是"tunnel 完全就绪"的标志。
+   */
+  @Override
+  public void onTunnelRegistered() {
+    logger.log(Level.INFO, "[MODE2] Arthas internal tunnel registered");
+    lifecycleManager.getStartupLogCollector()
+        .addLog("INFO", "Arthas internal TunnelClient registered");
+    tunnelRegistered.set(true);
+    stateEventBus.publishTunnelRegistered();
+    lifecycleManager.markRegistered();
+  }
+
+  /**
+   * 【模式2】Arthas 内部 TunnelClient 断开连接
+   *
+   * <p>由 {@link ArthasTunnelStatusBridge} 轮询检测到连接断开后回调。
+   */
+  @Override
+  public void onTunnelDisconnected(String reason) {
+    logger.log(Level.WARNING, "[MODE2] Arthas internal tunnel disconnected: {0}", reason);
+    lifecycleManager.getStartupLogCollector()
+        .addLog("WARN", "Arthas internal TunnelClient disconnected: " + reason);
+    tunnelRegistered.set(false);
+    stateEventBus.publishTunnelDisconnected(reason);
+  }
+
+  // ===== 便捷方法：供外部触发 Arthas 启动/停止 =====
+
+  /**
+   * 尝试启动 Arthas
+   *
+   * @return 启动结果
+   */
+  public ArthasLifecycleManager.StartResult tryStartArthas() {
+    if (scheduler == null) {
+      return ArthasLifecycleManager.StartResult.failed("Scheduler not available");
+    }
+    return lifecycleManager.tryStart(scheduler);
+  }
+
+  /**
+   * 停止 Arthas
+   *
+   * @return 是否成功停止
+   */
+  public boolean stopArthas() {
+    return lifecycleManager.stop();
+  }
+
+  /**
+   * 获取 Arthas 状态
+   *
+   * @return 状态名称
+   */
+  public String getArthasState() {
+    return lifecycleManager.getState().name();
+  }
+
+  /**
+   * 获取 Arthas 运行时长
+   *
+   * @return 运行时长（毫秒）
+   */
+  public long getArthasUptimeMs() {
+    return lifecycleManager.getUptimeMillis();
   }
 }

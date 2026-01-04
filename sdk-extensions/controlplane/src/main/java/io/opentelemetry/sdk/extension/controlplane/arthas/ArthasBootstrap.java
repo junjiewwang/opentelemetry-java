@@ -22,6 +22,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
 import javax.annotation.Nullable;
 
 /**
@@ -534,18 +536,35 @@ public final class ArthasBootstrap {
       // 构建配置 Map
       Map<String, String> configMap = buildArthasConfigMap();
 
-      // 加载 ArthasBootstrap 类
+      // 使用反射创建 Arthas Bootstrap
       Class<?> bootstrapClass = loader.loadClass(ARTHAS_BOOTSTRAP_CLASS);
+      java.lang.reflect.Method getInstanceMethod;
+      long t0 = System.nanoTime();
+      getInstanceMethod = bootstrapClass.getMethod("getInstance", Instrumentation.class, Map.class);
+      long t1 = System.nanoTime();
 
-      // 获取 getInstance(Instrumentation, Map) 方法
-      Method getInstanceMethod = bootstrapClass.getMethod(
-          "getInstance", Instrumentation.class, Map.class);
+      logger.log(
+          Level.INFO,
+          "Arthas reflection prepared: thread={0}, loadClass+getMethodCostMs={1}",
+          new Object[] {Thread.currentThread().getName(), (t1 - t0) / 1_000_000});
 
-      // 调用 getInstance
+      // 关键点：invoke 可能阻塞/死锁，增加前后打点
+      long invokeStart = System.nanoTime();
+      logger.log(
+          Level.INFO,
+          "Arthas reflection invoking getInstance... thread={0}",
+          Thread.currentThread().getName());
       Object bootstrap = getInstanceMethod.invoke(null, instrumentation, configMap);
+      long invokeEnd = System.nanoTime();
 
-      logger.log(Level.INFO, 
-          "Arthas Bootstrap created with Instrumentation, config keys: {0}", 
+      logger.log(
+          Level.INFO,
+          "Arthas reflection invoked getInstance ok: thread={0}, invokeCostMs={1}",
+          new Object[] {Thread.currentThread().getName(), (invokeEnd - invokeStart) / 1_000_000});
+
+      logger.log(
+          Level.INFO,
+          "Arthas Bootstrap created with Instrumentation, config keys: {0}",
           configMap.keySet());
       return bootstrap;
 
@@ -634,11 +653,23 @@ public final class ArthasBootstrap {
   /**
    * 构建 Arthas 配置 Map
    *
+   * <p>【模式2改造】由 Arthas 内部 TunnelClient 负责 tunnel 连接，
+   * OTel 只负责配置传递和状态观测。
+   *
+   * <p>官方 Arthas 支持的 tunnel 配置键：
+   * <ul>
+   *   <li>tunnel-server: Tunnel Server 地址（可在 URL 中携带 token）</li>
+   *   <li>agent-id: Agent 标识（支持重连复用）</li>
+   *   <li>app-name: 应用名称</li>
+   *   <li>arthas.version: Arthas 版本</li>
+   * </ul>
+   *
    * @return 配置 Map
    */
   private Map<String, String> buildArthasConfigMap() {
     Map<String, String> configMap = new HashMap<>();
 
+    // ===== 基础配置 =====
     // 禁用 Arthas 默认的 telnet 和 http 服务（我们使用 Tunnel）
     configMap.put("arthas.telnetPort", "-1");
     configMap.put("arthas.httpPort", "-1");
@@ -648,13 +679,112 @@ public final class ArthasBootstrap {
         "arthas.sessionTimeout",
         String.valueOf(config.getSessionIdleTimeout().toMillis() / 1000));
 
-    // Tunnel 相关配置
+    // ===== Tunnel 相关配置（模式2核心）=====
     String tunnelServer = config.getTunnelEndpoint();
     if (tunnelServer != null && !tunnelServer.isEmpty()) {
+      // 将 token 编码进 URL query 中（官方 tunnel-client 会透传整个 URL）
+//      String tunnelServerWithAuth = buildTunnelServerUrlWithAuth(tunnelServer);
       configMap.put("tunnel-server", tunnelServer);
+      logger.log(Level.FINE, "Tunnel server configured: {0}", tunnelServer);
     }
 
+    // Agent ID（支持重连复用）
+    // 使用 OTel AgentIdentityProvider 提供的稳定 ID
+    String agentId = getAgentIdForTunnel();
+    if (agentId != null && !agentId.isEmpty()) {
+      configMap.put("agent-id", agentId);
+      logger.log(Level.FINE, "Agent ID configured for tunnel: {0}", agentId);
+    }
+
+    // 应用名称（用于 tunnel-server 端识别）
+    String appName = getAppNameForTunnel();
+    if (appName != null && !appName.isEmpty()) {
+      configMap.put("app-name", appName);
+    }
+
+    // Arthas 版本
+    configMap.put("arthas.version", config.getVersion());
+
+    logger.log(Level.INFO, "Arthas config map built: keys={0}", configMap.keySet());
+
     return configMap;
+  }
+
+  /**
+   * 构建带认证参数的 Tunnel Server URL
+   *
+   * <p>将 OTel 的 auth token 编码到 URL query 中，
+   * 因为官方 Arthas TunnelClient 不支持自定义 HTTP Header。
+   *
+   * <p>URL 格式：ws://host:port/path?token=xxx
+   *
+   * @param baseUrl 基础 URL
+   * @return 带认证参数的 URL
+   */
+  private String buildTunnelServerUrlWithAuth(String baseUrl) {
+    String authToken = config.getAuthToken();
+    if (authToken == null || authToken.isEmpty()) {
+      return baseUrl;
+    }
+
+    try {
+      String encodedToken = URLEncoder.encode(authToken, "UTF-8");
+      String separator = baseUrl.contains("?") ? "&" : "?";
+      return baseUrl + separator + "token=" + encodedToken;
+    } catch (UnsupportedEncodingException e) {
+      // UTF-8 总是支持的，不会发生
+      logger.log(Level.WARNING, "Failed to encode auth token", e);
+      return baseUrl;
+    }
+  }
+
+  /**
+   * 获取用于 Tunnel 的 Agent ID
+   *
+   * <p>复用 OTel AgentIdentityProvider 提供的稳定 ID，
+   * 支持 tunnel 重连时复用同一个 agentId。
+   *
+   * @return Agent ID
+   */
+  @Nullable
+  private static String getAgentIdForTunnel() {
+    try {
+      // 使用反射获取 AgentIdentityProvider（避免编译期硬依赖）
+      Class<?> providerClass = Class.forName(
+          "io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider");
+      java.lang.reflect.Method getMethod = providerClass.getMethod("get");
+      Object identity = getMethod.invoke(null);
+      if (identity != null) {
+        java.lang.reflect.Method getAgentIdMethod = identity.getClass().getMethod("getAgentId");
+        return (String) getAgentIdMethod.invoke(identity);
+      }
+    } catch (ReflectiveOperationException e) {
+      logger.log(Level.FINE, "Failed to get agent ID from AgentIdentityProvider", e);
+    }
+    return null;
+  }
+
+  /**
+   * 获取用于 Tunnel 的应用名称
+   *
+   * @return 应用名称
+   */
+  @Nullable
+  private static String getAppNameForTunnel() {
+    try {
+      // 使用反射获取 AgentIdentityProvider（避免编译期硬依赖）
+      Class<?> providerClass = Class.forName(
+          "io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider");
+      java.lang.reflect.Method getMethod = providerClass.getMethod("get");
+      Object identity = getMethod.invoke(null);
+      if (identity != null) {
+        java.lang.reflect.Method getServiceNameMethod = identity.getClass().getMethod("getServiceName");
+        return (String) getServiceNameMethod.invoke(identity);
+      }
+    } catch (ReflectiveOperationException e) {
+      logger.log(Level.FINE, "Failed to get service name from AgentIdentityProvider", e);
+    }
+    return null;
   }
 
   /**

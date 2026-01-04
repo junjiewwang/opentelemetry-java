@@ -40,6 +40,9 @@ public final class ArthasLifecycleManager implements Closeable {
 
   private static final Logger logger = Logger.getLogger(ArthasLifecycleManager.class.getName());
 
+  // 启动看门狗：防止 Arthas 启动永久停留在 STARTING（例如反射调用内部阻塞）
+  private static final long STARTUP_WATCHDOG_MILLIS = 25_000;
+
   /** Arthas 运行状态 */
   public enum State {
     /** 已停止 */
@@ -69,6 +72,7 @@ public final class ArthasLifecycleManager implements Closeable {
   @Nullable private Instant idleSince;
   @Nullable private ScheduledFuture<?> idleShutdownTask;
   @Nullable private ScheduledFuture<?> maxDurationTask;
+  @Nullable private ScheduledFuture<?> startupWatchdogTask;
 
   // 可选：用于统一事件总线发布状态（避免由上层重复 publish STARTING/STOPPING）
   @Nullable private ArthasStateEventBus stateEventBus;
@@ -152,104 +156,163 @@ public final class ArthasLifecycleManager implements Closeable {
       return StartResult.failed("Arthas is stopping, please try again later");
     }
 
-    // 尝试切换到启动中状态
-    if (!state.compareAndSet(State.STOPPED, State.STARTING)) {
-      State after = state.get();
-      logger.log(Level.FINE, "Start attempt lost race, state changed: {0}", after);
-      // 如果已经在运行/空闲，视为成功（幂等）
-      if (after == State.RUNNING || after == State.IDLE) {
-        return StartResult.success();
-      }
-      return StartResult.failed("State changed during start attempt");
-    }
-
+    // 将启动从调用线程中剥离，避免阻塞调用方（例如 WebSocket 回调线程）
+    state.set(State.STARTING);
     ArthasStateEventBus bus = this.stateEventBus;
     if (bus != null) {
       bus.publishArthasState(State.STARTING);
     }
+    startupLogCollector.addLog("INFO", "Lifecycle state -> STARTING");
 
-    logger.log(Level.INFO, "Starting Arthas...");
-    startupLogCollector.clear();
-    startupLogCollector.addLog("INFO", "Arthas startup initiated");
+    // 启动看门狗：如果超过阈值仍未进入 RUNNING/IDLE，则记录诊断并回退到 STOPPED
+    startupWatchdogTask =
+        scheduler.schedule(
+            () -> {
+              State st = state.get();
+              if (st == State.STARTING) {
+                logger.log(
+                    Level.WARNING,
+                    "Arthas startup watchdog fired after {0}ms: still STARTING. This usually indicates a hang inside bootstrap.start().",
+                    STARTUP_WATCHDOG_MILLIS);
+                startupLogCollector.addLog(
+                    "ERROR",
+                    "Startup watchdog timeout after " + STARTUP_WATCHDOG_MILLIS + "ms (still STARTING)");
 
-    // 记录 Instrumentation 状态
-    if (arthasBootstrap.getInstrumentation() == null) {
-      // 启动前再做一次兜底获取，避免因初始化时序导致 instrumentation 为空
-      arthasBootstrap.setInstrumentation(InstrumentationHolder.get());
+                // 这里保持最小侵入：仅改变状态并发布事件，避免后续 TERMINAL_OPEN 无限等待。
+                state.set(State.STOPPED);
+                ArthasStateEventBus b = this.stateEventBus;
+                if (b != null) {
+                  b.publishArthasState(State.STOPPED);
+                }
+                listener.onArthasStopped();
+              }
+            },
+            STARTUP_WATCHDOG_MILLIS,
+            TimeUnit.MILLISECONDS);
+
+    scheduler.execute(
+        () -> {
+          try {
+            doStartInternal(scheduler);
+            // doStartInternal 内部会更新状态/回调
+          } catch (Throwable t) {
+            logger.log(Level.WARNING, "Arthas start task failed", t);
+            startupLogCollector.addLog("ERROR", "Start task failed: " + t);
+            state.set(State.STOPPED);
+            ArthasStateEventBus b = this.stateEventBus;
+            if (b != null) {
+              b.publishArthasState(State.STOPPED);
+            }
+            listener.onArthasStopped();
+          }
+        });
+
+    return StartResult.success();
+  }
+
+  // 将原有 tryStart 内的启动细节收敛到该方法，便于 watchdog/诊断复用
+  private void doStartInternal(ScheduledExecutorService scheduler) {
+    StartupLogCollector logs = this.startupLogCollector;
+
+    // 在真正启动之前，做一次“可启动性”检查，避免错误状态下继续启动
+    State st = state.get();
+    if (st != State.STARTING) {
+      logs.addLog("WARN", "Start task aborted: lifecycle state is " + st);
+      return;
     }
-    if (arthasBootstrap.getInstrumentation() == null) {
-      startupLogCollector.addLog(
-          "WARN",
-          "Instrumentation not available - SpyAPI cannot be loaded to Bootstrap ClassLoader");
-    } else {
-      startupLogCollector.addLog("INFO", "Instrumentation available");
+
+    logs.addLog("INFO", "Bootstrap.start() begin");
+
+    // 这里是最可能 hang 的位置：bootstrap.start 内部会进行反射 invoke(getInstance)
+    ArthasBootstrap.StartResult r = arthasBootstrap.start();
+
+    if (!r.isSuccess()) {
+      logs.addLog("ERROR", "Bootstrap.start() failed: " + r.getMessage());
+      // 启动失败，回退到 STOPPED，并通知 listener
+      transitionToStopped("bootstrap_start_failed");
+      return;
     }
 
+    logs.addLog("INFO", "Bootstrap.start() ok: " + r.getMessage());
+
+    // 启动成功：更新状态与时间
+    startedAt = Instant.now();
+    idleSince = null;
+
+    cancelStartupWatchdog();
+
+    state.set(State.RUNNING);
+    ArthasStateEventBus bus = this.stateEventBus;
+    if (bus != null) {
+      bus.publishArthasState(State.RUNNING);
+    }
+    logs.addLog("INFO", "Lifecycle state -> RUNNING");
+
+    // 安排最大运行时长关闭（如果配置了）
+    scheduleMaxDurationShutdown(scheduler);
+
+    // 通知 listener（由 integration 推动其他组件，如创建 terminal）
+    listener.onArthasStarted();
+  }
+
+  private void scheduleMaxDurationShutdown(ScheduledExecutorService scheduler) {
+    // 若未配置 maxDuration（<=0），则不安排
+    long maxMillis = config.getMaxRunningDuration().toMillis();
+    if (maxMillis <= 0) {
+      return;
+    }
+
+    if (maxDurationTask != null) {
+      maxDurationTask.cancel(false);
+      maxDurationTask = null;
+    }
+
+    maxDurationTask =
+        scheduler.schedule(
+            () -> {
+              // 超过最大时长后：通知监听器，并主动 stop
+              startupLogCollector.addLog(
+                  "WARN", "Max duration exceeded after " + maxMillis + "ms, stopping");
+              try {
+                listener.onMaxDurationExceeded();
+              } catch (RuntimeException e) {
+                logger.log(Level.FINE, "onMaxDurationExceeded listener failed", e);
+              }
+              stop();
+            },
+            maxMillis,
+            TimeUnit.MILLISECONDS);
+  }
+
+  private void cancelStartupWatchdog() {
+    if (startupWatchdogTask != null) {
+      startupWatchdogTask.cancel(false);
+      startupWatchdogTask = null;
+    }
+  }
+
+  private void transitionToStopped(String reason) {
+    cancelStartupWatchdog();
+
+    // best-effort stop bootstrap if it thinks it's running
     try {
-      // 1. 初始化 Arthas（加载依赖）
-      startupLogCollector.addLog("INFO", "Initializing Arthas...");
-      if (!arthasBootstrap.isInitialized() && !arthasBootstrap.initialize()) {
-        state.set(State.STOPPED);
-        startupLogCollector.addLog("ERROR", "Failed to initialize Arthas");
-        return StartResult.failed("Failed to initialize Arthas", startupLogCollector.getLogs());
-      }
-      startupLogCollector.addLog("INFO", "Arthas initialized");
-
-      // 2. 启动 Arthas
-      startupLogCollector.addLog("INFO", "Starting Arthas bootstrap...");
-      ArthasBootstrap.StartResult bootResult = arthasBootstrap.start();
-      if (!bootResult.isSuccess()) {
-        state.set(State.STOPPED);
-        startupLogCollector.addLog("ERROR", "Arthas bootstrap failed: " + bootResult.getMessage());
-        return StartResult.failed(bootResult.getMessage(), startupLogCollector.getLogs());
-      }
-      startupLogCollector.addLog("INFO", "Arthas bootstrap started");
-
-      // 3. 启动成功，更新状态
-      startedAt = Instant.now();
-
-      // 启动最大运行时长检查任务
-      scheduleMaxDurationCheck(scheduler);
-
-      // 切换到运行中状态：只在仍处于 STARTING 时更新，避免覆盖 IDLE
-      if (state.compareAndSet(State.STARTING, State.RUNNING)) {
-        startupLogCollector.addLog("INFO", "Arthas state changed to RUNNING");
-        if (bus != null) {
-          bus.publishArthasState(State.RUNNING);
-        }
-      } else {
-        State finalState = state.get();
-        logger.log(
-            Level.FINE,
-            "Skip setting RUNNING because state already changed to {0} during startup",
-            finalState);
-        startupLogCollector.addLog(
-            "INFO",
-            "Skip setting RUNNING because state already changed to " + finalState);
-
-        // 即使没有 CAS 到 RUNNING，也同步发布最终状态，确保订阅方一致
-        if (bus != null) {
-          bus.publishArthasState(finalState != null ? finalState : State.STOPPED);
-        }
-      }
-
-      logger.log(Level.INFO, "Arthas started successfully");
-
-      // 通知监听器
-      listener.onArthasStarted();
-
-      return StartResult.success(startupLogCollector.getLogs());
-
+      arthasBootstrap.stop();
     } catch (RuntimeException e) {
-      logger.log(Level.SEVERE, "Failed to start Arthas", e);
-      state.set(State.STOPPED);
-      if (bus != null) {
-        bus.publishArthasState(State.STOPPED);
-      }
-      startupLogCollector.addLog("ERROR", "Exception during startup: " + e.getMessage());
-      return StartResult.failed(
-          "Failed to start Arthas: " + e.getMessage(), startupLogCollector.getLogs());
+      logger.log(Level.FINE, "bootstrap.stop failed during transitionToStopped", e);
     }
+
+    startedAt = null;
+    idleSince = null;
+    registered.set(false);
+
+    state.set(State.STOPPED);
+    ArthasStateEventBus bus = this.stateEventBus;
+    if (bus != null) {
+      bus.publishArthasState(State.STOPPED);
+    }
+
+    startupLogCollector.addLog("INFO", "Lifecycle state -> STOPPED (" + reason + ")");
+    listener.onArthasStopped();
   }
 
   /**
@@ -451,27 +514,6 @@ public final class ArthasLifecycleManager implements Closeable {
     logger.log(Level.FINE, "Scheduled idle shutdown in {0}ms", delayMillis);
   }
 
-  /** 安排最大运行时长检查任务 */
-  private void scheduleMaxDurationCheck(ScheduledExecutorService scheduler) {
-    long maxDurationMillis = config.getMaxRunningDuration().toMillis();
-    maxDurationTask =
-        scheduler.schedule(
-            () -> {
-              if (isRunning()) {
-                logger.log(
-                    Level.WARNING,
-                    "Max running duration ({0}) exceeded, forcing shutdown",
-                    config.getMaxRunningDuration());
-                listener.onMaxDurationExceeded();
-                stop();
-              }
-            },
-            maxDurationMillis,
-            TimeUnit.MILLISECONDS);
-
-    logger.log(Level.FINE, "Scheduled max duration check in {0}ms", maxDurationMillis);
-  }
-
   /** 取消空闲关闭任务 */
   private void cancelIdleShutdownTask() {
     if (idleShutdownTask != null) {
@@ -483,6 +525,10 @@ public final class ArthasLifecycleManager implements Closeable {
   /** 取消所有定时任务 */
   private void cancelScheduledTasks() {
     cancelIdleShutdownTask();
+    if (startupWatchdogTask != null) {
+      startupWatchdogTask.cancel(false);
+      startupWatchdogTask = null;
+    }
     if (maxDurationTask != null) {
       maxDurationTask.cancel(false);
       maxDurationTask = null;

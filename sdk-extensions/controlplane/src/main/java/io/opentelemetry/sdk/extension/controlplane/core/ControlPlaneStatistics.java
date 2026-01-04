@@ -175,7 +175,7 @@ public final class ControlPlaneStatistics {
 
     logger.log(
         Level.INFO,
-        "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlpHealth: [{4}], configUrl: {5}",
+        "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlp: [{4}], configUrl: {5}",
         new Object[] {
           connectionStateManager.getState(),
           configPollCount.get(),

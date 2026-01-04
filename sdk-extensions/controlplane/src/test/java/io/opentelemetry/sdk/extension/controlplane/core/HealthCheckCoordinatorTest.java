@@ -86,11 +86,49 @@ class HealthCheckCoordinatorTest {
     when(healthMonitor.getSuccessCount()).thenReturn(95L);
     when(healthMonitor.getFailureCount()).thenReturn(5L);
     when(healthMonitor.getSuccessRate()).thenReturn(0.95);
-    
+
     String info = coordinator.buildOtlpHealthInfo();
     assertThat(info).contains("state=HEALTHY");
     assertThat(info).contains("success/fail=95/5");
     assertThat(info).contains("rate=95.0%");
+    assertThat(info).contains("gate=");
+  }
+
+  @Test
+  void shouldConnectFastOpensWhenDegradedButRecentSuccess() {
+    // 使用真实 monitor，确保 lastSuccessTimeNano 有值
+    OtlpHealthMonitor realMonitor = new OtlpHealthMonitor(10, 0.8, 0.3);
+    // 先触发足够样本进入 DEGRADED：6 success + 4 failure => 0.6
+    for (int i = 0; i < 6; i++) {
+      realMonitor.recordSuccess();
+    }
+    for (int i = 0; i < 4; i++) {
+      realMonitor.recordFailure("x");
+    }
+    assertThat(realMonitor.getState()).isEqualTo(OtlpHealthMonitor.HealthState.DEGRADED);
+
+    HealthCheckCoordinator c =
+        new HealthCheckCoordinator(realMonitor, new ConnectionStateManager());
+
+    assertThat(c.shouldConnect()).isTrue();
+    assertThat(c.getLastGateDecision().isAllowed()).isTrue();
+  }
+
+  @Test
+  void shouldConnectBlocksWhenUnhealthy() {
+    // 使用真实 monitor 进入 UNHEALTHY
+    OtlpHealthMonitor realMonitor = new OtlpHealthMonitor(10, 0.8, 0.3);
+    for (int i = 0; i < 6; i++) {
+      realMonitor.recordFailure("x");
+    }
+    assertThat(realMonitor.getState()).isEqualTo(OtlpHealthMonitor.HealthState.UNHEALTHY);
+
+    ConnectionStateManager sm = new ConnectionStateManager();
+    HealthCheckCoordinator c = new HealthCheckCoordinator(realMonitor, sm);
+
+    assertThat(c.shouldConnect()).isFalse();
+    assertThat(sm.getState()).isEqualTo(ConnectionState.WAITING_FOR_OTLP);
+    assertThat(c.getLastGateDecision().isAllowed()).isFalse();
   }
 
   @Test
