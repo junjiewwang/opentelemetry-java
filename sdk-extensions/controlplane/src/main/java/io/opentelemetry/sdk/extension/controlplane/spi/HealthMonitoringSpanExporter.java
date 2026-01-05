@@ -7,6 +7,7 @@ package io.opentelemetry.sdk.extension.controlplane.spi;
 
 import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.health.SignalType;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
 import java.util.Collection;
@@ -17,6 +18,7 @@ import java.util.logging.Logger;
  * 健康监控 SpanExporter 包装器
  *
  * <p>包装原始的 SpanExporter，监控导出结果以更新 OTLP 健康状态。
+ * 使用 {@link SignalType#SPAN} 信号类型记录导出结果。
  */
 final class HealthMonitoringSpanExporter implements SpanExporter {
 
@@ -44,11 +46,12 @@ final class HealthMonitoringSpanExporter implements SpanExporter {
     result.whenComplete(
         () -> {
           if (result.isSuccess()) {
-            healthMonitor.recordSuccess();
-            logger.log(Level.FINE, "Export succeeded, recorded success");
+            // 使用新的多信号源 API
+            healthMonitor.recordSuccess(SignalType.SPAN);
+            logger.log(Level.FINE, "Span export succeeded, recorded success");
           } else {
-            healthMonitor.recordFailure("Export failed");
-            logger.log(Level.FINE, "Export failed, recorded failure");
+            healthMonitor.recordFailure("Span export failed", SignalType.SPAN);
+            logger.log(Level.FINE, "Span export failed, recorded failure");
           }
         });
 
@@ -64,6 +67,15 @@ final class HealthMonitoringSpanExporter implements SpanExporter {
   public CompletableResultCode shutdown() {
     logger.log(Level.INFO, "Shutting down HealthMonitoringSpanExporter");
     return delegate.shutdown();
+  }
+
+  /**
+   * 获取原始 SpanExporter
+   *
+   * @return 原始 SpanExporter
+   */
+  public SpanExporter getDelegate() {
+    return delegate;
   }
 
   @Override

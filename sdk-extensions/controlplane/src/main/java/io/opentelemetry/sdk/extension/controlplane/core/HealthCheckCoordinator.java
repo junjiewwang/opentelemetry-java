@@ -127,20 +127,22 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
     long failureCount = healthMonitor.getFailureCount();
     double successRate = healthMonitor.getSuccessRate();
     long totalSamples = successCount + failureCount;
+    int activeSignals = healthMonitor.getActiveSignalCount();
 
     // 当没有采样数据时，显示更友好的提示
-    if (totalSamples == 0) {
-      return "state=UNKNOWN, no samples yet (waiting for span exports), gate=" + lastGateDecision;
+    if (totalSamples == 0 && activeSignals == 0) {
+      return "state=UNKNOWN, no samples yet (waiting for exports), gate=" + lastGateDecision;
     }
 
-    // 格式: state=HEALTHY, success/fail=95/5, rate=95.0%
+    // 格式: state=HEALTHY, success/fail=95/5, rate=95.0%, signals=2
     return String.format(
         Locale.ROOT,
-        "state=%s, success/fail=%d/%d, rate=%.1f%%, gate=%s",
+        "state=%s, success/fail=%d/%d, rate=%.1f%%, signals=%d, gate=%s",
         state,
         successCount,
         failureCount,
         successRate * 100,
+        activeSignals,
         lastGateDecision);
   }
 

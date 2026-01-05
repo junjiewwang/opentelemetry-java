@@ -22,8 +22,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.io.UnsupportedEncodingException;
-import java.net.URLEncoder;
 import javax.annotation.Nullable;
 
 /**
@@ -656,13 +654,15 @@ public final class ArthasBootstrap {
    * <p>【模式2改造】由 Arthas 内部 TunnelClient 负责 tunnel 连接，
    * OTel 只负责配置传递和状态观测。
    *
-   * <p>官方 Arthas 支持的 tunnel 配置键：
+   * <p>重要：配置键名必须与 Arthas Configure 类中的属性名一致（带 arthas. 前缀）：
    * <ul>
-   *   <li>tunnel-server: Tunnel Server 地址（可在 URL 中携带 token）</li>
-   *   <li>agent-id: Agent 标识（支持重连复用）</li>
-   *   <li>app-name: 应用名称</li>
-   *   <li>arthas.version: Arthas 版本</li>
+   *   <li>arthas.tunnelServer: Tunnel Server 地址（可在 URL 中携带 token）</li>
+   *   <li>arthas.agentId: Agent 标识（支持重连复用）</li>
+   *   <li>arthas.appName: 应用名称</li>
    * </ul>
+   *
+   * <p>注意：getInstance(Instrumentation, Map) 方法直接使用传入的 Map，不会自动添加 arthas. 前缀。
+   * 而 getInstance(Instrumentation, String) 方法会自动添加前缀。因此我们必须手动添加前缀。
    *
    * @return 配置 Map
    */
@@ -680,62 +680,32 @@ public final class ArthasBootstrap {
         String.valueOf(config.getSessionIdleTimeout().toMillis() / 1000));
 
     // ===== Tunnel 相关配置（模式2核心）=====
+    // 【重要修复】配置键必须是 arthas.tunnelServer 而非 tunnel-server
     String tunnelServer = config.getTunnelEndpoint();
     if (tunnelServer != null && !tunnelServer.isEmpty()) {
-      // 将 token 编码进 URL query 中（官方 tunnel-client 会透传整个 URL）
-//      String tunnelServerWithAuth = buildTunnelServerUrlWithAuth(tunnelServer);
-      configMap.put("tunnel-server", tunnelServer);
-      logger.log(Level.FINE, "Tunnel server configured: {0}", tunnelServer);
+      configMap.put("arthas.tunnelServer", tunnelServer);
+      logger.log(Level.INFO, "Tunnel server configured: {0}", tunnelServer);
     }
 
     // Agent ID（支持重连复用）
-    // 使用 OTel AgentIdentityProvider 提供的稳定 ID
+    // 【重要修复】配置键必须是 arthas.agentId 而非 agent-id
     String agentId = getAgentIdForTunnel();
     if (agentId != null && !agentId.isEmpty()) {
-      configMap.put("agent-id", agentId);
-      logger.log(Level.FINE, "Agent ID configured for tunnel: {0}", agentId);
+      configMap.put("arthas.agentId", agentId);
+      logger.log(Level.INFO, "Agent ID configured for tunnel: {0}", agentId);
     }
 
     // 应用名称（用于 tunnel-server 端识别）
-    String appName = getAppNameForTunnel();
+    // 【重要修复】配置键必须是 arthas.appName 而非 app-name
+    String appName = config.getAuthToken();
     if (appName != null && !appName.isEmpty()) {
-      configMap.put("app-name", appName);
+      configMap.put("arthas.appName", appName);
+      logger.log(Level.INFO, "App name configured for tunnel: {0}", appName);
     }
-
-    // Arthas 版本
-    configMap.put("arthas.version", config.getVersion());
 
     logger.log(Level.INFO, "Arthas config map built: keys={0}", configMap.keySet());
 
     return configMap;
-  }
-
-  /**
-   * 构建带认证参数的 Tunnel Server URL
-   *
-   * <p>将 OTel 的 auth token 编码到 URL query 中，
-   * 因为官方 Arthas TunnelClient 不支持自定义 HTTP Header。
-   *
-   * <p>URL 格式：ws://host:port/path?token=xxx
-   *
-   * @param baseUrl 基础 URL
-   * @return 带认证参数的 URL
-   */
-  private String buildTunnelServerUrlWithAuth(String baseUrl) {
-    String authToken = config.getAuthToken();
-    if (authToken == null || authToken.isEmpty()) {
-      return baseUrl;
-    }
-
-    try {
-      String encodedToken = URLEncoder.encode(authToken, "UTF-8");
-      String separator = baseUrl.contains("?") ? "&" : "?";
-      return baseUrl + separator + "token=" + encodedToken;
-    } catch (UnsupportedEncodingException e) {
-      // UTF-8 总是支持的，不会发生
-      logger.log(Level.WARNING, "Failed to encode auth token", e);
-      return baseUrl;
-    }
   }
 
   /**
@@ -764,28 +734,6 @@ public final class ArthasBootstrap {
     return null;
   }
 
-  /**
-   * 获取用于 Tunnel 的应用名称
-   *
-   * @return 应用名称
-   */
-  @Nullable
-  private static String getAppNameForTunnel() {
-    try {
-      // 使用反射获取 AgentIdentityProvider（避免编译期硬依赖）
-      Class<?> providerClass = Class.forName(
-          "io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider");
-      java.lang.reflect.Method getMethod = providerClass.getMethod("get");
-      Object identity = getMethod.invoke(null);
-      if (identity != null) {
-        java.lang.reflect.Method getServiceNameMethod = identity.getClass().getMethod("getServiceName");
-        return (String) getServiceNameMethod.invoke(identity);
-      }
-    } catch (ReflectiveOperationException e) {
-      logger.log(Level.FINE, "Failed to get service name from AgentIdentityProvider", e);
-    }
-    return null;
-  }
 
   /**
    * 获取当前 JVM 的 PID

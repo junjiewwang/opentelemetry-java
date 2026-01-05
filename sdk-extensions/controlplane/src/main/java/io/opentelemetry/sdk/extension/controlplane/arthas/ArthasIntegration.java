@@ -31,14 +31,12 @@ import javax.annotation.Nullable;
 public final class ArthasIntegration
     implements Closeable,
         ArthasLifecycleManager.LifecycleEventListener,
-        ArthasTerminalBridge.OutputHandler,
         ArthasTunnelStatusBridge.TunnelStatusListener {
 
   private static final Logger logger = Logger.getLogger(ArthasIntegration.class.getName());
 
   private final ArthasConfig config;
   private final ArthasLifecycleManager lifecycleManager;
-  private final ArthasTerminalBridge terminalBridge;
   private final ArthasEnvironmentDetector.Environment environment;
 
   /** 【模式2核心】Tunnel 状态桥接器，从 Arthas 内部获取 tunnel 状态 */
@@ -67,7 +65,6 @@ public final class ArthasIntegration
     this.environment = ArthasEnvironmentDetector.detect();
     this.lifecycleManager = new ArthasLifecycleManager(config, this);
     this.lifecycleManager.setStateEventBus(stateEventBus);
-    this.terminalBridge = new ArthasTerminalBridge(config, this);
 
     // readinessGate 依赖 lifecycleManager，必须在 lifecycleManager 初始化之后构造
     this.readinessGate = new ArthasReadinessGate(stateEventBus, lifecycleManager);
@@ -78,9 +75,7 @@ public final class ArthasIntegration
         this, // TunnelStatusListener
         lifecycleManager.getStartupLogCollector());
 
-    // 设置 Arthas Bootstrap 和生命周期管理器到终端桥接器
-    this.terminalBridge.setArthasBootstrap(lifecycleManager.getArthasBootstrap());
-    this.terminalBridge.setLifecycleManager(lifecycleManager);
+
   }
 
   /**
@@ -130,8 +125,6 @@ public final class ArthasIntegration
 
     this.scheduler = scheduler;
 
-    // 启动终端桥接器
-    terminalBridge.start(scheduler);
 
     // 【模式2核心】启动 Tunnel 状态桥接器
     // 从 Arthas 内部获取 tunnel 状态，桥接到 OTel 状态事件总线
@@ -149,9 +142,6 @@ public final class ArthasIntegration
 
     // 停止 Arthas
     lifecycleManager.stop();
-
-    // 关闭终端桥接器
-    terminalBridge.close();
   }
 
   @Override
@@ -174,10 +164,6 @@ public final class ArthasIntegration
     return lifecycleManager;
   }
 
-  /** 获取终端桥接器 */
-  public ArthasTerminalBridge getTerminalBridge() {
-    return terminalBridge;
-  }
 
   /** 获取环境信息 */
   public ArthasEnvironmentDetector.Environment getEnvironment() {
@@ -238,7 +224,6 @@ public final class ArthasIntegration
     status.put("terminalBindable", isTerminalBindable());
     status.put("terminalNotBindableReason", getTerminalNotBindableReason());
     status.put("uptimeMs", lifecycleManager.getUptimeMillis());
-    status.put("activeTerminals", terminalBridge.getActiveTerminalCount());
 
     // 环境信息
     Map<String, Object> env = new LinkedHashMap<>();
@@ -264,22 +249,11 @@ public final class ArthasIntegration
   public void onArthasStopped() {
     logger.log(Level.INFO, "Arthas stopped callback");
     stateEventBus.publishArthasState(lifecycleManager.getState());
-    // 关闭所有终端
-    terminalBridge.closeAllTerminals();
   }
 
   @Override
   public void onMaxDurationExceeded() {
     logger.log(Level.WARNING, "Arthas max duration exceeded, forcing shutdown");
-  }
-
-  // ===== OutputHandler 实现（终端输出转发） =====
-
-  @Override
-  public void onOutput(String sessionId, byte[] data) {
-    // 【模式2】终端输出由 Arthas 内部 tunnel 自动转发，此处仅用于本地调试
-    logger.log(Level.FINE, "Terminal output for session {0}, bytes: {1}", 
-        new Object[]{sessionId, data.length});
   }
 
   // ===== TunnelStatusListener 实现（模式2：从 Arthas 内部获取 tunnel 状态） =====
