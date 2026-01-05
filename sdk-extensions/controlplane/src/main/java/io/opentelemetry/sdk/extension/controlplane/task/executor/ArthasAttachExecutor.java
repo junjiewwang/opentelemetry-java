@@ -128,9 +128,12 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     if (enableEventMode) {
       TaskStatusEmitter emitter = Objects.requireNonNull(statusEmitter, "statusEmitter");
 
-      // 已注册则直接成功
-      if (arthasIntegration.isTunnelReady()) {
-        TaskExecutionResult immediate = buildSuccessResult("Arthas already registered", manager);
+      // 已就绪（Arthas 本地可用 + tunnel 已注册）则直接成功
+      io.opentelemetry.sdk.extension.controlplane.arthas.ArthasReadinessGate.Result nowReady =
+          arthasIntegration.getReadinessGate().evaluateNow();
+      if (nowReady.isTerminalReady()) {
+        TaskExecutionResult immediate =
+            buildSuccessResult("Arthas already ready (terminal-ready)", manager);
         future.complete(TaskExecutionResult.success(immediate.getResultJson(), 0));
         return future;
       }
@@ -373,11 +376,41 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         "[ARTHAS-ATTACH] Current Arthas state: {0}, taskId={1}",
         new Object[] {currentState, taskId});
 
-    // 如果已经运行或空闲，直接返回成功
+    // 如果 Arthas 已本地运行，但 tunnel 可能未就绪：
+    // - tunnel 已注册：直接成功
+    // - tunnel 未注册：需要等待注册（不能直接返回成功，否则会导致你日志里那种 RUNNING -> TIMEOUT 的错乱）
     if (currentState == ArthasLifecycleManager.State.RUNNING
         || currentState == ArthasLifecycleManager.State.IDLE) {
-      logger.log(Level.INFO, "[ARTHAS-ATTACH] Arthas already running, taskId={0}", taskId);
-      return buildSuccessResult("Arthas already running", manager);
+      io.opentelemetry.sdk.extension.controlplane.arthas.ArthasReadinessGate.Result rr =
+          arthasIntegration != null ? arthasIntegration.getReadinessGate().evaluateNow() : null;
+
+      if (rr != null && rr.isTerminalReady()) {
+        logger.log(Level.INFO, "[ARTHAS-ATTACH] Arthas already ready, taskId={0}", taskId);
+        return buildSuccessResult("Arthas already ready (terminal-ready)", manager);
+      }
+
+      // Arthas ready but tunnel not ready：进入等待逻辑
+      logger.log(
+          Level.INFO,
+          "[ARTHAS-ATTACH] Arthas running but tunnel not ready yet, waiting for tunnel registration, taskId={0}",
+          taskId);
+
+      if (statusEmitter != null) {
+        statusEmitter.running("Arthas running, waiting for tunnel registration");
+        return TaskExecutionResult.builder()
+            .status(io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus.RUNNING)
+            .resultJson(
+                "{\"status\":\"running\",\"message\":\"Arthas running, waiting for tunnel registration\"}")
+            .build();
+      }
+
+      // 阻塞等待注册：使用 startTimeout 作为兜底窗口
+      TaskExecutionResult registerResult = waitForTunnelRegistered(startTimeout);
+      if (!registerResult.isSuccess()) {
+        return registerResult;
+      }
+
+      return buildSuccessResult("Arthas running and tunnel registered", manager);
     }
 
     // 如果正在启动

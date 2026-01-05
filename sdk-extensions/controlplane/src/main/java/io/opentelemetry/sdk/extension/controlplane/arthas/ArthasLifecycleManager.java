@@ -381,6 +381,55 @@ public final class ArthasLifecycleManager implements Closeable {
   }
 
   /**
+   * 外部观测到 Tunnel/Arthas 已退出时的状态同步。
+   *
+   * <p>背景：在模式2下，Arthas 内部 tunnel 收到 stop 命令后，可能导致 tunnel 断开并触发 Arthas 退出。
+   * 但该退出未必经过本类的 {@link #stop()} 路径，容易造成生命周期状态卡在 RUNNING/IDLE。
+   *
+   * <p>该方法用于由外部观测（如 {@link ArthasTunnelStatusBridge}）驱动本地状态回灌，
+   * 将状态推进到 STOPPED，避免 attach/terminal 判定出现“假 RUNNING”。
+   *
+   * <p>设计原则：最小侵入、best-effort，不抛异常。
+   */
+  public void syncStoppedFromExternalSignal(String reason) {
+    String r = reason != null ? reason : "external";
+
+    // 清除 tunnel 注册标记，避免 isRegistered() 误判
+    registered.set(false);
+
+    State current = state.get();
+    if (current == State.STOPPED) {
+      startupLogCollector.addLog("INFO", "External stop sync ignored (already STOPPED): " + r);
+      return;
+    }
+
+    // 不尝试重入 stop()，避免与外部线程/反射 stop 产生互相等待；仅 best-effort 调用 bootstrap.stop()
+    try {
+      arthasBootstrap.stop();
+    } catch (RuntimeException e) {
+      logger.log(Level.FINE, "bootstrap.stop failed during external stop sync", e);
+    }
+
+    cancelScheduledTasks();
+    startedAt = null;
+    idleSince = null;
+
+    state.set(State.STOPPED);
+    ArthasStateEventBus bus = this.stateEventBus;
+    if (bus != null) {
+      bus.publishArthasState(State.STOPPED);
+    }
+
+    startupLogCollector.addLog("WARN", "Lifecycle state -> STOPPED (external sync: " + r + ")");
+
+    try {
+      listener.onArthasStopped();
+    } catch (RuntimeException e) {
+      logger.log(Level.FINE, "listener.onArthasStopped failed during external stop sync", e);
+    }
+  }
+
+  /**
    * 标记已向服务端注册成功
    *
    * <p>【阶段性重构】Tunnel 注册状态已与 Arthas 生命周期状态解耦。

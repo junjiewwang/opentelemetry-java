@@ -11,6 +11,8 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -52,6 +54,12 @@ public final class ArthasIntegration
   private final ArthasReadinessGate readinessGate;
 
   @Nullable private ScheduledExecutorService scheduler;
+
+  /** Tunnel 断开后的超时销毁任务 */
+  @Nullable private ScheduledFuture<?> tunnelDisconnectTimeoutTask;
+
+  /** Tunnel 断开后等待重连的超时时间（毫秒） */
+  private static final long TUNNEL_RECONNECT_TIMEOUT_MILLIS = 300_000;
 
   /** 供外部使用：基于 predicate 等待状态达成（事件驱动，非阻塞/非轮询） */
   public java.util.concurrent.CompletableFuture<ArthasStateEventBus.State> awaitState(
@@ -147,6 +155,7 @@ public final class ArthasIntegration
   @Override
   public void close() {
     stop();
+    cancelTunnelDisconnectTimeout();
     tunnelStatusBridge.stop();
     lifecycleManager.close();
     logger.log(Level.INFO, "Arthas integration closed");
@@ -285,12 +294,25 @@ public final class ArthasIntegration
     tunnelRegistered.set(true);
     stateEventBus.publishTunnelRegistered();
     lifecycleManager.markRegistered();
+
+    // 【重要】tunnel 重连成功，取消超时销毁任务
+    cancelTunnelDisconnectTimeout();
   }
 
   /**
    * 【模式2】Arthas 内部 TunnelClient 断开连接
    *
    * <p>由 {@link ArthasTunnelStatusBridge} 轮询检测到连接断开后回调。
+   *
+   * <p>【重要】Tunnel 断开可能有多种原因：
+   * <ul>
+   *   <li>网络波动、心跳超时 → Arthas TunnelClient 会自动尝试重连，不应销毁 Arthas</li>
+   *   <li>服务端下发 stop 命令 → 应该销毁 Arthas</li>
+   *   <li>Arthas 进程异常退出 → 应该同步状态</li>
+   *   <li>服务端重启 → TunnelClient 可能无法自动恢复，需要超时销毁</li>
+   * </ul>
+   *
+   * <p>策略：给 TunnelClient 一定时间尝试重连，超时后销毁 Arthas 允许重新启动。
    */
   @Override
   public void onTunnelDisconnected(String reason) {
@@ -299,46 +321,66 @@ public final class ArthasIntegration
         .addLog("WARN", "Arthas internal TunnelClient disconnected: " + reason);
     tunnelRegistered.set(false);
     stateEventBus.publishTunnelDisconnected(reason);
-  }
 
-  // ===== 便捷方法：供外部触发 Arthas 启动/停止 =====
-
-  /**
-   * 尝试启动 Arthas
-   *
-   * @return 启动结果
-   */
-  public ArthasLifecycleManager.StartResult tryStartArthas() {
-    if (scheduler == null) {
-      return ArthasLifecycleManager.StartResult.failed("Scheduler not available");
+    // 检查 Arthas 本地进程是否仍在运行
+    if (lifecycleManager.isRunning() && !lifecycleManager.getArthasBootstrap().isRunning()) {
+      // Arthas 本地进程已退出，但 lifecycleManager 状态未同步
+      logger.log(Level.INFO, 
+          "[MODE2] Arthas local process not running, syncing lifecycle state to STOPPED");
+      cancelTunnelDisconnectTimeout();
+      lifecycleManager.syncStoppedFromExternalSignal("tunnel_disconnected_arthas_exited:" + reason);
+    } else if (lifecycleManager.isRunning()) {
+      // Arthas 本地进程仍在运行，启动超时任务
+      // 给 TunnelClient 一定时间尝试重连，超时后销毁 Arthas
+      logger.log(Level.INFO, 
+          "[MODE2] Arthas still running locally, will destroy if tunnel not reconnected within {0}ms",
+          TUNNEL_RECONNECT_TIMEOUT_MILLIS);
+      scheduleTunnelDisconnectTimeout(reason);
     }
-    return lifecycleManager.tryStart(scheduler);
   }
 
   /**
-   * 停止 Arthas
+   * 安排 tunnel 断开超时任务
    *
-   * @return 是否成功停止
+   * <p>如果在超时时间内 tunnel 未重连，则销毁 Arthas。
    */
-  public boolean stopArthas() {
-    return lifecycleManager.stop();
+  private void scheduleTunnelDisconnectTimeout(String disconnectReason) {
+    // 取消之前的超时任务（如果有）
+    cancelTunnelDisconnectTimeout();
+
+    if (scheduler == null) {
+      logger.log(Level.WARNING, 
+          "[MODE2] Scheduler not available, cannot schedule tunnel disconnect timeout");
+      return;
+    }
+
+    tunnelDisconnectTimeoutTask = scheduler.schedule(
+        () -> {
+          // 超时后检查 tunnel 是否已重连
+          if (!tunnelRegistered.get() && lifecycleManager.isRunning()) {
+            logger.log(Level.WARNING,
+                "[MODE2] Tunnel reconnect timeout after {0}ms, destroying Arthas to allow fresh start",
+                TUNNEL_RECONNECT_TIMEOUT_MILLIS);
+            lifecycleManager.getStartupLogCollector()
+                .addLog("WARN", "Tunnel reconnect timeout, destroying Arthas");
+            lifecycleManager.syncStoppedFromExternalSignal(
+                "tunnel_reconnect_timeout:" + disconnectReason);
+          }
+        },
+        TUNNEL_RECONNECT_TIMEOUT_MILLIS,
+        TimeUnit.MILLISECONDS);
+
+    logger.log(Level.FINE, "[MODE2] Scheduled tunnel disconnect timeout task");
   }
 
   /**
-   * 获取 Arthas 状态
-   *
-   * @return 状态名称
+   * 取消 tunnel 断开超时任务
    */
-  public String getArthasState() {
-    return lifecycleManager.getState().name();
-  }
-
-  /**
-   * 获取 Arthas 运行时长
-   *
-   * @return 运行时长（毫秒）
-   */
-  public long getArthasUptimeMs() {
-    return lifecycleManager.getUptimeMillis();
+  private void cancelTunnelDisconnectTimeout() {
+    if (tunnelDisconnectTimeoutTask != null) {
+      tunnelDisconnectTimeoutTask.cancel(false);
+      tunnelDisconnectTimeoutTask = null;
+      logger.log(Level.FINE, "[MODE2] Cancelled tunnel disconnect timeout task");
+    }
   }
 }

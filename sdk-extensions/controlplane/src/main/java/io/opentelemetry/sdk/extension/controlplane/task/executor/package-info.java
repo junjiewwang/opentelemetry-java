@@ -17,6 +17,7 @@
  * <p>扩展支持：
  * <ul>
  *   <li>{@link io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor} - Arthas 附加执行器
+ *   <li>{@link io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor} - Arthas 分离执行器
  * </ul>
  */
 package io.opentelemetry.sdk.extension.controlplane.task.executor;

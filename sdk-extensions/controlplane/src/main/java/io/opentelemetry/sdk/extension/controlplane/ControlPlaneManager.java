@@ -34,6 +34,7 @@ import io.opentelemetry.sdk.extension.controlplane.status.SystemResourceCollecto
 import io.opentelemetry.sdk.extension.controlplane.status.UptimeCollector;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import java.io.Closeable;
 import java.io.IOException;
@@ -296,13 +297,18 @@ public final class ControlPlaneManager implements Closeable {
 
     // 注册 Arthas 附加执行器
     if (arthasIntegration != null) {
-      ArthasAttachExecutor arthasExecutor = new ArthasAttachExecutor(
+      ArthasAttachExecutor arthasAttachExecutor = new ArthasAttachExecutor(
           arthasIntegration,
           taskManager.getScheduler());
-      taskDispatcher.registerExecutor(arthasExecutor);
+      taskDispatcher.registerExecutor(arthasAttachExecutor);
       logger.log(Level.INFO, "Registered ArthasAttachExecutor for arthas_attach tasks");
+
+      // 注册 Arthas 分离执行器
+      ArthasDetachExecutor arthasDetachExecutor = new ArthasDetachExecutor(arthasIntegration);
+      taskDispatcher.registerExecutor(arthasDetachExecutor);
+      logger.log(Level.INFO, "Registered ArthasDetachExecutor for arthas_detach tasks");
     } else {
-      logger.log(Level.INFO, "Arthas integration not configured, arthas_attach tasks will not be supported");
+      logger.log(Level.INFO, "Arthas integration not configured, arthas_attach/detach tasks will not be supported");
     }
 
     // 未来可以在此添加其他任务执行器

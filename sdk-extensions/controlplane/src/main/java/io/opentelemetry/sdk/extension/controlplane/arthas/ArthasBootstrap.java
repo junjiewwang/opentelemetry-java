@@ -325,10 +325,57 @@ public final class ArthasBootstrap {
   /**
    * 检查 Arthas 是否正在运行
    *
+   * <p>【关键修复】不仅检查我们本地的 running 标志，还要检查 Arthas 真实的运行状态。
+   *
+   * <p>背景：当用户在 Arthas Terminal 里执行 stop 命令时，Arthas 内部直接调用 destroy()，
+   * 而不是通过我们的 stop() 方法。这导致我们的 running 标志没有被更新，但 Arthas 实际已停止。
+   *
+   * <p>通过检查 Arthas 实例的 isBind() 方法（如果存在），可以确认 Arthas 是否真正在运行。
+   *
    * @return 运行状态
    */
   public boolean isRunning() {
-    return running.get();
+    // 1. 首先检查本地标志
+    if (!running.get()) {
+      return false;
+    }
+
+    // 2. 检查 Arthas 实例是否仍然存在
+    Object bootstrap = arthasBootstrapInstance.get();
+    if (bootstrap == null) {
+      return false;
+    }
+
+    // 3. 检查 Arthas 真实的运行状态（调用 isBind() 方法）
+    // isBind() 在 Arthas 被 destroy() 后会返回 false
+    return isArthasActuallyRunning(bootstrap);
+  }
+
+  /**
+   * 检查 Arthas 实例是否真正在运行
+   *
+   * <p>通过反射调用 Arthas Bootstrap 的 isBind() 方法。
+   * isBind() 在 shellServer.listen() 成功后返回 true，在 destroy() 后返回 false。
+   *
+   * @param bootstrap Arthas Bootstrap 实例
+   * @return 是否真正在运行
+   */
+  private static boolean isArthasActuallyRunning(Object bootstrap) {
+    try {
+      // 尝试调用 isBind() 方法
+      java.lang.reflect.Method isBindMethod = bootstrap.getClass().getMethod("isBind");
+      Object result = isBindMethod.invoke(bootstrap);
+      if (result instanceof Boolean) {
+        return (Boolean) result;
+      }
+    } catch (NoSuchMethodException e) {
+      // isBind() 方法不存在，可能是旧版本 Arthas
+      logger.log(Level.FINE, "isBind() method not found, assuming running");
+    } catch (ReflectiveOperationException e) {
+      logger.log(Level.WARNING, "Failed to check Arthas isBind(): {0}", e.getMessage());
+    }
+    // 如果无法确定，保守返回 true
+    return true;
   }
 
   /**
@@ -567,9 +614,8 @@ public final class ArthasBootstrap {
       return bootstrap;
 
     } catch (ClassNotFoundException e) {
-      logger.log(Level.WARNING, "Arthas classes not found in ClassLoader. Running in mock mode.");
-      // 返回非 null 以模拟启动成功（用于测试）
-      return new MockArthasBootstrap();
+      logger.log(Level.SEVERE, "Arthas classes not found in ClassLoader");
+      return null;
 
     } catch (NoSuchMethodException e) {
       // 如果没有 getInstance(Instrumentation, Map) 方法，尝试旧版方法
@@ -618,8 +664,8 @@ public final class ArthasBootstrap {
       return bootstrap;
 
     } catch (ClassNotFoundException e) {
-      logger.log(Level.WARNING, "Arthas classes not found in ClassLoader. Running in mock mode.");
-      return new MockArthasBootstrap();
+      logger.log(Level.SEVERE, "Arthas classes not found in ClassLoader");
+      return null;
 
     } catch (ReflectiveOperationException e) {
       logger.log(Level.SEVERE, "Failed to start Arthas via legacy reflection", e);
@@ -630,22 +676,73 @@ public final class ArthasBootstrap {
   /**
    * 通过反射停止 Arthas
    *
+   * <p>【关键修复】除了调用 destroy() 外，还必须重置 Arthas 的静态单例字段。
+   * 否则下次调用 getInstance() 会返回"已死"的旧实例（TunnelClient 已 shutdown），
+   * 导致 tunnel 永远无法重新连接。
+   *
    * @param bootstrap Arthas Bootstrap 实例
    */
   private static void stopArthasViaReflection(Object bootstrap) {
-    if (bootstrap instanceof MockArthasBootstrap) {
-      logger.log(Level.INFO, "Stopping mock Arthas");
-      return;
-    }
-
     try {
+      // 1. 调用 destroy() 停止内部组件（包括 TunnelClient）
       Method destroyMethod = bootstrap.getClass().getMethod("destroy");
       destroyMethod.invoke(bootstrap);
       logger.log(Level.INFO, "Arthas destroyed via reflection");
 
+      // 2.【关键】重置 Arthas 静态单例字段，使下次 getInstance() 能重新创建实例
+      // Arthas 官方 ArthasBootstrap 使用静态变量 arthasBootstrap 保存单例
+      resetArthasSingletonField(bootstrap.getClass());
+
     } catch (ReflectiveOperationException e) {
       logger.log(Level.WARNING, "Failed to stop Arthas via reflection", e);
     }
+  }
+
+  /**
+   * 重置 Arthas 静态单例字段
+   *
+   * <p>Arthas 官方的 ArthasBootstrap 是单例模式，静态字段名可能因版本而异。
+   * 常见的字段名包括：arthasBootstrap, INSTANCE, instance 等。
+   *
+   * @param bootstrapClass Arthas Bootstrap 类
+   */
+  private static void resetArthasSingletonField(Class<?> bootstrapClass) {
+    // 按优先级尝试不同的字段名
+    String[] possibleFieldNames = {"arthasBootstrap", "INSTANCE", "instance"};
+
+    for (String fieldName : possibleFieldNames) {
+      try {
+        java.lang.reflect.Field instanceField = bootstrapClass.getDeclaredField(fieldName);
+        instanceField.setAccessible(true);
+
+        // 检查是否是静态字段
+        if (java.lang.reflect.Modifier.isStatic(instanceField.getModifiers())) {
+          Object oldValue = instanceField.get(null);
+          instanceField.set(null, null);
+          logger.log(
+              Level.INFO,
+              "Arthas static singleton field ''{0}'' reset (was: {1})",
+              new Object[] {fieldName, oldValue != null ? "non-null" : "null"});
+          return; // 成功重置，退出
+        }
+      } catch (NoSuchFieldException e) {
+        // 该字段名不存在，尝试下一个
+        logger.log(Level.FINE, "Field ''{0}'' not found in ArthasBootstrap", fieldName);
+      } catch (ReflectiveOperationException e) {
+        logger.log(
+            Level.WARNING,
+            "Failed to reset Arthas singleton field ''{0}'': {1}",
+            new Object[] {fieldName, e.getMessage()});
+      }
+    }
+
+    // 如果所有尝试都失败，输出警告
+    logger.log(
+        Level.WARNING,
+        "Cannot find Arthas singleton field to reset. " +
+        "Subsequent attach may fail due to stale singleton instance. " +
+        "Tried fields: {0}",
+        java.util.Arrays.toString(possibleFieldNames));
   }
 
   /**
@@ -795,8 +892,4 @@ public final class ArthasBootstrap {
     void onOutput(String sessionId, byte[] data);
   }
 
-  /** Mock Arthas Bootstrap（用于测试） */
-  private static final class MockArthasBootstrap {
-    // 空实现，用于在 Arthas jar 不存在时的测试场景
-  }
 }
