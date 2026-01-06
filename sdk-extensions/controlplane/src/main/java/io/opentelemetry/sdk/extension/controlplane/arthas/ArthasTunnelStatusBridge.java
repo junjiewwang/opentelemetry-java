@@ -2,6 +2,7 @@
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
 import java.lang.reflect.Method;
+import java.time.Instant;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -54,6 +55,9 @@ public final class ArthasTunnelStatusBridge {
   private final AtomicReference<TunnelStatus> currentStatus =
       new AtomicReference<>(TunnelStatus.UNKNOWN);
   @Nullable private ScheduledFuture<?> pollTask;
+
+  /** 最后一次断线时间（用于计算断线时长） */
+  @Nullable private volatile Instant lastDisconnectedAt;
 
   // 反射缓存
   @Nullable private Method getTunnelClientMethod;
@@ -142,6 +146,46 @@ public final class ArthasTunnelStatusBridge {
    */
   public boolean isRegistered() {
     return getCurrentStatus() == TunnelStatus.REGISTERED;
+  }
+
+  /**
+   * 是否处于断线状态
+   *
+   * @return 是否断线
+   */
+  public boolean isDisconnected() {
+    TunnelStatus status = getCurrentStatus();
+    return status == TunnelStatus.DISCONNECTED || status == TunnelStatus.UNKNOWN;
+  }
+
+  /**
+   * 获取 tunnel 断线时长（毫秒）
+   *
+   * <p>如果当前未断线（CONNECTED/REGISTERED），返回 0。
+   * 如果已断线但没有记录断线时间（例如刚启动），返回 0。
+   *
+   * @return 断线时长（毫秒），未断线或无记录时返回 0
+   */
+  public long getDisconnectedDurationMillis() {
+    // 如果当前状态不是断线，则返回 0
+    if (!isDisconnected()) {
+      return 0;
+    }
+    Instant disconnectedAt = this.lastDisconnectedAt;
+    if (disconnectedAt == null) {
+      return 0;
+    }
+    return System.currentTimeMillis() - disconnectedAt.toEpochMilli();
+  }
+
+  /**
+   * 获取最后一次断线时间
+   *
+   * @return 断线时间，未断线或无记录时返回 null
+   */
+  @Nullable
+  public Instant getLastDisconnectedAt() {
+    return lastDisconnectedAt;
   }
 
   /** 轮询 Tunnel 状态 */
@@ -358,11 +402,17 @@ public final class ArthasTunnelStatusBridge {
         listener.onTunnelConnected();
         break;
       case REGISTERED:
+        // 重连成功，清除断线时间�n        lastDisconnectedAt = null;
         listener.onTunnelRegistered();
         break;
       case DISCONNECTED:
+        // 记录断线时间戳
         if (oldStatus == TunnelStatus.CONNECTED || oldStatus == TunnelStatus.REGISTERED) {
+          lastDisconnectedAt = Instant.now();
           listener.onTunnelDisconnected("status_change");
+        } else if (lastDisconnectedAt == null) {
+          // 首次检测到断线（例如 UNKNOWN -> DISCONNECTED）
+          lastDisconnectedAt = Instant.now();
         }
         break;
       default:

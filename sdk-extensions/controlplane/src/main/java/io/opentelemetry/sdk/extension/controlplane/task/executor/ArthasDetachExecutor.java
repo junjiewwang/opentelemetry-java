@@ -160,6 +160,21 @@ public final class ArthasDetachExecutor implements TaskExecutor {
         "[ARTHAS-DETACH] Current Arthas state: {0}, taskId={1}",
         new Object[] {currentState, taskId});
 
+    // 【前置检查】检查 Arthas 是否已经退出（外部 stop 命令场景）
+    if (!manager.getArthasBootstrap().isRunning()) {
+      logger.log(Level.INFO,
+          "[ARTHAS-DETACH] Arthas already exited (detected via bootstrap.isRunning), "
+              + "syncing lifecycle state from {0}, taskId={1}",
+          new Object[] {currentState, taskId});
+
+      // 如果 lifecycle 状态不是 STOPPED，主动同步
+      if (currentState != ArthasLifecycleManager.State.STOPPED) {
+        manager.syncStoppedFromExternalSignal("detach_task_pre_check:" + taskId);
+      }
+
+      return buildSuccessResult("Arthas already stopped", manager);
+    }
+
     // 如果已经停止，直接返回成功
     if (currentState == ArthasLifecycleManager.State.STOPPED) {
       logger.log(Level.INFO, "[ARTHAS-DETACH] Arthas already stopped, taskId={0}", taskId);
@@ -217,6 +232,12 @@ public final class ArthasDetachExecutor implements TaskExecutor {
   /**
    * 等待 Arthas 停止完成
    *
+   * <p>检查条件（任一满足即视为已停止）：
+   * <ul>
+   *   <li>lifecycle 状态为 STOPPED</li>
+   *   <li>Arthas 实际已退出（bootstrap.isRunning() == false）</li>
+   * </ul>
+   *
    * @param timeoutMillis 超时时间
    * @param manager 生命周期管理器
    * @param taskId 任务 ID
@@ -232,18 +253,35 @@ public final class ArthasDetachExecutor implements TaskExecutor {
     while (System.currentTimeMillis() < deadline) {
       ArthasLifecycleManager.State state = manager.getState();
 
+      // 条件1：lifecycle 状态已变为 STOPPED
       if (state == ArthasLifecycleManager.State.STOPPED) {
         long elapsed = System.currentTimeMillis() - startTime;
         logger.log(
             Level.INFO,
-            "[ARTHAS-DETACH] Arthas stopped after {0}ms, taskId={1}",
+            "[ARTHAS-DETACH] Arthas stopped (lifecycle) after {0}ms, taskId={1}",
             new Object[] {elapsed, taskId});
         return buildSuccessResult("Arthas stopped successfully", manager);
       }
 
-      // 如果状态变回 RUNNING/IDLE，说明停止被取消或失败
-      if (state == ArthasLifecycleManager.State.RUNNING
-          || state == ArthasLifecycleManager.State.IDLE) {
+      // 条件2：Arthas 实际已退出（但 lifecycle 状态尚未同步）
+      // 这是为了处理 Arthas 被外部 stop 命令停止的场景
+      if (!manager.getArthasBootstrap().isRunning()) {
+        long elapsed = System.currentTimeMillis() - startTime;
+        logger.log(
+            Level.INFO,
+            "[ARTHAS-DETACH] Arthas actually stopped (bootstrap.isRunning=false) after {0}ms, "
+                + "syncing lifecycle state. Current state: {1}, taskId={2}",
+            new Object[] {elapsed, state, taskId});
+
+        // 主动同步 lifecycle 状态，避免状态不一致
+        manager.syncStoppedFromExternalSignal("detach_task_detected_arthas_exit:" + taskId);
+        return buildSuccessResult("Arthas stopped (external exit detected)", manager);
+      }
+
+      // 如果状态变回 RUNNING/IDLE，且 Arthas 仍在运行，说明停止被取消
+      if ((state == ArthasLifecycleManager.State.RUNNING
+              || state == ArthasLifecycleManager.State.IDLE)
+          && manager.getArthasBootstrap().isRunning()) {
         logger.log(
             Level.WARNING,
             "[ARTHAS-DETACH] Stop cancelled, Arthas returned to {0}, taskId={1}",
@@ -261,6 +299,17 @@ public final class ArthasDetachExecutor implements TaskExecutor {
             "INTERRUPTED",
             "Interrupted while waiting for Arthas to stop");
       }
+    }
+
+    // 超时前最后检查 Arthas 实际状态
+    if (!manager.getArthasBootstrap().isRunning()) {
+      long elapsed = System.currentTimeMillis() - startTime;
+      logger.log(
+          Level.INFO,
+          "[ARTHAS-DETACH] Arthas stopped (detected during timeout) after {0}ms, taskId={1}",
+          new Object[] {elapsed, taskId});
+      manager.syncStoppedFromExternalSignal("detach_task_timeout_but_arthas_exit:" + taskId);
+      return buildSuccessResult("Arthas stopped (detected during timeout)", manager);
     }
 
     // 超时

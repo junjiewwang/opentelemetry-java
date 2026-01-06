@@ -61,6 +61,17 @@ public final class ArthasIntegration
   /** Tunnel 断开后等待重连的超时时间（毫秒） */
   private static final long TUNNEL_RECONNECT_TIMEOUT_MILLIS = 300_000;
 
+  /**
+   * attach 健康检查的 grace 上限（毫秒）
+   *
+   * <p>说明：实际 grace 由 ArthasAttachExecutor 根据 effectiveTimeout 动态计算，
+   * 此常量仅作为文档参考，cleanupIfUnhealthyForAttach() 接受调用方传入的值。
+   *
+   * @see io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor
+   */
+  @SuppressWarnings("unused")
+  public static final long DEFAULT_ATTACH_CLEANUP_GRACE_PERIOD_MILLIS = 30_000;
+
   /** 供外部使用：基于 predicate 等待状态达成（事件驱动，非阻塞/非轮询） */
   public java.util.concurrent.CompletableFuture<ArthasStateEventBus.State> awaitState(
       java.util.function.Predicate<ArthasStateEventBus.State> predicate,
@@ -233,6 +244,7 @@ public final class ArthasIntegration
     status.put("terminalBindable", isTerminalBindable());
     status.put("terminalNotBindableReason", getTerminalNotBindableReason());
     status.put("uptimeMs", lifecycleManager.getUptimeMillis());
+    status.put("tunnelDisconnectedDurationMs", tunnelStatusBridge.getDisconnectedDurationMillis());
 
     // 环境信息
     Map<String, Object> env = new LinkedHashMap<>();
@@ -244,6 +256,130 @@ public final class ArthasIntegration
     status.put("environment", env);
 
     return Collections.unmodifiableMap(status);
+  }
+
+  // ===== Attach 健康检查（自愈机制） =====
+
+  /**
+   * 检查并清理不健康的 Arthas 实例（供 attach 自愈使用）
+   *
+   * <p>不健康的定义：
+   * <ul>
+   *   <li>Arthas 本地状态为 RUNNING 或 IDLE</li>
+   *   <li>Tunnel 未就绪（未注册）</li>
+   *   <li>断线时长超过宽限期</li>
+   * </ul>
+   *
+   * <p>如果检测到不健康状态，将调用 {@link ArthasLifecycleManager#syncStoppedFromExternalSignal(String)}
+   * 销毁 Arthas，允许后续 attach 重新启动新实例。
+   *
+   * @param gracePeriodMillis 宽限期（毫秒），tunnel 断开后等待这段时间再判定为不健康
+   * @param reason 清理原因（用于日志）
+   * @return 是否执行了清理（true=执行了清理，false=无需清理或无法清理）
+   */
+  public boolean cleanupIfUnhealthyForAttach(long gracePeriodMillis, String reason) {
+    // 1. 检查 lifecycle 状态
+    if (!lifecycleManager.isRunning()) {
+      logger.log(Level.FINE, "[ATTACH-CLEANUP] Arthas not running, no cleanup needed");
+      return false;
+    }
+
+    // 2. 检查 tunnel 状态
+    if (isTunnelReady()) {
+      logger.log(Level.FINE, "[ATTACH-CLEANUP] Tunnel ready, no cleanup needed");
+      return false;
+    }
+
+    // 3. 检查断线时长
+    long disconnectedDuration = tunnelStatusBridge.getDisconnectedDurationMillis();
+    if (disconnectedDuration < gracePeriodMillis) {
+      logger.log(Level.FINE,
+          "[ATTACH-CLEANUP] Tunnel disconnected for {0}ms < grace {1}ms, waiting for reconnect",
+          new Object[] {disconnectedDuration, gracePeriodMillis});
+      return false;
+    }
+
+    // 4. 执行清理
+    logger.log(Level.WARNING,
+        "[ATTACH-CLEANUP] Arthas unhealthy (running but tunnel disconnected for {0}ms > grace {1}ms), cleaning up: {2}",
+        new Object[] {disconnectedDuration, gracePeriodMillis, reason});
+
+    lifecycleManager.getStartupLogCollector().addLog("WARN",
+        "Attach cleanup triggered: tunnel disconnected for " + disconnectedDuration + "ms, reason=" + reason);
+
+    lifecycleManager.syncStoppedFromExternalSignal("attach_cleanup:" + reason);
+    return true;
+  }
+
+  /**
+   * 检查 Arthas 是否处于不健康状态（不执行清理，仅诊断）
+   *
+   * @param gracePeriodMillis 宽限期
+   * @return 不健康状态信息，null 表示健康
+   */
+  @Nullable
+  public UnhealthyStatus checkUnhealthyStatus(long gracePeriodMillis) {
+    if (!lifecycleManager.isRunning()) {
+      return null;
+    }
+    if (isTunnelReady()) {
+      return null;
+    }
+
+    long disconnectedDuration = tunnelStatusBridge.getDisconnectedDurationMillis();
+    if (disconnectedDuration < gracePeriodMillis) {
+      return null;
+    }
+
+    return new UnhealthyStatus(
+        lifecycleManager.getState(),
+        tunnelStatusBridge.getCurrentStatus(),
+        disconnectedDuration,
+        gracePeriodMillis);
+  }
+
+  /**
+   * 不健康状态信息（用于诊断日志）
+   */
+  public static final class UnhealthyStatus {
+    private final ArthasLifecycleManager.State lifecycleState;
+    private final ArthasTunnelStatusBridge.TunnelStatus tunnelStatus;
+    private final long disconnectedDurationMillis;
+    private final long gracePeriodMillis;
+
+    public UnhealthyStatus(
+        ArthasLifecycleManager.State lifecycleState,
+        ArthasTunnelStatusBridge.TunnelStatus tunnelStatus,
+        long disconnectedDurationMillis,
+        long gracePeriodMillis) {
+      this.lifecycleState = lifecycleState;
+      this.tunnelStatus = tunnelStatus;
+      this.disconnectedDurationMillis = disconnectedDurationMillis;
+      this.gracePeriodMillis = gracePeriodMillis;
+    }
+
+    public ArthasLifecycleManager.State getLifecycleState() {
+      return lifecycleState;
+    }
+
+    public ArthasTunnelStatusBridge.TunnelStatus getTunnelStatus() {
+      return tunnelStatus;
+    }
+
+    public long getDisconnectedDurationMillis() {
+      return disconnectedDurationMillis;
+    }
+
+    public long getGracePeriodMillis() {
+      return gracePeriodMillis;
+    }
+
+    @Override
+    public String toString() {
+      return String.format(java.util.Locale.ROOT,
+          "UnhealthyStatus{lifecycle=%s, tunnel=%s, disconnectedMs=%d, graceMs=%d}",
+          lifecycleState, tunnelStatus, disconnectedDurationMillis, gracePeriodMillis);
+    }
   }
 
   // ===== LifecycleEventListener 实现 =====
