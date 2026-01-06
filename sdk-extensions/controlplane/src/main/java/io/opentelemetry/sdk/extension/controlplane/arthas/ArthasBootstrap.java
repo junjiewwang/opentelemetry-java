@@ -496,6 +496,9 @@ public final class ArthasBootstrap {
   /**
    * 从 classpath 资源加载 Arthas jar
    *
+   * <p>同时提取 async-profiler native library 到 arthas-home 目录，
+   * 使 Arthas profiler 命令能够正常工作。
+   *
    * @return ClassLoader
    */
   @Nullable
@@ -515,6 +518,11 @@ public final class ArthasBootstrap {
       // 尝试解压 arthas-client.jar（可选）
       Path clientJar = extractResource(ARTHAS_CLIENT_JAR_RESOURCE, tempDir, "arthas-client.jar");
 
+      // 【关键】提取 async-profiler native library 到 arthas-home 目录
+      // 使 Arthas profiler 命令能够找到 libasyncProfiler.so
+      // 失败不阻塞 Arthas 启动，仅影响 profiler 命令
+      extractAsyncProfilerLibrary(tempDir);
+
       // 构建 URL 数组
       int urlCount = clientJar != null ? 2 : 1;
       URL[] urls = new URL[urlCount];
@@ -531,6 +539,50 @@ public final class ArthasBootstrap {
     } catch (IOException e) {
       logger.log(Level.WARNING, "Failed to load Arthas from classpath resources", e);
       return null;
+    }
+  }
+
+  /**
+   * 提取 async-profiler native library 到 arthas-home 目录
+   *
+   * <p>Arthas profiler 命令查找 async-profiler 库的路径是：
+   * <code>{arthas-home}/async-profiler/libasyncProfiler-{platform}.{ext}</code>
+   *
+   * <p>失败不阻塞 Arthas 启动，仅记录警告日志。profiler 命令将不可用。
+   *
+   * @param arthasHome Arthas 运行时根目录
+   */
+  private static void extractAsyncProfilerLibrary(Path arthasHome) {
+    try {
+      // 使用独立的 AsyncProfilerResourceExtractor 提取库文件
+      io.opentelemetry.sdk.extension.controlplane.profiler.AsyncProfilerResourceExtractor
+          .ExtractionResult result =
+              io.opentelemetry.sdk.extension.controlplane.profiler.AsyncProfilerResourceExtractor
+                  .extractTo(arthasHome);
+
+      if (result.isSuccess()) {
+        if (result.isSkipped()) {
+          logger.log(Level.FINE,
+              "[ARTHAS] async-profiler library already exists: {0}",
+              result.getLibraryPath());
+        } else {
+          logger.log(Level.INFO,
+              "[ARTHAS] async-profiler library extracted: {0}",
+              result.getLibraryPath());
+        }
+      } else {
+        // 提取失败，记录警告但不阻塞
+        logger.log(Level.WARNING,
+            "[ARTHAS] Failed to extract async-profiler library: {0}. "
+                + "Arthas profiler command will not work.",
+            result.getMessage());
+      }
+    } catch (RuntimeException e) {
+      // 捕获所有异常，防止影响 Arthas 启动
+      logger.log(Level.WARNING,
+          "[ARTHAS] Error extracting async-profiler library: {0}. "
+              + "Arthas profiler command will not work.",
+          e.getMessage());
     }
   }
 
