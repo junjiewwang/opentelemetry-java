@@ -5,6 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane;
 
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -49,6 +50,7 @@ public final class InstrumentationHolder {
    * 设置 Instrumentation 实例
    *
    * <p>应该在 Agent 的 premain 方法中尽早调用。只能设置一次，后续调用会被忽略。
+   * 同时会将 Instrumentation 设置到 {@link InstrumentationProvider} 中。
    *
    * @param instrumentation Instrumentation 实例
    */
@@ -60,6 +62,8 @@ public final class InstrumentationHolder {
 
     if (INSTANCE.compareAndSet(null, instrumentation)) {
       logger.log(Level.INFO, "Instrumentation set successfully");
+      // 同步到 InstrumentationProvider
+      InstrumentationProvider.getInstance().setInstrumentation(instrumentation);
     } else {
       logger.log(Level.FINE, "Instrumentation already set, ignoring duplicate set call");
     }
@@ -123,6 +127,17 @@ public final class InstrumentationHolder {
    */
   public static boolean isAvailable() {
     return get() != null;
+  }
+
+  /**
+   * 获取 InstrumentationProvider 实例
+   *
+   * <p>推荐使用 {@link InstrumentationProvider} 获取更丰富的能力信息和诊断信息。
+   *
+   * @return InstrumentationProvider 实例
+   */
+  public static InstrumentationProvider getProvider() {
+    return InstrumentationProvider.getInstance();
   }
 
   /**
@@ -209,5 +224,7 @@ public final class InstrumentationHolder {
   static void clear() {
     INSTANCE.set(null);
     AUTO_OBTAIN_ATTEMPTED.set(false);
+    // 同时清除 InstrumentationProvider 的缓存
+    InstrumentationProvider.getInstance().invalidateCache();
   }
 }

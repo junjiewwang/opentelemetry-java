@@ -5,6 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
 import java.util.Collections;
@@ -116,8 +117,9 @@ public final class ArthasIntegration
    * @param instrumentation Instrumentation 实例
    */
   public void setInstrumentation(@Nullable Instrumentation instrumentation) {
-    lifecycleManager.setInstrumentation(instrumentation);
+    // 通过 InstrumentationProvider 设置，而非直接调用 lifecycleManager
     if (instrumentation != null) {
+      InstrumentationProvider.getInstance().setInstrumentation(instrumentation);
       logger.log(Level.INFO, "Instrumentation set for Arthas integration");
     }
   }

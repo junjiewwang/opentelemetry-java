@@ -20,7 +20,7 @@ class ArthasConfigTest {
     ArthasConfig config = ArthasConfig.builder().build();
 
     assertThat(config.isEnabled()).isFalse();
-    assertThat(config.getVersion()).isEqualTo("4.0.3");
+    assertThat(config.getVersion()).isEqualTo("4.0.5");
     assertThat(config.getMaxSessionsPerAgent()).isEqualTo(2);
     assertThat(config.getSessionIdleTimeout()).isEqualTo(Duration.ofMinutes(30));
     assertThat(config.getSessionMaxDuration()).isEqualTo(Duration.ofHours(2));

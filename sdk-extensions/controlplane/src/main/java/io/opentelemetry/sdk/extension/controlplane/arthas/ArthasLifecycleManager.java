@@ -6,6 +6,8 @@
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
 import io.opentelemetry.sdk.extension.controlplane.InstrumentationHolder;
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationSnapshot;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
 import java.time.Instant;
@@ -86,9 +88,9 @@ public final class ArthasLifecycleManager implements Closeable {
   public ArthasLifecycleManager(ArthasConfig config, LifecycleEventListener listener) {
     this.config = config;
     this.listener = listener;
-    // 在构造时尽早尝试获取 Instrumentation（如果 agent 已注入）
-    // 这样即便上层 wiring 漏传，也不会导致 Arthas 永久走 legacy。
-    this.arthasBootstrap = new ArthasBootstrap(config, InstrumentationHolder.get());
+    // 使用 InstrumentationProvider 获取 Instrumentation，而非直接使用 InstrumentationHolder
+    // 这样可以获取更丰富的诊断信息
+    this.arthasBootstrap = new ArthasBootstrap(config, InstrumentationProvider.getInstance());
   }
 
   /**
@@ -107,12 +109,15 @@ public final class ArthasLifecycleManager implements Closeable {
    * 和传递给 Arthas 进行字节码增强。
    *
    * @param instrumentation Instrumentation 实例
+   * @deprecated 推荐通过 InstrumentationProvider 设置
    */
+  @Deprecated
+  @SuppressWarnings("deprecation")
   public void setInstrumentation(@Nullable Instrumentation instrumentation) {
-    // 如果调用方显式传入为空，做一次兜底尝试：可能 agent 尚未完成注入，或存在初始化时序。
+    // 如果调用方显式传入为空，做一次兆底尝试：可能 agent 尚未完成注入，或存在初始化时序。
     Instrumentation effective = instrumentation != null ? instrumentation : InstrumentationHolder.get();
-    arthasBootstrap.setInstrumentation(effective);
     if (effective != null) {
+      InstrumentationProvider.getInstance().setInstrumentation(effective);
       logger.log(Level.INFO, "Instrumentation set for Arthas lifecycle manager");
       startupLogCollector.addLog("INFO", "Instrumentation configured");
     } else {
@@ -219,6 +224,17 @@ public final class ArthasLifecycleManager implements Closeable {
     if (st != State.STARTING) {
       logs.addLog("WARN", "Start task aborted: lifecycle state is " + st);
       return;
+    }
+
+    // 【新增】启动前诊断：记录 Instrumentation 状态
+    InstrumentationSnapshot instSnapshot = arthasBootstrap.getInstrumentationSnapshot();
+    logs.addLog("INFO", "Instrumentation status: " + instSnapshot.toSummary());
+    if (!instSnapshot.isAvailable()) {
+      logs.addLog("WARN", "Instrumentation NOT available: " + instSnapshot.getDiagnosticMessage());
+      logs.addLog("WARN", "trace/watch/stack commands will NOT work (SpyAPI will be NopSpy)");
+    } else if (!instSnapshot.hasEnhancementCapability()) {
+      logs.addLog("WARN", "Instrumentation available but retransform NOT supported");
+      logs.addLog("WARN", "trace/watch/stack commands will NOT work");
     }
 
     logs.addLog("INFO", "Bootstrap.start() begin");

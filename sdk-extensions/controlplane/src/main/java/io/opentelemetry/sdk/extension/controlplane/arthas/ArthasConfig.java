@@ -74,7 +74,7 @@ public final class ArthasConfig {
 
   // ===== 默认值 =====
   private static final boolean DEFAULT_ENABLED = false;
-  private static final String DEFAULT_VERSION = "4.0.3";
+  private static final String DEFAULT_VERSION = "4.0.5";
   private static final int DEFAULT_MAX_SESSIONS_PER_AGENT = 2;
   private static final Duration DEFAULT_SESSION_IDLE_TIMEOUT = Duration.ofMinutes(30);
   private static final Duration DEFAULT_SESSION_MAX_DURATION = Duration.ofHours(2);

@@ -5,6 +5,8 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationSnapshot;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -55,8 +57,11 @@ public final class ArthasBootstrap {
   private final AtomicReference<ClassLoader> arthasClassLoader = new AtomicReference<>();
   private final AtomicReference<Object> arthasBootstrapInstance = new AtomicReference<>();
 
-  /** Instrumentation 实例（用于加载 SpyAPI 和传递给 Arthas） */
-  @Nullable private Instrumentation instrumentation;
+  /** Instrumentation 提供者（用于获取 Instrumentation 及其能力信息） */
+  private final InstrumentationProvider instrumentationProvider;
+
+  /** 缓存的 Instrumentation 快照（用于诊断） */
+  @Nullable private volatile InstrumentationSnapshot instrumentationSnapshot;
 
   // 回调接口（预留给未来扩展使用）
   @SuppressWarnings("UnusedVariable")
@@ -68,7 +73,7 @@ public final class ArthasBootstrap {
    * @param config Arthas 配置
    */
   public ArthasBootstrap(ArthasConfig config) {
-    this.config = config;
+    this(config, InstrumentationProvider.getInstance());
   }
 
   /**
@@ -76,10 +81,29 @@ public final class ArthasBootstrap {
    *
    * @param config Arthas 配置
    * @param instrumentation Instrumentation 实例
+   * @deprecated 推荐使用 {@link #ArthasBootstrap(ArthasConfig, InstrumentationProvider)}
    */
+  @Deprecated
   public ArthasBootstrap(ArthasConfig config, @Nullable Instrumentation instrumentation) {
     this.config = config;
-    this.instrumentation = instrumentation;
+    this.instrumentationProvider = InstrumentationProvider.getInstance();
+    // 如果显式传入了 Instrumentation，设置到 Provider 中
+    if (instrumentation != null) {
+      this.instrumentationProvider.setInstrumentation(instrumentation);
+    }
+  }
+
+  /**
+   * 创建 Arthas 启动引导器（推荐构造函数）
+   *
+   * <p>使用 InstrumentationProvider 获取 Instrumentation，解耦获取逻辑。
+   *
+   * @param config Arthas 配置
+   * @param provider Instrumentation 提供者
+   */
+  public ArthasBootstrap(ArthasConfig config, InstrumentationProvider provider) {
+    this.config = config;
+    this.instrumentationProvider = provider;
   }
 
   /**
@@ -92,9 +116,14 @@ public final class ArthasBootstrap {
    * </ul>
    *
    * @param instrumentation Instrumentation 实例
+   * @deprecated 推荐在构造时通过 InstrumentationProvider 设置
    */
+  @Deprecated
   public void setInstrumentation(@Nullable Instrumentation instrumentation) {
-    this.instrumentation = instrumentation;
+    if (instrumentation != null) {
+      this.instrumentationProvider.setInstrumentation(instrumentation);
+      this.instrumentationSnapshot = null; // 清除缓存
+    }
   }
 
   /**
@@ -104,7 +133,34 @@ public final class ArthasBootstrap {
    */
   @Nullable
   public Instrumentation getInstrumentation() {
-    return instrumentation;
+    return instrumentationProvider.getInstrumentation();
+  }
+
+  /**
+   * 获取 Instrumentation 快照
+   *
+   * <p>包含 Instrumentation 实例、能力信息和诊断信息，用于问题排查。
+   *
+   * @return Instrumentation 快照
+   */
+  public InstrumentationSnapshot getInstrumentationSnapshot() {
+    InstrumentationSnapshot snapshot = this.instrumentationSnapshot;
+    if (snapshot == null) {
+      snapshot = instrumentationProvider.getSnapshot();
+      this.instrumentationSnapshot = snapshot;
+    }
+    return snapshot;
+  }
+
+  /**
+   * 检查是否具备字节码增强能力
+   *
+   * <p>只有具备增强能力时，trace/watch/stack 等命令才能正常工作。
+   *
+   * @return 是否具备增强能力
+   */
+  public boolean hasEnhancementCapability() {
+    return getInstrumentationSnapshot().hasEnhancementCapability();
   }
 
   /**
@@ -172,13 +228,20 @@ public final class ArthasBootstrap {
     if (isSpyApiLoaded()) {
       logger.log(Level.INFO, "SpyAPI already present in Bootstrap ClassLoader");
       spyLoaded.set(true);
+      // 验证 SpyAPI 状态并记录诊断信息（兼容 Arthas 4.0.3+）
+      resetSpyApiToNopSpyInstance();
       return true;
     }
 
+    // 通过 Provider 获取 Instrumentation 快照
+    InstrumentationSnapshot snapshot = getInstrumentationSnapshot();
+    Instrumentation inst = snapshot.getInstrumentation();
+    
     // 检查 Instrumentation 是否可用
-    if (instrumentation == null) {
+    if (inst == null) {
       logger.log(Level.WARNING, 
-          "Instrumentation not available, cannot load SpyAPI to Bootstrap ClassLoader");
+          "Instrumentation not available, cannot load SpyAPI to Bootstrap ClassLoader. " +
+          "Diagnostic: {0}", snapshot.getDiagnosticMessage());
       return false;
     }
 
@@ -192,12 +255,22 @@ public final class ArthasBootstrap {
 
       // 使用 Instrumentation 将 spy jar 添加到 Bootstrap ClassLoader
       logger.log(Level.INFO, "Loading SpyAPI from: {0}", spyJarFile.getAbsolutePath());
-      instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(spyJarFile));
+      inst.appendToBootstrapClassLoaderSearch(new JarFile(spyJarFile));
 
       // 验证加载成功
       if (isSpyApiLoaded()) {
         spyLoaded.set(true);
         logger.log(Level.INFO, "SpyAPI loaded to Bootstrap ClassLoader successfully");
+        
+        // 验证 SpyAPI 状态并记录诊断信息
+        // 
+        // Arthas 4.0.3+ 说明：
+        // - SpyImpl 通过 Enhancer 类的静态初始化块中的 SpyAPI.setSpy() 设置
+        // - Enhancer 类只有在执行 trace/watch/stack 命令时才会被加载
+        // - 因此此时 spyInstance 是 NopSpy 是正常的
+        // - 这里只做状态验证和诊断日志记录
+        resetSpyApiToNopSpyInstance();
+        
         return true;
       } else {
         logger.log(Level.WARNING, "SpyAPI jar added but class not found");
@@ -207,6 +280,148 @@ public final class ArthasBootstrap {
     } catch (IOException e) {
       logger.log(Level.WARNING, "Failed to load SpyAPI: {0}", e.getMessage());
       return false;
+    }
+  }
+
+  /**
+   * 验证 SpyAPI 状态并记录诊断信息
+   *
+   * <p>【兼容 Arthas 4.0.3+】此方法用于验证 SpyAPI 的初始状态。
+   *
+   * <p>Arthas 4.0.3 的 SpyAPI 结构变化：
+   * <ul>
+   *   <li>NopSpy 变成了内部类 SpyAPI$NopSpy，不再是独立类 java.arthas.NopSpy</li>
+   *   <li>使用 NOPSPY 静态常量，不再是 NopSpy.INSTANCE</li>
+   *   <li>setSpy() 方法是无条件设置，没有幂等性检查</li>
+   *   <li>spyInstance 在静态初始化时就等于 NOPSPY（同一个对象引用）</li>
+   * </ul>
+   *
+   * <p>重要说明：
+   * <ul>
+   *   <li>Arthas 4.0.3 中，SpyAPI.setSpy(spyImpl) 是在 Enhancer 类的静态初始化块中调用的</li>
+   *   <li>Enhancer 类只有在用户执行 trace/watch/stack 等命令时才会被加载</li>
+   *   <li>因此，在执行这些命令之前，spyInstance 自然是 NopSpy，这是正常的</li>
+   * </ul>
+   */
+  private static void resetSpyApiToNopSpyInstance() {
+    try {
+      // 1. 从 Bootstrap ClassLoader 加载 SpyAPI 类
+      Class<?> spyApiClass = Class.forName(SPY_API_CLASS, true, null);
+      
+      // 2. 获取 SpyAPI.spyInstance 字段
+      java.lang.reflect.Field spyInstanceField = spyApiClass.getDeclaredField("spyInstance");
+      spyInstanceField.setAccessible(true);
+      
+      // 3. 检查当前值
+      Object currentValue = spyInstanceField.get(null);
+      String currentClassName = currentValue != null ? currentValue.getClass().getSimpleName() : "null";
+      
+      // 4. 记录当前状态（诊断用）
+      if ("NopSpy".equals(currentClassName)) {
+        // 这是正常的初始状态
+        // Arthas 4.0.3 中，SpyImpl 会在 Enhancer 类加载时通过 setSpy() 设置
+        // Enhancer 类只有在执行 trace/watch/stack 命令时才会被加载
+        logger.log(Level.INFO, 
+            "[SpyAPI] Current spyInstance is NopSpy (initial state). " +
+            "SpyImpl will be set when Enhancer class is loaded (on first trace/watch/stack command).");
+        
+        // 5. 尝试获取 NOPSPY 常量，验证 Arthas 4.0.3+ 结构
+        try {
+          java.lang.reflect.Field nopspyField = spyApiClass.getDeclaredField("NOPSPY");
+          nopspyField.setAccessible(true);
+          Object nopspyValue = nopspyField.get(null);
+          
+          if (currentValue == nopspyValue) {
+            logger.log(Level.FINE, 
+                "[SpyAPI] Verified: spyInstance == NOPSPY (Arthas 4.0.3+ detected). " +
+                "No reset needed, setSpy() will work correctly.");
+          } else {
+            // 旧版本 Arthas 或异常情况：spyInstance 不等于 NOPSPY
+            // 尝试重置
+            logger.log(Level.INFO, 
+                "[SpyAPI] spyInstance != NOPSPY, resetting to NOPSPY for compatibility.");
+            spyInstanceField.set(null, nopspyValue);
+          }
+        } catch (NoSuchFieldException e) {
+          // 没有 NOPSPY 字段，可能是旧版本 Arthas
+          logger.log(Level.FINE, 
+              "[SpyAPI] NOPSPY field not found, trying legacy NopSpy.INSTANCE");
+          resetSpyApiLegacy(spyInstanceField, currentValue);
+        }
+        
+      } else if ("SpyImpl".equals(currentClassName)) {
+        // SpyImpl 已经设置，说明 Enhancer 已加载，一切正常
+        logger.log(Level.INFO, 
+            "[SpyAPI] spyInstance is already SpyImpl. " +
+            "Arthas enhancement is working correctly.");
+      } else {
+        // 其他类型，记录警告但不干预
+        logger.log(Level.WARNING, 
+            "[SpyAPI] Unexpected spyInstance type: {0}. " +
+            "Arthas enhancement may not work correctly.",
+            currentClassName);
+      }
+      
+    } catch (ClassNotFoundException e) {
+      // SpyAPI 类不存在
+      logger.log(Level.WARNING, 
+          "[SpyAPI] SpyAPI class not found in Bootstrap ClassLoader: {0}. " +
+          "arthas-spy.jar may not be loaded correctly.",
+          e.getMessage());
+    } catch (NoSuchFieldException e) {
+      // spyInstance 字段不存在，可能是 Arthas 版本变更
+      logger.log(Level.WARNING, 
+          "[SpyAPI] spyInstance field not found: {0}. " +
+          "This may be due to Arthas version incompatibility.",
+          e.getMessage());
+    } catch (ReflectiveOperationException e) {
+      // 其他反射异常
+      logger.log(Level.WARNING, 
+          "[SpyAPI] Failed to check/reset spyInstance: {0}.",
+          e.getMessage());
+    }
+  }
+  
+  /**
+   * 旧版本 Arthas 的 SpyAPI 重置逻辑
+   *
+   * <p>旧版本使用独立的 java.arthas.NopSpy 类和 NopSpy.INSTANCE 常量。
+   */
+  private static void resetSpyApiLegacy(
+      java.lang.reflect.Field spyInstanceField,
+      Object currentValue) {
+    try {
+      // 尝试加载旧版本的 NopSpy 类
+      Class<?> nopSpyClass = Class.forName("java.arthas.NopSpy", true, null);
+      java.lang.reflect.Field instanceField = nopSpyClass.getDeclaredField("INSTANCE");
+      instanceField.setAccessible(true);
+      Object nopSpyInstance = instanceField.get(null);
+      
+      if (nopSpyInstance == null) {
+        logger.log(Level.WARNING, 
+            "[SpyAPI] Legacy NopSpy.INSTANCE is null, cannot reset spyInstance");
+        return;
+      }
+      
+      if (currentValue == nopSpyInstance) {
+        logger.log(Level.FINE, 
+            "[SpyAPI] Legacy: spyInstance is already NopSpy.INSTANCE, no reset needed");
+        return;
+      }
+      
+      // 重置为 NopSpy.INSTANCE
+      spyInstanceField.set(null, nopSpyInstance);
+      logger.log(Level.INFO, 
+          "[SpyAPI] Legacy: Reset spyInstance to NopSpy.INSTANCE.");
+      
+    } catch (ClassNotFoundException e) {
+      // 既没有 NOPSPY 也没有 java.arthas.NopSpy，版本不兼容
+      logger.log(Level.INFO, 
+          "[SpyAPI] Neither NOPSPY nor java.arthas.NopSpy found. " +
+          "Assuming Arthas 4.0.3+ with setSpy() that works without reset.");
+    } catch (ReflectiveOperationException e) {
+      logger.log(Level.WARNING, 
+          "[SpyAPI] Legacy reset failed: {0}.", e.getMessage());
     }
   }
 
@@ -622,11 +837,27 @@ public final class ArthasBootstrap {
    */
   @Nullable
   private Object startArthasViaReflection(ClassLoader loader) {
+    // 通过 Provider 获取 Instrumentation 快照
+    InstrumentationSnapshot snapshot = getInstrumentationSnapshot();
+    Instrumentation inst = snapshot.getInstrumentation();
+    
     // 检查 Instrumentation
-    if (instrumentation == null) {
+    if (inst == null) {
       logger.log(Level.WARNING, 
-          "Instrumentation not available, trying legacy startup method");
+          "Instrumentation not available, trying legacy startup method. Diagnostic: {0}",
+          snapshot.getDiagnosticMessage());
       return startArthasViaReflectionLegacy(loader);
+    }
+    
+    // 记录 Instrumentation 能力信息
+    logger.log(Level.INFO, 
+        "[Arthas] Instrumentation capability: {0}", snapshot.toSummary());
+    
+    // 如果不支持 retransform，发出警告（trace/watch/stack 将无法工作）
+    if (!snapshot.supportsRetransform()) {
+      logger.log(Level.WARNING, 
+          "[Arthas] WARNING: Instrumentation does not support retransform! " +
+          "trace/watch/stack commands will NOT work.");
     }
 
     try {
@@ -651,7 +882,7 @@ public final class ArthasBootstrap {
           Level.INFO,
           "Arthas reflection invoking getInstance... thread={0}",
           Thread.currentThread().getName());
-      Object bootstrap = getInstanceMethod.invoke(null, instrumentation, configMap);
+      Object bootstrap = getInstanceMethod.invoke(null, inst, configMap);
       long invokeEnd = System.nanoTime();
 
       logger.log(
