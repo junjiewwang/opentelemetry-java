@@ -7,21 +7,12 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationSnapshot;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
-import java.net.URL;
-import java.net.URLClassLoader;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.jar.JarFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -42,19 +33,12 @@ public final class ArthasBootstrap {
   private static final Logger logger = Logger.getLogger(ArthasBootstrap.class.getName());
 
   // Arthas 类名常量
-  private static final String ARTHAS_BOOTSTRAP_CLASS = "com.taobao.arthas.core.server.ArthasBootstrap";
-  private static final String SPY_API_CLASS = "java.arthas.SpyAPI";
-
-  // Arthas jar 资源路径（嵌入式模式）
-  private static final String ARTHAS_CORE_JAR_RESOURCE = "/arthas/arthas-core.jar";
-  private static final String ARTHAS_CLIENT_JAR_RESOURCE = "/arthas/arthas-client.jar";
-  private static final String ARTHAS_SPY_JAR_RESOURCE = "/arthas/arthas-spy.jar";
+  private static final String ARTHAS_BOOTSTRAP_CLASS =
+      "com.taobao.arthas.core.server.ArthasBootstrap";
 
   private final ArthasConfig config;
   private final AtomicBoolean initialized = new AtomicBoolean(false);
   private final AtomicBoolean running = new AtomicBoolean(false);
-  private final AtomicBoolean spyLoaded = new AtomicBoolean(false);
-  private final AtomicReference<ClassLoader> arthasClassLoader = new AtomicReference<>();
   private final AtomicReference<Object> arthasBootstrapInstance = new AtomicReference<>();
 
   /** Instrumentation 提供者（用于获取 Instrumentation 及其能力信息） */
@@ -62,6 +46,15 @@ public final class ArthasBootstrap {
 
   /** 缓存的 Instrumentation 快照（用于诊断） */
   @Nullable private volatile InstrumentationSnapshot instrumentationSnapshot;
+
+  /** 日志隔离组件（负责统一管理 Arthas 日志治理） */
+  private final ArthasLogIsolation logIsolation;
+
+  /** ClassLoader 管理器（负责创建、缓存、重置） */
+  private final ArthasClassLoaderManager classLoaderManager;
+
+  /** SpyAPI 管理器（负责加载、诊断、自愈） */
+  private final SpyApiManager spyApiManager;
 
   // 回调接口（预留给未来扩展使用）
   @SuppressWarnings("UnusedVariable")
@@ -87,6 +80,9 @@ public final class ArthasBootstrap {
   public ArthasBootstrap(ArthasConfig config, @Nullable Instrumentation instrumentation) {
     this.config = config;
     this.instrumentationProvider = InstrumentationProvider.getInstance();
+    this.logIsolation = new ArthasLogIsolation(config);
+    this.classLoaderManager = new ArthasClassLoaderManager();
+    this.spyApiManager = new SpyApiManager();
     // 如果显式传入了 Instrumentation，设置到 Provider 中
     if (instrumentation != null) {
       this.instrumentationProvider.setInstrumentation(instrumentation);
@@ -104,6 +100,18 @@ public final class ArthasBootstrap {
   public ArthasBootstrap(ArthasConfig config, InstrumentationProvider provider) {
     this.config = config;
     this.instrumentationProvider = provider;
+    this.logIsolation = new ArthasLogIsolation(config);
+    this.classLoaderManager = new ArthasClassLoaderManager();
+    this.spyApiManager = new SpyApiManager();
+  }
+
+  /**
+   * 获取日志隔离组件（用于诊断和测试）
+   *
+   * @return 日志隔离组件
+   */
+  public ArthasLogIsolation getLogIsolation() {
+    return logIsolation;
   }
 
   /**
@@ -184,20 +192,20 @@ public final class ArthasBootstrap {
     }
 
     try {
-      // 1. 首先加载 SpyAPI 到 Bootstrap ClassLoader
-      if (!loadSpyApi()) {
+      // 1. 首先加载 SpyAPI 到 Bootstrap ClassLoader（委托给 SpyApiManager）
+      Instrumentation inst = instrumentationProvider.getInstrumentation();
+      if (!spyApiManager.loadToBootstrap(inst, config)) {
         logger.log(Level.WARNING, "Failed to load SpyAPI, Arthas may not work properly");
         // 继续执行，因为在某些场景下可能不需要 SpyAPI
       }
 
-      // 2. 创建 Arthas ClassLoader
-      ClassLoader loader = createArthasClassLoader();
+      // 2. 创建 Arthas ClassLoader（委托给 ClassLoaderManager）
+      ClassLoader loader = classLoaderManager.getOrCreate(config);
       if (loader == null) {
         logger.log(Level.WARNING, "Failed to create Arthas ClassLoader");
         return false;
       }
 
-      arthasClassLoader.set(loader);
       initialized.set(true);
 
       logger.log(Level.INFO, "Arthas initialized successfully");
@@ -207,284 +215,6 @@ public final class ArthasBootstrap {
       logger.log(Level.SEVERE, "Failed to initialize Arthas", e);
       return false;
     }
-  }
-
-  /**
-   * 加载 SpyAPI 到 Bootstrap ClassLoader
-   *
-   * <p>SpyAPI 必须在 Bootstrap ClassLoader 中加载，这样才能被所有类访问。
-   * 使用 {@link Instrumentation#appendToBootstrapClassLoaderSearch(JarFile)} 实现。
-   *
-   * @return 是否成功加载
-   */
-  private boolean loadSpyApi() {
-    // 检查是否已经加载
-    if (spyLoaded.get()) {
-      logger.log(Level.FINE, "SpyAPI already loaded");
-      return true;
-    }
-
-    // 检查 SpyAPI 是否已在 Bootstrap ClassLoader 中
-    if (isSpyApiLoaded()) {
-      logger.log(Level.INFO, "SpyAPI already present in Bootstrap ClassLoader");
-      spyLoaded.set(true);
-      // 验证 SpyAPI 状态并记录诊断信息（兼容 Arthas 4.0.3+）
-      diagnoseSpyApiState();
-      return true;
-
-    }
-
-    // 通过 Provider 获取 Instrumentation 快照
-    InstrumentationSnapshot snapshot = getInstrumentationSnapshot();
-    Instrumentation inst = snapshot.getInstrumentation();
-    
-    // 检查 Instrumentation 是否可用
-    if (inst == null) {
-      logger.log(Level.WARNING, 
-          "Instrumentation not available, cannot load SpyAPI to Bootstrap ClassLoader. " +
-          "Diagnostic: {0}", snapshot.getDiagnosticMessage());
-      return false;
-    }
-
-    try {
-      // 查找 arthas-spy.jar
-      File spyJarFile = findSpyJar();
-      if (spyJarFile == null) {
-        logger.log(Level.WARNING, "arthas-spy.jar not found");
-        return false;
-      }
-
-      // 使用 Instrumentation 将 spy jar 添加到 Bootstrap ClassLoader
-      logger.log(Level.INFO, "Loading SpyAPI from: {0}", spyJarFile.getAbsolutePath());
-      inst.appendToBootstrapClassLoaderSearch(new JarFile(spyJarFile));
-
-      // 验证加载成功
-      if (isSpyApiLoaded()) {
-        spyLoaded.set(true);
-        logger.log(Level.INFO, "SpyAPI loaded to Bootstrap ClassLoader successfully");
-        
-        // 验证 SpyAPI 状态并记录诊断信息
-        // 
-        // Arthas 4.0.3+ 说明：
-        // - SpyImpl 通过 Enhancer 类的静态初始化块中的 SpyAPI.setSpy() 设置
-        // - Enhancer 类只有在执行 trace/watch/stack 命令时才会被加载
-        // - 因此此时 spyInstance 是 NopSpy 是正常的
-        // 这里只做状态验证和诊断日志记录
-        diagnoseSpyApiState();
-        
-        return true;
-
-      } else {
-        logger.log(Level.WARNING, "SpyAPI jar added but class not found");
-        return false;
-      }
-
-    } catch (IOException e) {
-      logger.log(Level.WARNING, "Failed to load SpyAPI: {0}", e.getMessage());
-      return false;
-    }
-  }
-
-  /**
-   * 诊断 SpyAPI 状态并记录诊断信息
-   *
-   * <p>【职责边界】本方法<strong>只做诊断</strong>，用于记录 SpyAPI 的当前状态、
-   * 以及（在极少数“明显不一致”的老版本场景下）做最小化兼容处理。
-   *
-   * <p>注意：二次 attach 的“自愈修复”（恢复 SpyImpl）由 {@code ensureSpyInstalledAfterAttach(...)} 负责，
-   * 不应把“真正的修复逻辑”塞进本方法，以免语义混乱导致维护者误用。
-   *
-   * <p>【兼容 Arthas 4.0.3+】此方法用于验证 SpyAPI 的初始状态。
-   *
-   * <p>Arthas 4.0.3 的 SpyAPI 结构变化：
-   * <ul>
-   *   <li>NopSpy 变成了内部类 SpyAPI$NopSpy，不再是独立类 java.arthas.NopSpy</li>
-   *   <li>使用 NOPSPY 静态常量，不再是 NopSpy.INSTANCE</li>
-   *   <li>setSpy() 方法是无条件设置，没有幂等性检查</li>
-   *   <li>spyInstance 在静态初始化时就等于 NOPSPY（同一个对象引用）</li>
-   * </ul>
-   *
-   * <p>重要说明：
-   * <ul>
-   *   <li>Arthas 4.0.3 中，SpyAPI.setSpy(spyImpl) 是在 Enhancer 类的静态初始化块中调用的</li>
-   *   <li>Enhancer 类只有在用户执行 trace/watch/stack 等命令时才会被加载</li>
-   *   <li>因此，在执行这些命令之前，spyInstance 自然是 NopSpy，这是正常的</li>
-   * </ul>
-   */
-  private static void diagnoseSpyApiState() {
-
-    try {
-      SpyApiSnapshot snapshot = SpyApiSnapshot.read();
-      if (!snapshot.isAvailable()) {
-        logger.log(
-            Level.WARNING,
-            "[SpyAPI] SpyAPI class not found in Bootstrap ClassLoader: {0}. "
-                + "arthas-spy.jar may not be loaded correctly.",
-            snapshot.getDiagnosticMessage());
-        return;
-      }
-
-      // NullAway: snapshot.isAvailable() implies these must be non-null
-      Class<?> spyApiClass = snapshot.getSpyApiClass();
-      java.lang.reflect.Field spyInstanceField = snapshot.getSpyInstanceField();
-      if (spyApiClass == null || spyInstanceField == null) {
-        logger.log(Level.WARNING, "[SpyAPI] SpyAPI snapshot is inconsistent (null fields)");
-        return;
-      }
-
-      String currentClassName = snapshot.getSpyInstanceSimpleName();
-      Object currentValue = snapshot.getSpyInstance();
-
-      // 记录当前状态（诊断用）
-      if ("NopSpy".equals(currentClassName)) {
-        // 这是正常的初始状态
-        // Arthas 4.0.3 中，SpyImpl 会在 Enhancer 类加载时通过 setSpy() 设置
-        // Enhancer 类只有在执行 trace/watch/stack 命令时才会被加载
-        logger.log(
-            Level.INFO,
-            "[SpyAPI] Current spyInstance is NopSpy (initial state). "
-                + "SpyImpl will be set when Enhancer class is loaded (on first trace/watch/stack command). ");
-
-        // 5. 尝试获取 NOPSPY 常量，验证 Arthas 4.0.3+ 结构
-        try {
-          java.lang.reflect.Field nopspyField = spyApiClass.getDeclaredField("NOPSPY");
-          nopspyField.setAccessible(true);
-          Object nopspyValue = nopspyField.get(null);
-
-          if (currentValue == nopspyValue) {
-            logger.log(
-                Level.FINE,
-                "[SpyAPI] Verified: spyInstance == NOPSPY (Arthas 4.0.3+ detected). "
-                    + "No reset needed, setSpy() will work correctly.");
-          } else {
-            // 旧版本 Arthas 或异常情况：spyInstance 不等于 NOPSPY
-            // 尝试重置
-            logger.log(
-                Level.INFO,
-                "[SpyAPI] spyInstance != NOPSPY, resetting to NOPSPY for compatibility.");
-            spyInstanceField.set(null, nopspyValue);
-          }
-        } catch (NoSuchFieldException e) {
-          // 没有 NOPSPY 字段，可能是旧版本 Arthas
-          logger.log(
-              Level.FINE, "[SpyAPI] NOPSPY field not found, trying legacy NopSpy.INSTANCE");
-          if (currentValue == null) {
-            logger.log(
-                Level.FINE,
-                "[SpyAPI] Legacy reset skipped because current spyInstance is null (unexpected)");
-          } else {
-            resetSpyApiLegacy(spyInstanceField, currentValue);
-          }
-        }
-
-      } else if ("SpyImpl".equals(currentClassName)) {
-        // SpyImpl 已经设置，说明 Enhancer 已加载，一切正常
-        logger.log(
-            Level.INFO,
-            "[SpyAPI] spyInstance is already SpyImpl. "
-                + "Arthas enhancement is working correctly.");
-      } else {
-        // 其他类型，记录警告但不干预
-        logger.log(
-            Level.WARNING,
-            "[SpyAPI] Unexpected spyInstance type: {0}. "
-                + "Arthas enhancement may not work correctly.",
-            currentClassName);
-      }
-
-    } catch (ReflectiveOperationException e) {
-      // 其他反射异常
-      logger.log(Level.WARNING, "[SpyAPI] Failed to check/reset spyInstance: {0}.", e.getMessage());
-    }
-  }
-  
-  /**
-   * 旧版本 Arthas 的 SpyAPI 重置逻辑
-   *
-   * <p>旧版本使用独立的 java.arthas.NopSpy 类和 NopSpy.INSTANCE 常量。
-   */
-  private static void resetSpyApiLegacy(
-      java.lang.reflect.Field spyInstanceField,
-      Object currentValue) {
-    try {
-      // 尝试加载旧版本的 NopSpy 类
-      Class<?> nopSpyClass = Class.forName("java.arthas.NopSpy", true, null);
-      java.lang.reflect.Field instanceField = nopSpyClass.getDeclaredField("INSTANCE");
-      instanceField.setAccessible(true);
-      Object nopSpyInstance = instanceField.get(null);
-      
-      if (nopSpyInstance == null) {
-        logger.log(Level.WARNING, 
-            "[SpyAPI] Legacy NopSpy.INSTANCE is null, cannot reset spyInstance");
-        return;
-      }
-      
-      if (currentValue == nopSpyInstance) {
-        logger.log(Level.FINE, 
-            "[SpyAPI] Legacy: spyInstance is already NopSpy.INSTANCE, no reset needed");
-        return;
-      }
-      
-      // 重置为 NopSpy.INSTANCE
-      spyInstanceField.set(null, nopSpyInstance);
-      logger.log(Level.INFO, 
-          "[SpyAPI] Legacy: Reset spyInstance to NopSpy.INSTANCE.");
-      
-    } catch (ClassNotFoundException e) {
-      // 既没有 NOPSPY 也没有 java.arthas.NopSpy，版本不兼容
-      logger.log(Level.INFO, 
-          "[SpyAPI] Neither NOPSPY nor java.arthas.NopSpy found. " +
-          "Assuming Arthas 4.0.3+ with setSpy() that works without reset.");
-    } catch (ReflectiveOperationException e) {
-      logger.log(Level.WARNING, 
-          "[SpyAPI] Legacy reset failed: {0}.", e.getMessage());
-    }
-  }
-
-  /**
-   * 检查 SpyAPI 是否已在 Bootstrap ClassLoader 中
-   *
-   * @return 是否已加载
-   */
-  private static boolean isSpyApiLoaded() {
-    try {
-      Class.forName(SPY_API_CLASS, false, null);
-      return true;
-    } catch (ClassNotFoundException e) {
-      return false;
-    }
-  }
-
-  /**
-   * 查找 arthas-spy.jar 文件
-   *
-   * @return jar 文件，未找到返回 null
-   */
-  @Nullable
-  private File findSpyJar() {
-    // 1. 从配置的外部路径查找
-    String libPath = config.getLibPath();
-    if (libPath != null && !libPath.isEmpty()) {
-      File spyJar = new File(libPath, "arthas-spy.jar");
-      if (spyJar.exists()) {
-        return spyJar;
-      }
-    }
-
-    // 2. 从 classpath 资源提取
-    try {
-      Path tempDir = Files.createTempDirectory("arthas-spy-");
-      tempDir.toFile().deleteOnExit();
-
-      Path spyJar = extractResource(ARTHAS_SPY_JAR_RESOURCE, tempDir, "arthas-spy.jar");
-      if (spyJar != null) {
-        return spyJar.toFile();
-      }
-    } catch (IOException e) {
-      logger.log(Level.WARNING, "Failed to extract arthas-spy.jar: {0}", e.getMessage());
-    }
-
-    return null;
   }
 
   /**
@@ -501,11 +231,13 @@ public final class ArthasBootstrap {
       return StartResult.failed("Failed to initialize Arthas");
     }
 
-    ClassLoader loader = arthasClassLoader.get();
+    ClassLoader loader = classLoaderManager.get();
     if (loader == null) {
       return StartResult.failed("Arthas ClassLoader not available");
     }
 
+    // 【日志隔离】开始 stdout/stderr 短窗口捕获
+    logIsolation.beginStdoutCapture();
     try {
       // 使用反射启动 Arthas
       Object bootstrap = startArthasViaReflection(loader);
@@ -515,10 +247,13 @@ public final class ArthasBootstrap {
 
         // 【关键修复】二次 attach 场景下，Arthas destroy() 会把 SpyAPI.spyInstance 置回 NOPSPY，
         // 但 Enhancer 的静态块只会执行一次，导致后续 attach 时增强功能失效。
-        // 因此在每次启动成功后，若 Arthas 实际已 bind，则尝试通过反射恢复 spyInstance。
+        // 因此在每次启动成功后，若 Arthas 实际已 bind，则尝试通过反射恢复 spyInstance（委托给 SpyApiManager）。
         if (isArthasActuallyRunning(bootstrap)) {
-          ensureSpyInstalledAfterAttach(loader);
+          spyApiManager.ensureInstalled(loader);
         }
+
+        // 【日志隔离】调整 AnsiLog.LEVEL，减少 stdout 输出
+        logIsolation.adjustAnsiLogLevel(loader);
 
         logger.log(Level.INFO, "Arthas started successfully");
         return StartResult.success("Arthas started");
@@ -529,6 +264,9 @@ public final class ArthasBootstrap {
     } catch (RuntimeException e) {
       logger.log(Level.SEVERE, "Failed to start Arthas", e);
       return StartResult.failed("Failed to start Arthas: " + e.getMessage());
+    } finally {
+      // 【日志隔离】结束 stdout/stderr 捕获，恢复原始流
+      logIsolation.endStdoutCapture();
     }
   }
 
@@ -543,6 +281,8 @@ public final class ArthasBootstrap {
       return true;
     }
 
+    // 【日志隔离】开始 stdout/stderr 短窗口捕获
+    logIsolation.beginStdoutCapture();
     try {
       Object bootstrap = arthasBootstrapInstance.get();
       if (bootstrap != null) {
@@ -558,6 +298,9 @@ public final class ArthasBootstrap {
       logger.log(Level.SEVERE, "Error stopping Arthas", e);
       running.set(false);
       return false;
+    } finally {
+      // 【日志隔离】结束 stdout/stderr 捕获，恢复原始流
+      logIsolation.endStdoutCapture();
     }
   }
 
@@ -618,149 +361,6 @@ public final class ArthasBootstrap {
   }
 
   /**
-   * 二次 attach 自愈：确保 SpyAPI.spyInstance 已恢复为 SpyImpl
-   *
-   * <p>背景：Arthas destroy() 会把 SpyAPI 置回 NOPSPY，但 Enhancer 的静态块只执行一次，
-   * 导致后续 attach 虽然 init/bind 成功，但增强回调链路仍是 NOP。
-   *
-   * <p>策略：
-   * <ul>
-   *   <li>幂等：若当前已是 SpyImpl，则不做处理</li>
-   *   <li>优先复用 Arthas 自己创建的 Enhancer.spyImpl 静态字段</li>
-   *   <li>失败降级：任何反射失败只记录日志，不阻塞启动</li>
-   * </ul>
-   */
-  private static void ensureSpyInstalledAfterAttach(ClassLoader arthasLoader) {
-    try {
-      SpyApiSnapshot snapshot = SpyApiSnapshot.read();
-      if (!snapshot.isAvailable()) {
-        logger.log(
-            Level.WARNING,
-            "[SpyAPI] SpyAPI class not found in Bootstrap ClassLoader: {0}",
-            snapshot.getDiagnosticMessage());
-        return;
-      }
-
-      String beforeType = snapshot.getSpyInstanceClassName();
-
-      // 已经是 SpyImpl（或其子类）则直接返回
-      if (snapshot.isSpyImplInstalled()) {
-        logger.log(Level.FINE, "[SpyAPI] spyInstance already installed: {0}", beforeType);
-        return;
-      }
-
-      // 2) 优先从 Enhancer.spyImpl 复用 Arthas 内部实例
-      Object spyImpl = tryGetSpyImplFromEnhancer(arthasLoader);
-
-      // 3) 拿不到则尝试反射创建 SpyImpl（兼容部分裁剪/变种打包）
-      if (spyImpl == null) {
-        spyImpl = tryCreateSpyImpl(arthasLoader);
-      }
-
-      if (spyImpl == null) {
-        logger.log(
-            Level.WARNING,
-            "[SpyAPI] Cannot restore spyInstance because SpyImpl is not available. current={0}",
-            beforeType);
-        return;
-      }
-
-      // 4) 调用 SpyAPI.setSpy(spyImpl)，并输出强诊断
-      try {
-        snapshot.invokeSetSpy(spyImpl);
-      } catch (ReflectiveOperationException | RuntimeException e) {
-        logger.log(
-            Level.WARNING,
-            "[SpyAPI] Failed to invoke SpyAPI.setSpy. spyImplClass={0}, setSpyParamType={1}, error={2}",
-            new Object[] {
-              spyImpl.getClass().getName(),
-              snapshot.getSetSpyParamType() != null ? snapshot.getSetSpyParamType().getName() : "null",
-              e.getMessage()
-            });
-        return;
-      }
-
-      // 5) 再次确认 before/after
-      SpyApiSnapshot after = SpyApiSnapshot.read();
-      String afterType = after.isAvailable() ? after.getSpyInstanceClassName() : "unknown";
-      logger.log(
-          Level.INFO,
-          "[SpyAPI] Restored spyInstance after attach. before={0}, after={1}",
-          new Object[] {beforeType, afterType});
-
-    } catch (RuntimeException e) {
-      logger.log(
-          Level.WARNING,
-          "[SpyAPI] Unexpected error while restoring spyInstance: {0}",
-          e.getMessage());
-    }
-  }
-
-  @Nullable
-  private static Object tryCreateSpyImpl(ClassLoader arthasLoader) {
-    try {
-      Class<?> spyImplClass = arthasLoader.loadClass("com.taobao.arthas.core.advisor.SpyImpl");
-      java.lang.reflect.Constructor<?> ctor = spyImplClass.getDeclaredConstructor();
-      ctor.setAccessible(true);
-      Object value = ctor.newInstance();
-      logger.log(
-          Level.FINE,
-          "[SpyAPI] Created SpyImpl via reflection: class={0}, loader={1}",
-          new Object[] {value.getClass().getName(), value.getClass().getClassLoader()});
-      return value;
-    } catch (ReflectiveOperationException | RuntimeException e) {
-      logger.log(Level.FINE, "[SpyAPI] Failed to create SpyImpl via reflection: {0}", e.getMessage());
-      return null;
-    }
-  }
-
-  @Nullable
-  private static Object tryGetSpyImplFromEnhancer(ClassLoader arthasLoader) {
-    // Arthas 官方实现类：com.taobao.arthas.core.advisor.Enhancer
-    String enhancerClassName = "com.taobao.arthas.core.advisor.Enhancer";
-
-    try {
-      Class<?> enhancerClass = arthasLoader.loadClass(enhancerClassName);
-      java.lang.reflect.Field spyImplField = enhancerClass.getDeclaredField("spyImpl");
-      spyImplField.setAccessible(true);
-
-      // 必须是 static 字段
-      if (!java.lang.reflect.Modifier.isStatic(spyImplField.getModifiers())) {
-        logger.log(Level.WARNING,
-            "[SpyAPI] Enhancer.spyImpl is not static, cannot use it for restoration");
-        return null;
-      }
-
-      Object value = spyImplField.get(null);
-      if (value == null) {
-        logger.log(Level.WARNING, "[SpyAPI] Enhancer.spyImpl is null");
-        return null;
-      }
-
-      logger.log(Level.FINE,
-          "[SpyAPI] Loaded spyImpl from Enhancer: class={0}, loader={1}",
-          new Object[] {value.getClass().getName(), value.getClass().getClassLoader()});
-      return value;
-
-    } catch (ClassNotFoundException e) {
-      logger.log(Level.WARNING,
-          "[SpyAPI] Enhancer class not found in Arthas ClassLoader: {0}",
-          e.getMessage());
-      return null;
-    } catch (NoSuchFieldException e) {
-      logger.log(Level.WARNING,
-          "[SpyAPI] Enhancer.spyImpl field not found: {0}",
-          e.getMessage());
-      return null;
-    } catch (ReflectiveOperationException e) {
-      logger.log(Level.WARNING,
-          "[SpyAPI] Failed to read Enhancer.spyImpl: {0}",
-          e.getMessage());
-      return null;
-    }
-  }
-
-  /**
    * 检查 Arthas 是否已初始化
    *
    * @return 初始化状态
@@ -776,7 +376,7 @@ public final class ArthasBootstrap {
    */
   @Nullable
   public ClassLoader getArthasClassLoader() {
-    return arthasClassLoader.get();
+    return classLoaderManager.get();
   }
 
   /**
@@ -793,206 +393,14 @@ public final class ArthasBootstrap {
   public void destroy() {
     stop();
 
-    ClassLoader loader = arthasClassLoader.getAndSet(null);
-    if (loader instanceof URLClassLoader) {
-      try {
-        ((URLClassLoader) loader).close();
-      } catch (IOException e) {
-        logger.log(Level.WARNING, "Error closing Arthas ClassLoader", e);
-      }
-    }
+    // 委托给 ClassLoaderManager 关闭
+    classLoaderManager.close();
 
     initialized.set(false);
     logger.log(Level.INFO, "Arthas bootstrap destroyed");
   }
 
   // ===== 私有方法 =====
-
-  /**
-   * 创建 Arthas ClassLoader
-   *
-   * @return ClassLoader，如果创建失败返回 null
-   */
-  @Nullable
-  private ClassLoader createArthasClassLoader() {
-    // 1. 首先尝试从配置的外部路径加载
-    String libPath = config.getLibPath();
-    if (libPath != null && !libPath.isEmpty()) {
-      ClassLoader loader = loadFromExternalPath(libPath);
-      if (loader != null) {
-        logger.log(Level.INFO, "Loaded Arthas from external path: {0}", libPath);
-        return loader;
-      }
-    }
-
-    // 2. 尝试从 classpath 资源加载
-    ClassLoader loader = loadFromClasspathResources();
-    if (loader != null) {
-      logger.log(Level.INFO, "Loaded Arthas from classpath resources");
-      return loader;
-    }
-
-    // 3. 如果都失败，返回当前 ClassLoader（假设 Arthas 已在 classpath 中）
-    logger.log(Level.INFO, "Using current ClassLoader for Arthas (assuming Arthas is in classpath)");
-    return getClass().getClassLoader();
-  }
-
-  /**
-   * 从外部路径加载 Arthas jar
-   *
-   * @param libPath 库路径
-   * @return ClassLoader
-   */
-  @Nullable
-  private ClassLoader loadFromExternalPath(String libPath) {
-    try {
-      File libDir = new File(libPath);
-      if (!libDir.exists() || !libDir.isDirectory()) {
-        logger.log(Level.WARNING, "Arthas lib path does not exist or is not a directory: {0}", libPath);
-        return null;
-      }
-
-      File[] jars = libDir.listFiles((dir, name) -> name.endsWith(".jar"));
-      if (jars == null || jars.length == 0) {
-        logger.log(Level.WARNING, "No jar files found in Arthas lib path: {0}", libPath);
-        return null;
-      }
-
-      URL[] urls = new URL[jars.length];
-      for (int i = 0; i < jars.length; i++) {
-        urls[i] = jars[i].toURI().toURL();
-        logger.log(Level.FINE, "Adding Arthas jar: {0}", jars[i].getAbsolutePath());
-      }
-
-      // 创建 URLClassLoader 用于动态加载外部 Arthas jar
-      @SuppressWarnings("BanClassLoader")
-      URLClassLoader loader = new URLClassLoader(urls, getClass().getClassLoader());
-      return loader;
-
-    } catch (IOException e) {
-      logger.log(Level.WARNING, "Failed to load Arthas from external path", e);
-      return null;
-    }
-  }
-
-  /**
-   * 从 classpath 资源加载 Arthas jar
-   *
-   * <p>同时提取 async-profiler native library 到 arthas-home 目录，
-   * 使 Arthas profiler 命令能够正常工作。
-   *
-   * @return ClassLoader
-   */
-  @Nullable
-  private ClassLoader loadFromClasspathResources() {
-    try {
-      // 创建临时目录存放解压的 jar
-      Path tempDir = Files.createTempDirectory("arthas-");
-      tempDir.toFile().deleteOnExit();
-
-      // 尝试解压 arthas-core.jar
-      Path coreJar = extractResource(ARTHAS_CORE_JAR_RESOURCE, tempDir, "arthas-core.jar");
-      if (coreJar == null) {
-        logger.log(Level.FINE, "Arthas core jar not found in classpath resources");
-        return null;
-      }
-
-      // 尝试解压 arthas-client.jar（可选）
-      Path clientJar = extractResource(ARTHAS_CLIENT_JAR_RESOURCE, tempDir, "arthas-client.jar");
-
-      // 【关键】提取 async-profiler native library 到 arthas-home 目录
-      // 使 Arthas profiler 命令能够找到 libasyncProfiler.so
-      // 失败不阻塞 Arthas 启动，仅影响 profiler 命令
-      extractAsyncProfilerLibrary(tempDir);
-
-      // 构建 URL 数组
-      int urlCount = clientJar != null ? 2 : 1;
-      URL[] urls = new URL[urlCount];
-      urls[0] = coreJar.toUri().toURL();
-      if (clientJar != null) {
-        urls[1] = clientJar.toUri().toURL();
-      }
-
-      // 创建 URLClassLoader 用于动态加载 classpath 中的 Arthas jar
-      @SuppressWarnings("BanClassLoader")
-      URLClassLoader loader = new URLClassLoader(urls, getClass().getClassLoader());
-      return loader;
-
-    } catch (IOException e) {
-      logger.log(Level.WARNING, "Failed to load Arthas from classpath resources", e);
-      return null;
-    }
-  }
-
-  /**
-   * 提取 async-profiler native library 到 arthas-home 目录
-   *
-   * <p>Arthas profiler 命令查找 async-profiler 库的路径是：
-   * <code>{arthas-home}/async-profiler/libasyncProfiler-{platform}.{ext}</code>
-   *
-   * <p>失败不阻塞 Arthas 启动，仅记录警告日志。profiler 命令将不可用。
-   *
-   * @param arthasHome Arthas 运行时根目录
-   */
-  private static void extractAsyncProfilerLibrary(Path arthasHome) {
-    try {
-      // 使用独立的 AsyncProfilerResourceExtractor 提取库文件
-      io.opentelemetry.sdk.extension.controlplane.profiler.AsyncProfilerResourceExtractor
-          .ExtractionResult result =
-              io.opentelemetry.sdk.extension.controlplane.profiler.AsyncProfilerResourceExtractor
-                  .extractTo(arthasHome);
-
-      if (result.isSuccess()) {
-        if (result.isSkipped()) {
-          logger.log(Level.FINE,
-              "[ARTHAS] async-profiler library already exists: {0}",
-              result.getLibraryPath());
-        } else {
-          logger.log(Level.INFO,
-              "[ARTHAS] async-profiler library extracted: {0}",
-              result.getLibraryPath());
-        }
-      } else {
-        // 提取失败，记录警告但不阻塞
-        logger.log(Level.WARNING,
-            "[ARTHAS] Failed to extract async-profiler library: {0}. "
-                + "Arthas profiler command will not work.",
-            result.getMessage());
-      }
-    } catch (RuntimeException e) {
-      // 捕获所有异常，防止影响 Arthas 启动
-      logger.log(Level.WARNING,
-          "[ARTHAS] Error extracting async-profiler library: {0}. "
-              + "Arthas profiler command will not work.",
-          e.getMessage());
-    }
-  }
-
-  /**
-   * 解压资源到临时目录
-   *
-   * @param resourcePath 资源路径
-   * @param targetDir 目标目录
-   * @param fileName 文件名
-   * @return 解压后的文件路径，如果资源不存在返回 null
-   */
-  @Nullable
-  private Path extractResource(String resourcePath, Path targetDir, String fileName) {
-    try (InputStream is = getClass().getResourceAsStream(resourcePath)) {
-      if (is == null) {
-        return null;
-      }
-
-      Path targetFile = targetDir.resolve(fileName);
-      Files.copy(is, targetFile, StandardCopyOption.REPLACE_EXISTING);
-      targetFile.toFile().deleteOnExit();
-
-      return targetFile;
-    } catch (IOException e) {
-      logger.log(Level.WARNING, "Failed to extract resource: {0}", resourcePath);
-      return null;
-    }
-  }
 
   /**
    * 通过反射启动 Arthas
@@ -1250,6 +658,10 @@ public final class ArthasBootstrap {
       logger.log(Level.INFO, "App name configured for tunnel: {0}", appName);
     }
 
+    // ===== 日志隔离配置 =====
+    // 通过日志隔离组件应用 Arthas logback 配置，让日志只写文件
+    logIsolation.applyLoggingConfig(configMap);
+
     logger.log(Level.INFO, "Arthas config map built: keys={0}", configMap.keySet());
 
     return configMap;
@@ -1300,169 +712,6 @@ public final class ArthasBootstrap {
       }
     }
     return -1;
-  }
-
-  /**
-   * SpyAPI 反射访问快照（用于统一诊断与修复逻辑）
-   *
-   * <p>目标：
-   * <ul>
-   *   <li>避免在多个方法中散落反射细节</li>
-   *   <li>统一 spyInstance 的类型判定口径</li>
-   * </ul>
-   */
-  private static final class SpyApiSnapshot {
-
-    @Nullable private final Class<?> spyApiClass;
-    @Nullable private final java.lang.reflect.Field spyInstanceField;
-    @Nullable private final Object spyInstance;
-    @Nullable private final java.lang.reflect.Method setSpyMethod;
-    @Nullable private final Class<?> setSpyParamType;
-    @Nullable private final String diagnosticMessage;
-
-    private SpyApiSnapshot(
-        @Nullable Class<?> spyApiClass,
-        @Nullable java.lang.reflect.Field spyInstanceField,
-        @Nullable Object spyInstance,
-        @Nullable java.lang.reflect.Method setSpyMethod,
-        @Nullable Class<?> setSpyParamType,
-        @Nullable String diagnosticMessage) {
-      this.spyApiClass = spyApiClass;
-      this.spyInstanceField = spyInstanceField;
-      this.spyInstance = spyInstance;
-      this.setSpyMethod = setSpyMethod;
-      this.setSpyParamType = setSpyParamType;
-      this.diagnosticMessage = diagnosticMessage;
-    }
-
-    static SpyApiSnapshot read() {
-      try {
-        Class<?> spyApiClass = Class.forName(SPY_API_CLASS, true, null);
-        java.lang.reflect.Field spyInstanceField = spyApiClass.getDeclaredField("spyInstance");
-        spyInstanceField.setAccessible(true);
-        Object spyInstance = spyInstanceField.get(null);
-
-        // 不要写死 setSpy 的参数类型（不同 Arthas 版本可能不同）
-        // 只要满足：public static setSpy(xxx)
-        java.lang.reflect.Method setSpyMethod = null;
-        Class<?> setSpyParamType = null;
-        for (java.lang.reflect.Method m : spyApiClass.getMethods()) {
-          if (!"setSpy".equals(m.getName())) {
-            continue;
-          }
-          if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
-            continue;
-          }
-          Class<?>[] params = m.getParameterTypes();
-          if (params.length != 1) {
-            continue;
-          }
-          setSpyMethod = m;
-          setSpyParamType = params[0];
-          break;
-        }
-
-        return new SpyApiSnapshot(
-            spyApiClass, spyInstanceField, spyInstance, setSpyMethod, setSpyParamType, null);
-      } catch (ClassNotFoundException e) {
-        return new SpyApiSnapshot(null, null, null, null, null, e.getMessage());
-      } catch (NoSuchFieldException e) {
-        return new SpyApiSnapshot(null, null, null, null, null, e.getMessage());
-      } catch (ReflectiveOperationException e) {
-        return new SpyApiSnapshot(null, null, null, null, null, e.getMessage());
-      }
-    }
-
-    boolean isAvailable() {
-      return spyApiClass != null && spyInstanceField != null;
-    }
-
-    @Nullable
-    String getDiagnosticMessage() {
-      return diagnosticMessage;
-    }
-
-    @Nullable
-    Class<?> getSpyApiClass() {
-      return spyApiClass;
-    }
-
-    @Nullable
-    java.lang.reflect.Field getSpyInstanceField() {
-      return spyInstanceField;
-    }
-
-    @Nullable
-    Object getSpyInstance() {
-      return spyInstance;
-    }
-
-    @Nullable
-    Class<?> getSetSpyParamType() {
-      return setSpyParamType;
-    }
-
-    String getSpyInstanceSimpleName() {
-      if (spyInstance == null) {
-        return "null";
-      }
-      return spyInstance.getClass().getSimpleName();
-    }
-
-    String getSpyInstanceClassName() {
-      if (spyInstance == null) {
-        return "null";
-      }
-      return spyInstance.getClass().getName();
-    }
-
-    boolean isSpyImplInstalled() {
-      if (spyInstance == null) {
-        return false;
-      }
-      // 统一判定口径：只认 class name 以 SpyImpl 结尾
-      return spyInstance.getClass().getName().endsWith("SpyImpl");
-    }
-
-    void invokeSetSpy(Object spyImpl) throws ReflectiveOperationException {
-      if (spyApiClass == null) {
-        throw new ClassNotFoundException(SPY_API_CLASS);
-      }
-      if (setSpyMethod == null || setSpyParamType == null) {
-        throw new NoSuchMethodException("public static setSpy(xxx) not found on " + spyApiClass.getName());
-      }
-
-      // 关键：必须是同一份 SpyAPI$AbstractSpy 类型体系（Bootstrap）
-      if (!setSpyParamType.isInstance(spyImpl)) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("argument type mismatch. expected=")
-            .append(setSpyParamType.getName())
-            .append(" (loader=")
-            .append(setSpyParamType.getClassLoader())
-            .append(") but got=")
-            .append(spyImpl.getClass().getName())
-            .append(" (loader=")
-            .append(spyImpl.getClass().getClassLoader())
-            .append(")");
-
-        // 打印父类链，帮助定位“多份 SpyAPI / 类加载器隔离”
-        sb.append(", superTypes=");
-        Class<?> c = spyImpl.getClass();
-        boolean first = true;
-        while (c != null) {
-          if (!first) {
-            sb.append(" -> ");
-          }
-          first = false;
-          sb.append(c.getName()).append("@").append(c.getClassLoader());
-          c = c.getSuperclass();
-        }
-
-        throw new IllegalArgumentException(sb.toString());
-      }
-
-      setSpyMethod.invoke(null, spyImpl);
-    }
   }
 
   // ===== 内部类 =====
