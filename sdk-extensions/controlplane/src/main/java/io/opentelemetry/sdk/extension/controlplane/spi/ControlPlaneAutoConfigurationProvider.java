@@ -9,7 +9,7 @@ import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizer;
 import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizerProvider;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import io.opentelemetry.sdk.extension.controlplane.ControlPlaneManager;
-import io.opentelemetry.sdk.extension.controlplane.InstrumentationHolder;
+import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
@@ -213,13 +213,15 @@ public final class ControlPlaneAutoConfigurationProvider
               .setDynamicSampler(dynamicSampler);
 
       // 设置 Instrumentation（如果可用）
-      if (InstrumentationHolder.isAvailable()) {
-        managerBuilder.setInstrumentation(InstrumentationHolder.get());
+      InstrumentationProvider provider = InstrumentationProvider.getInstance();
+      if (provider.isAvailable()) {
+        managerBuilder.setInstrumentation(provider.getInstrumentation());
         logger.log(Level.INFO, "Instrumentation set for control plane manager");
       } else {
-        logger.log(Level.WARNING, 
-            "Instrumentation not available, Arthas may not work properly. " +
-            "Make sure InstrumentationHolder.set() is called in premain.");
+        logger.log(
+            Level.WARNING,
+            "Instrumentation not available. "
+                + "Make sure InstrumentationProvider.setInstrumentation() is called in premain.");
       }
 
       // 根据配置启用 Arthas

@@ -5,7 +5,6 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
-import io.opentelemetry.sdk.extension.controlplane.InstrumentationHolder;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationSnapshot;
 import java.io.Closeable;
@@ -115,7 +114,8 @@ public final class ArthasLifecycleManager implements Closeable {
   @SuppressWarnings("deprecation")
   public void setInstrumentation(@Nullable Instrumentation instrumentation) {
     // 如果调用方显式传入为空，做一次兆底尝试：可能 agent 尚未完成注入，或存在初始化时序。
-    Instrumentation effective = instrumentation != null ? instrumentation : InstrumentationHolder.get();
+    Instrumentation effective =
+        instrumentation != null ? instrumentation : InstrumentationProvider.getInstance().getInstrumentation();
     if (effective != null) {
       InstrumentationProvider.getInstance().setInstrumentation(effective);
       logger.log(Level.INFO, "Instrumentation set for Arthas lifecycle manager");

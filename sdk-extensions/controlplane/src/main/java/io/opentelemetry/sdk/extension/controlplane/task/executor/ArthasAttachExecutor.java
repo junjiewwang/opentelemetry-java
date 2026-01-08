@@ -606,7 +606,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       sb.append(". Reason: Instrumentation not available - ");
       sb.append("SpyAPI cannot be loaded to Bootstrap ClassLoader, ");
       sb.append("this may cause Arthas to fail or work in degraded mode. ");
-      sb.append("Please ensure InstrumentationHolder.set() is called in premain.");
+      sb.append("Please ensure InstrumentationProvider.setInstrumentation() is called in premain.");
     }
 
     String logSummary = getStartupLogSummary(manager);

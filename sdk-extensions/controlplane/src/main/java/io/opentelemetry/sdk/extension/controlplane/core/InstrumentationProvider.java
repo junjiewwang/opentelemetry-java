@@ -29,7 +29,6 @@ import javax.annotation.Nullable;
  * <p>获取优先级（按顺序尝试）：
  * <ol>
  *   <li>显式设置的 Instrumentation（通过 {@link #setInstrumentation}）</li>
- *   <li>controlplane 模块的 InstrumentationHolder</li>
  *   <li>javaagent-bootstrap 模块的 InstrumentationHolder（多种 ClassLoader 尝试）</li>
  *   <li>ByteBuddy Agent 动态获取</li>
  *   <li>自定义的 fallback loader</li>
@@ -227,25 +226,19 @@ public final class InstrumentationProvider {
     }
     addDiag(diagBuilder, "No explicit Instrumentation set");
 
-    // 2. 从 controlplane InstrumentationHolder 获取
-    inst = tryGetFromControlplaneHolder(diagBuilder);
-    if (inst != null) {
-      return InstrumentationSnapshot.of(inst, InstrumentationSnapshot.Source.AGENT_PREMAIN);
-    }
-
-    // 3. 从 javaagent-bootstrap InstrumentationHolder 获取（多种 ClassLoader 尝试）
+    // 2. 从 javaagent-bootstrap InstrumentationHolder 获取（多种 ClassLoader 尝试）
     inst = tryGetFromJavaagentBootstrap(diagBuilder);
     if (inst != null) {
       return InstrumentationSnapshot.of(inst, InstrumentationSnapshot.Source.JAVAAGENT_BOOTSTRAP);
     }
 
-    // 4. 通过 ByteBuddy Agent 获取
+    // 3. 通过 ByteBuddy Agent 获取
     inst = tryGetFromByteBuddyAgent(diagBuilder);
     if (inst != null) {
       return InstrumentationSnapshot.of(inst, InstrumentationSnapshot.Source.BYTEBUDDY_AGENT);
     }
 
-    // 5. 自定义 fallback loader
+    // 4. 自定义 fallback loader
     synchronized (fallbackLoaders) {
       for (FallbackLoader loader : fallbackLoaders) {
         try {
@@ -266,25 +259,6 @@ public final class InstrumentationProvider {
       diagnosticLogs.add(finalDiag);
     }
     return InstrumentationSnapshot.notAvailable(finalDiag);
-  }
-
-  /**
-   * 从 controlplane InstrumentationHolder 获取
-   */
-  @Nullable
-  private static Instrumentation tryGetFromControlplaneHolder(StringBuilder diagBuilder) {
-    try {
-      Instrumentation inst = 
-          io.opentelemetry.sdk.extension.controlplane.InstrumentationHolder.get();
-      if (inst != null) {
-        addDiag(diagBuilder, "Found from controlplane InstrumentationHolder");
-        return inst;
-      }
-      addDiag(diagBuilder, "controlplane InstrumentationHolder returned null");
-    } catch (Throwable t) {
-      addDiag(diagBuilder, "controlplane InstrumentationHolder error: " + t.getMessage());
-    }
-    return null;
   }
 
   /**
