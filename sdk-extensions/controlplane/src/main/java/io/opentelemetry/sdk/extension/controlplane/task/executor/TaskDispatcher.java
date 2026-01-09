@@ -148,6 +148,13 @@ public final class TaskDispatcher implements Closeable {
       new ConcurrentHashMap<>();
 
   /**
+   * 每个任务是否已进入终态（SUCCESS/FAILED/TIMEOUT/CANCELLED）。
+   *
+   * <p>用途：一旦终态被上报/发布，后续任何 RUNNING 事件都必须被屏蔽，避免服务端状态回退。
+   */
+  private final Set<String> terminalTasks = ConcurrentHashMap.newKeySet();
+
+  /**
    * 创建任务分发器
    *
    * @param client 控制平面客户端
@@ -201,6 +208,11 @@ public final class TaskDispatcher implements Closeable {
     String taskId = event.getTaskId();
     TaskExecutionResult result = event.toExecutionResult();
 
+    // 终态后屏蔽：一旦终态已发布，任何 RUNNING 上报都必须丢弃，避免服务端状态回退。
+    if (result.getStatus() == TaskStatus.RUNNING && terminalTasks.contains(taskId)) {
+      return;
+    }
+
     // 终态幂等：SUCCESS/FAILED/TIMEOUT/CANCELLED 只上报一次；RUNNING 可重复但会被管理器做节流/合并。
     if (result.getStatus() != TaskStatus.RUNNING) {
       AtomicReference<TaskStatus> ref =
@@ -213,6 +225,9 @@ public final class TaskDispatcher implements Closeable {
         return;
       }
       ref.set(result.getStatus());
+
+      // 记录终态发布：从这一刻起屏蔽所有 RUNNING。
+      terminalTasks.add(taskId);
     }
 
     reportResult(taskId, result);
@@ -430,6 +445,10 @@ public final class TaskDispatcher implements Closeable {
       if (finalResult.getStatus() != TaskStatus.RUNNING) {
         reportResult(taskId, finalResult);
       }
+
+      // 清理任务级状态机缓存，避免内存增长。
+      terminalTasks.remove(taskId);
+      reportedTerminalStatus.remove(taskId);
 
       // 记录任务完成日志
       if (finalResult.isSuccess()) {
