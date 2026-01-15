@@ -7,6 +7,7 @@ package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskInfo;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultRequest;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultResponse;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus;
@@ -15,7 +16,6 @@ import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEvent;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEventManager;
 import java.io.Closeable;
-import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -528,47 +528,11 @@ public final class TaskDispatcher implements Closeable {
 
   /**
    * 解析参数 JSON
+   *
+   * <p>使用 {@link JsonUtils#parseSimpleObject(String)} 进行解析
    */
   private static Map<String, Object> parseParameters(@Nullable String json) {
-    Map<String, Object> params = new HashMap<>();
-    if (json == null || json.isEmpty() || "{}".equals(json)) {
-      return params;
-    }
-
-    // 简单的 JSON 解析（不引入外部依赖）
-    // 格式：{"key1":"value1","key2":"value2"}
-    try {
-      String content = json.trim();
-      if (content.startsWith("{") && content.endsWith("}")) {
-        content = content.substring(1, content.length() - 1).trim();
-        if (!content.isEmpty()) {
-          // 简单分割（不处理嵌套对象）
-          String[] pairs = content.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
-          for (String pair : pairs) {
-            int colonIndex = pair.indexOf(':');
-            if (colonIndex > 0) {
-              String key = pair.substring(0, colonIndex).trim();
-              String value = pair.substring(colonIndex + 1).trim();
-              // 去除引号
-              key = removeQuotes(key);
-              value = removeQuotes(value);
-              params.put(key, value);
-            }
-          }
-        }
-      }
-    } catch (RuntimeException e) {
-      logger.log(Level.WARNING, "Failed to parse parameters JSON: {0}", e.getMessage());
-    }
-
-    return params;
-  }
-
-  private static String removeQuotes(String s) {
-    if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
-      return s.substring(1, s.length() - 1);
-    }
-    return s;
+    return JsonUtils.parseSimpleObject(json);
   }
 
   /**

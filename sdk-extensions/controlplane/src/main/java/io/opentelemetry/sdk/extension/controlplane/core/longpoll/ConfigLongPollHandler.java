@@ -143,6 +143,18 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
       return false;
     }
 
+    // 调试日志：输出收到的配置结果详情
+    logger.log(
+        Level.INFO,
+        "[CONFIG-PROCESS] Processing config result: hasChanges={0}, version={1}, etag={2}, currentVersion={3}, currentEtag={4}",
+        new Object[] {
+          result.hasChanges(),
+          result.getConfigVersion(),
+          result.getConfigEtag(),
+          currentConfigVersion,
+          currentConfigEtag
+        });
+
     if (result.hasChanges()) {
       String newVersion = result.getConfigVersion();
       String newEtag = result.getConfigEtag();

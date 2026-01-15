@@ -5,11 +5,14 @@
 
 package io.opentelemetry.sdk.extension.controlplane.client;
 
+import io.opentelemetry.sdk.extension.controlplane.client.response.DefaultChunkedUploadResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.response.DefaultConfigResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.response.DefaultStatusResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.response.DefaultTaskResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.response.DefaultTaskResultResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.response.DefaultUnifiedPollResponse;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -17,15 +20,25 @@ import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
 /**
- * gRPC 控制平面客户端实现
+ * gRPC 控制平面客户端实现（占位）
  *
- * <p>使用 gRPC 一元长轮询方式与控制平面服务通信，预留双向流扩展能力。
+ * <p>当前为占位实现，所有方法都将抛出 {@link UnsupportedOperationException}。
  *
- * <p>注意: 此实现需要 io.grpc 依赖，在运行时按需加载。
+ * <p>如需启用 gRPC 支持，请：
+ * <ol>
+ *   <li>添加 io.grpc 依赖
+ *   <li>生成 proto 对应的代码
+ *   <li>实现此类的各个方法
+ * </ol>
+ *
+ * <p>注意: 如果不需要 gRPC 支持，建议在 {@link ControlPlaneConfig#isGrpc()} 返回 true 时
+ * 抛出更明确的异常，而不是使用此占位实现。
  */
 public final class GrpcControlPlaneClient implements ControlPlaneClient {
 
   private static final Logger logger = Logger.getLogger(GrpcControlPlaneClient.class.getName());
+  private static final String GRPC_NOT_IMPLEMENTED = "gRPC control plane client is not implemented yet. "
+      + "Please use HTTP client by setting otel.exporter.otlp.protocol=http/protobuf";
 
   @SuppressWarnings("UnusedVariable") // 为将来 gRPC 实现预留
   private final ControlPlaneConfig config;
@@ -48,8 +61,9 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
     this.closed = new AtomicBoolean(false);
 
     logger.log(
-        Level.INFO,
-        "gRPC Control Plane client initialized (lazy), endpoint: {0}",
+        Level.WARNING,
+        "gRPC Control Plane client created but NOT IMPLEMENTED. Endpoint: {0}. "
+            + "All operations will throw UnsupportedOperationException.",
         config.getEndpoint());
   }
 
@@ -125,73 +139,56 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
   @Override
   public CompletableFuture<UnifiedPollResponse> poll(UnifiedPollRequest request) {
     checkNotClosed();
-    checkOtlpHealth();
-
-    // TODO: 当前返回占位实现
+    
+    // 返回失败响应而非抛出异常，保持 API 兼容性
+    logger.log(Level.WARNING, "gRPC poll called but not implemented");
     return CompletableFuture.completedFuture(
-        new DefaultUnifiedPollResponse(
-            /* success= */ false,
-            /* hasAnyChanges= */ false,
-            Collections.emptyMap(),
-            "gRPC not implemented yet"));
+        DefaultUnifiedPollResponse.error(GRPC_NOT_IMPLEMENTED));
   }
 
   @Override
   public CompletableFuture<ConfigResponse> getConfig(ConfigRequest request) {
     checkNotClosed();
-    checkOtlpHealth();
-
-    // TODO: 当前返回占位实现
+    
+    logger.log(Level.WARNING, "gRPC getConfig called but not implemented");
     return CompletableFuture.completedFuture(
-        new DefaultConfigResponse(
-            /* success= */ false,
-            /* hasChanges= */ false,
-            "",
-            "",
-            new byte[0],
-            "gRPC not implemented yet",
-            30000));
+        DefaultConfigResponse.error(GRPC_NOT_IMPLEMENTED));
   }
 
   @Override
   public CompletableFuture<TaskResponse> getTasks(TaskRequest request) {
     checkNotClosed();
-    checkOtlpHealth();
-
-    // TODO: 当前返回占位实现
+    
+    logger.log(Level.WARNING, "gRPC getTasks called but not implemented");
     return CompletableFuture.completedFuture(
-        new DefaultTaskResponse(
-            /* success= */ false, Collections.emptyList(), "gRPC not implemented yet", 10000));
+        DefaultTaskResponse.error(GRPC_NOT_IMPLEMENTED));
   }
 
   @Override
   public CompletableFuture<StatusResponse> reportStatus(StatusRequest request) {
     checkNotClosed();
-
-    // TODO: 当前返回占位实现
+    
+    logger.log(Level.WARNING, "gRPC reportStatus called but not implemented");
     return CompletableFuture.completedFuture(
-        new DefaultStatusResponse(
-            /* success= */ false, Collections.emptyList(), "gRPC not implemented yet", 60000));
+        DefaultStatusResponse.error(GRPC_NOT_IMPLEMENTED));
   }
 
   @Override
   public CompletableFuture<ChunkedUploadResponse> uploadChunkedResult(ChunkedTaskResult chunk) {
     checkNotClosed();
-
-    // TODO: 当前返回占位实现
+    
+    logger.log(Level.WARNING, "gRPC uploadChunkedResult called but not implemented");
     return CompletableFuture.completedFuture(
-        new DefaultChunkedUploadResponse(
-            /* success= */ false, "", -1, "FAILED", "gRPC not implemented yet"));
+        DefaultChunkedUploadResponse.error(GRPC_NOT_IMPLEMENTED));
   }
 
   @Override
   public CompletableFuture<TaskResultResponse> reportTaskResult(TaskResultRequest request) {
     checkNotClosed();
-
-    // TODO: 当前返回占位实现
+    
+    logger.log(Level.WARNING, "gRPC reportTaskResult called but not implemented");
     return CompletableFuture.completedFuture(
-        new DefaultTaskResultResponse(
-            /* success= */ false, "gRPC not implemented yet"));
+        DefaultTaskResultResponse.error(GRPC_NOT_IMPLEMENTED));
   }
 
   @Override
@@ -242,256 +239,13 @@ public final class GrpcControlPlaneClient implements ControlPlaneClient {
     }
   }
 
+  @SuppressWarnings("UnusedMethod") // 保留供将来实现使用
   private void checkOtlpHealth() {
     if (!healthMonitor.isHealthy()) {
       logger.log(
           Level.FINE,
           "OTLP is not healthy, control plane request may be delayed. State: {0}",
           healthMonitor.getState());
-    }
-  }
-
-  // ===== 默认响应实现 (与 HTTP 客户端共享) =====
-
-  private static final class DefaultUnifiedPollResponse implements UnifiedPollResponse {
-    private final boolean success;
-    private final boolean hasAnyChanges;
-    private final Map<String, PollResult> results;
-    private final String errorMessage;
-
-    DefaultUnifiedPollResponse(
-        boolean success,
-        boolean hasAnyChanges,
-        Map<String, PollResult> results,
-        String errorMessage) {
-      this.success = success;
-      this.hasAnyChanges = hasAnyChanges;
-      this.results = results;
-      this.errorMessage = errorMessage;
-    }
-
-    @Override
-    public boolean isSuccess() {
-      return success;
-    }
-
-    @Override
-    public boolean hasAnyChanges() {
-      return hasAnyChanges;
-    }
-
-    @Override
-    public Map<String, PollResult> getResults() {
-      return results;
-    }
-
-    @Override
-    public String getErrorMessage() {
-      return errorMessage;
-    }
-  }
-
-  private static final class DefaultConfigResponse implements ConfigResponse {
-    private final boolean success;
-    private final boolean hasChanges;
-    private final String configVersion;
-    private final String etag;
-    private final byte[] configData;
-    private final String errorMessage;
-    private final long suggestedPollIntervalMillis;
-
-    DefaultConfigResponse(
-        boolean success,
-        boolean hasChanges,
-        String configVersion,
-        String etag,
-        byte[] configData,
-        String errorMessage,
-        long suggestedPollIntervalMillis) {
-      this.success = success;
-      this.hasChanges = hasChanges;
-      this.configVersion = configVersion;
-      this.etag = etag;
-      this.configData = configData;
-      this.errorMessage = errorMessage;
-      this.suggestedPollIntervalMillis = suggestedPollIntervalMillis;
-    }
-
-    @Override
-    public boolean isSuccess() {
-      return success;
-    }
-
-    @Override
-    public boolean hasChanges() {
-      return hasChanges;
-    }
-
-    @Override
-    public String getConfigVersion() {
-      return configVersion;
-    }
-
-    @Override
-    public String getEtag() {
-      return etag;
-    }
-
-    @Override
-    public byte[] getConfigData() {
-      return configData;
-    }
-
-    @Override
-    public String getErrorMessage() {
-      return errorMessage;
-    }
-
-    @Override
-    public long getSuggestedPollIntervalMillis() {
-      return suggestedPollIntervalMillis;
-    }
-  }
-
-  private static final class DefaultTaskResponse implements TaskResponse {
-    private final boolean success;
-    private final List<TaskInfo> tasks;
-    private final String errorMessage;
-    private final long suggestedPollIntervalMillis;
-
-    DefaultTaskResponse(
-        boolean success,
-        List<TaskInfo> tasks,
-        String errorMessage,
-        long suggestedPollIntervalMillis) {
-      this.success = success;
-      this.tasks = tasks;
-      this.errorMessage = errorMessage;
-      this.suggestedPollIntervalMillis = suggestedPollIntervalMillis;
-    }
-
-    @Override
-    public boolean isSuccess() {
-      return success;
-    }
-
-    @Override
-    public List<TaskInfo> getTasks() {
-      return tasks;
-    }
-
-    @Override
-    public String getErrorMessage() {
-      return errorMessage;
-    }
-
-    @Override
-    public long getSuggestedPollIntervalMillis() {
-      return suggestedPollIntervalMillis;
-    }
-  }
-
-  private static final class DefaultStatusResponse implements StatusResponse {
-    private final boolean success;
-    private final List<String> acknowledgedTaskIds;
-    private final String errorMessage;
-    private final long suggestedReportIntervalMillis;
-
-    DefaultStatusResponse(
-        boolean success,
-        List<String> acknowledgedTaskIds,
-        String errorMessage,
-        long suggestedReportIntervalMillis) {
-      this.success = success;
-      this.acknowledgedTaskIds = acknowledgedTaskIds;
-      this.errorMessage = errorMessage;
-      this.suggestedReportIntervalMillis = suggestedReportIntervalMillis;
-    }
-
-    @Override
-    public boolean isSuccess() {
-      return success;
-    }
-
-    @Override
-    public List<String> getAcknowledgedTaskIds() {
-      return acknowledgedTaskIds;
-    }
-
-    @Override
-    public String getErrorMessage() {
-      return errorMessage;
-    }
-
-    @Override
-    public long getSuggestedReportIntervalMillis() {
-      return suggestedReportIntervalMillis;
-    }
-  }
-
-  private static final class DefaultChunkedUploadResponse implements ChunkedUploadResponse {
-    private final boolean success;
-    private final String uploadId;
-    private final int receivedChunkIndex;
-    private final String status;
-    private final String errorMessage;
-
-    DefaultChunkedUploadResponse(
-        boolean success,
-        String uploadId,
-        int receivedChunkIndex,
-        String status,
-        String errorMessage) {
-      this.success = success;
-      this.uploadId = uploadId;
-      this.receivedChunkIndex = receivedChunkIndex;
-      this.status = status;
-      this.errorMessage = errorMessage;
-    }
-
-    @Override
-    public boolean isSuccess() {
-      return success;
-    }
-
-    @Override
-    public String getUploadId() {
-      return uploadId;
-    }
-
-    @Override
-    public int getReceivedChunkIndex() {
-      return receivedChunkIndex;
-    }
-
-    @Override
-    public String getStatus() {
-      return status;
-    }
-
-    @Override
-    public String getErrorMessage() {
-      return errorMessage;
-    }
-  }
-
-  private static final class DefaultTaskResultResponse implements TaskResultResponse {
-    private final boolean success;
-    private final String errorMessage;
-
-    DefaultTaskResultResponse(boolean success, String errorMessage) {
-      this.success = success;
-      this.errorMessage = errorMessage;
-    }
-
-    @Override
-    public boolean isSuccess() {
-      return success;
-    }
-
-    @Override
-    public String getErrorMessage() {
-      return errorMessage;
     }
   }
 }

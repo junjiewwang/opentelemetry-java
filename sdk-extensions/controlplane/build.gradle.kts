@@ -23,7 +23,7 @@ dependencies {
   implementation(project(":exporters:sender:okhttp"))
   implementation("com.squareup.okhttp3:okhttp")
 
-  // JSON 序列化 (用于 Arthas Tunnel 协议)
+  // JSON 序列化
   implementation("com.fasterxml.jackson.core:jackson-databind")
 
   // ByteBuddy Agent（可选依赖，用于自动获取 Instrumentation）

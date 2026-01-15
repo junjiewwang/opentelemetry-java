@@ -5,12 +5,11 @@
 
 package io.opentelemetry.sdk.extension.controlplane.status;
 
-import java.nio.charset.StandardCharsets;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.logging.Level;
@@ -109,11 +108,13 @@ public final class AgentStatusAggregator {
   /**
    * 收集状态并序列化为 JSON 字节数组
    *
+   * <p>使用 {@link JsonUtils#toJsonBytes(java.util.Map)} 进行序列化
+   *
    * @return JSON 格式的字节数组
    */
   public byte[] collectAsJsonBytes() {
     Map<String, Object> data = collectAll();
-    return toJsonBytes(data);
+    return JsonUtils.toJsonBytes(data);
   }
 
   /**
@@ -233,102 +234,5 @@ public final class AgentStatusAggregator {
   @FunctionalInterface
   private interface MapValueSetter {
     void set(Map<String, Object> value);
-  }
-
-  /**
-   * 简单的 JSON 序列化实现（不依赖外部库）
-   *
-   * <p>仅支持基本类型和 Map/List 结构
-   */
-  private static byte[] toJsonBytes(Map<String, Object> data) {
-    StringBuilder sb = new StringBuilder();
-    appendJsonObject(sb, data);
-    return sb.toString().getBytes(StandardCharsets.UTF_8);
-  }
-
-  private static void appendJsonObject(StringBuilder sb, Map<String, Object> map) {
-    sb.append("{");
-    boolean first = true;
-    for (Map.Entry<String, Object> entry : map.entrySet()) {
-      if (!first) {
-        sb.append(",");
-      }
-      first = false;
-      sb.append("\"").append(escapeJson(entry.getKey())).append("\":");
-      appendJsonValue(sb, entry.getValue());
-    }
-    sb.append("}");
-  }
-
-  @SuppressWarnings("unchecked")
-  private static void appendJsonValue(StringBuilder sb, Object value) {
-    if (value == null) {
-      sb.append("null");
-    } else if (value instanceof String) {
-      sb.append("\"").append(escapeJson((String) value)).append("\"");
-    } else if (value instanceof Number) {
-      sb.append(value);
-    } else if (value instanceof Boolean) {
-      sb.append(value);
-    } else if (value instanceof Map) {
-      appendJsonObject(sb, (Map<String, Object>) value);
-    } else if (value instanceof List) {
-      appendJsonArray(sb, (List<Object>) value);
-    } else {
-      sb.append("\"").append(escapeJson(value.toString())).append("\"");
-    }
-  }
-
-  private static void appendJsonArray(StringBuilder sb, List<Object> list) {
-    sb.append("[");
-    boolean first = true;
-    for (Object item : list) {
-      if (!first) {
-        sb.append(",");
-      }
-      first = false;
-      appendJsonValue(sb, item);
-    }
-    sb.append("]");
-  }
-
-  private static String escapeJson(String str) {
-    if (str == null) {
-      return "";
-    }
-    StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < str.length(); i++) {
-      char c = str.charAt(i);
-      switch (c) {
-        case '"':
-          sb.append("\\\"");
-          break;
-        case '\\':
-          sb.append("\\\\");
-          break;
-        case '\b':
-          sb.append("\\b");
-          break;
-        case '\f':
-          sb.append("\\f");
-          break;
-        case '\n':
-          sb.append("\\n");
-          break;
-        case '\r':
-          sb.append("\\r");
-          break;
-        case '\t':
-          sb.append("\\t");
-          break;
-        default:
-          if (c < 0x20) {
-            sb.append(String.format(Locale.ROOT, "\\u%04x", (int) c));
-          } else {
-            sb.append(c);
-          }
-      }
-    }
-    return sb.toString();
   }
 }
