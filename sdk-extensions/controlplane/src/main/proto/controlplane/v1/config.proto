@@ -17,8 +17,17 @@ message ConfigRequest {
   // Agent 身份标识
   AgentIdentity agent_identity = 1;
   
+  // Agent ID 字符串（与 DTO 兼容，优先使用此字段）
+  string agent_id = 5;
+  
   // 当前配置版本 (首次请求为空)
   ConfigVersion current_version = 2;
+  
+  // 当前配置版本字符串（与 DTO 兼容）
+  string current_config_version = 6;
+  
+  // 当前配置 ETag（与 DTO 兼容）
+  string current_etag = 7;
   
   // 长轮询超时时间 (毫秒)
   int64 long_poll_timeout_millis = 3;
@@ -37,6 +46,18 @@ message ConfigResponse {
   
   // 下次轮询建议间隔 (毫秒)
   int64 suggested_poll_interval_millis = 4;
+  
+  // 配置版本字符串（与 DTO 兼容）
+  string config_version = 5;
+  
+  // 配置 ETag（与 DTO 兼容）
+  string etag = 6;
+  
+  // 是否成功（与 DTO 兼容）
+  bool success = 7;
+  
+  // 错误信息（与 DTO 兼容）
+  string error_message = 8;
 }
 
 // Agent 配置 (所有字段均支持热更新)

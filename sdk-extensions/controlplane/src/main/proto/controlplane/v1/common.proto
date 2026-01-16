@@ -30,8 +30,8 @@ message AgentIdentity {
   // 服务命名空间
   string service_namespace = 6;
   
-  // Agent 启动时间 (Unix 纳秒)
-  int64 start_time_unix_nano = 7;
+  // Agent 启动时间 (毫秒时间戳)
+  int64 start_time_millis = 7;
   
   // 扩展属性
   map<string, string> attributes = 8;
@@ -42,8 +42,8 @@ message ConfigVersion {
   // 配置版本号
   string version = 1;
   
-  // 配置时间戳 (Unix 纳秒)
-  int64 timestamp_unix_nano = 2;
+  // 配置时间戳 (毫秒时间戳)
+  int64 timestamp_millis = 2;
   
   // ETag (用于 HTTP 缓存)
   string etag = 3;

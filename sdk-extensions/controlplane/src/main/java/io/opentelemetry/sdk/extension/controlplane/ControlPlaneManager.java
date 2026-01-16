@@ -7,7 +7,7 @@ package io.opentelemetry.sdk.extension.controlplane;
 
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasConfig;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollType;
 import io.opentelemetry.sdk.extension.controlplane.core.longpoll.TaskLongPollHandler;
@@ -37,7 +37,6 @@ import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExe
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import java.io.Closeable;
-import java.io.IOException;
 import java.lang.instrument.Instrumentation;
 import java.time.Duration;
 import java.util.Map;
@@ -87,8 +86,8 @@ public final class ControlPlaneManager implements Closeable {
   private final ControlPlaneStatistics statistics;
   private final LongPollCoordinator longPollCoordinator;
 
-  // 业务组件
-  private final ControlPlaneClient client;
+  // 业务组件（Phase 5: 使用 ControlPlaneService）
+  private final ControlPlaneService service;
   private final OtlpHealthMonitor healthMonitor;
   private final DynamicConfigManager configManager;
   private final DynamicSampler dynamicSampler;
@@ -126,7 +125,8 @@ public final class ControlPlaneManager implements Closeable {
     // 初始化业务组件
     this.resultPersistence = TaskResultPersistence.create(this.config);
     this.agentIdentity = AgentIdentityProvider.get();
-    this.client = ControlPlaneClient.create(this.config, this.healthMonitor);
+    // Phase 5: 直接使用 ControlPlaneService（Protobuf-only）
+    this.service = ControlPlaneService.create(this.config, this.healthMonitor);
 
     // 初始化状态收集器
     this.statusAggregator = new AgentStatusAggregator();
@@ -156,20 +156,21 @@ public final class ControlPlaneManager implements Closeable {
             .setMaxConsecutiveErrors(this.config.getRetryMaxAttempts())
             .build();
 
+    // Phase 5: LongPollCoordinator 直接使用 ControlPlaneService
     this.longPollCoordinator =
         new LongPollCoordinator(
             longPollConfig,
-            this.client,
+            this.service,
             this.connectionStateManager,
             this.healthCheckCoordinator,
             this.statistics,
             this.agentIdentity.getAgentId());
 
-    // 初始化心跳上报器
+    // 初始化心跳上报器（Phase 5: 使用 ControlPlaneService）
     this.heartbeatReporter =
         HeartbeatReporter.builder()
             .setConfig(this.config)
-            .setClient(this.client)
+            .setService(this.service)
             .setStatusAggregator(this.statusAggregator)
             .setScheduler(this.taskManager.getScheduler())
             .setListener(this::onHeartbeatComplete)
@@ -263,9 +264,9 @@ public final class ControlPlaneManager implements Closeable {
         "[TASK-DISPATCHER-INIT] Initializing TaskDispatcher, arthasIntegration={0}",
         arthasIntegration != null ? "configured" : "null");
 
-    // 创建任务分发器
+    // 创建任务分发器（Phase 5: 使用 ControlPlaneService）
     taskDispatcher = new TaskDispatcher(
-        client,
+        service,
         agentIdentity.getAgentId(),
         taskManager.getScheduler());
 
@@ -373,14 +374,14 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   @Override
-  public void close() throws IOException {
+  public void close() {
     if (closed.compareAndSet(false, true)) {
       stop();
 
       longPollCoordinator.close();
       taskManager.close();
       heartbeatReporter.close();
-      client.close();
+      service.close();
 
       if (arthasIntegration != null) {
         arthasIntegration.close();

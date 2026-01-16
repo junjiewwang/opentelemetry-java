@@ -17,6 +17,9 @@ message TaskRequest {
   // Agent 身份标识
   AgentIdentity agent_identity = 1;
   
+  // Agent ID 字符串（与 DTO 兼容，优先使用此字段）
+  string agent_id = 4;
+  
   // 长轮询超时时间 (毫秒)
   int64 long_poll_timeout_millis = 2;
   
@@ -46,6 +49,12 @@ message TaskResponse {
   
   // 下次轮询建议间隔 (毫秒)
   int64 suggested_poll_interval_millis = 3;
+  
+  // 是否成功（与 DTO 兼容）
+  bool success = 4;
+  
+  // 错误信息（与 DTO 兼容）
+  string error_message = 5;
 }
 
 // 任务定义
@@ -53,7 +62,7 @@ message Task {
   // 任务 ID
   string task_id = 1;
   
-  // 任务类型
+  // 任务类型（枚举）
   enum TaskType {
     TASK_TYPE_UNSPECIFIED = 0;
     TASK_TYPE_THREAD_DUMP = 1;       // 线程转储
@@ -66,10 +75,13 @@ message Task {
   
   TaskType type = 2;
   
+  // 任务类型字符串（与 DTO 兼容，优先使用此字段）
+  string task_type_name = 12;
+  
   // 任务参数 (JSON 格式)
   string parameters_json = 3;
   
-  // 任务优先级
+  // 任务优先级（枚举）
   enum Priority {
     PRIORITY_UNSPECIFIED = 0;
     PRIORITY_LOW = 1;
@@ -79,14 +91,20 @@ message Task {
   
   Priority priority = 4;
   
+  // 任务优先级数值（与 DTO 兼容，0-100）
+  int32 priority_num = 13;
+  
   // 任务超时时间 (毫秒)
   int64 timeout_millis = 5;
   
-  // 任务创建时间 (Unix 纳秒)
-  int64 created_at_unix_nano = 6;
+  // 任务创建时间 (毫秒时间戳)
+  int64 created_at_millis = 6;
   
-  // 任务过期时间 (Unix 纳秒)
-  int64 expires_at_unix_nano = 7;
+  // 任务过期时间 (毫秒时间戳)
+  int64 expires_at_millis = 7;
+  
+  // 最大可接受延迟 (毫秒)，超过此延迟的任务将被拒绝
+  int64 max_acceptable_delay_millis = 14;
 }
 
 // 任务结果
@@ -106,17 +124,26 @@ message TaskResult {
   
   Status status = 2;
   
-  // 任务开始时间 (Unix 纳秒)
-  int64 started_at_unix_nano = 3;
+  // 任务开始时间 (毫秒时间戳)
+  int64 started_at_millis = 3;
   
-  // 任务完成时间 (Unix 纳秒)
-  int64 completed_at_unix_nano = 4;
+  // 任务完成时间 (毫秒时间戳)
+  int64 completed_at_millis = 4;
+  
+  // 任务执行耗时 (毫秒)
+  int64 execution_time_millis = 12;
   
   // 结果数据 (当 status 为 STATUS_RESULT_TOO_LARGE 时为空)
   bytes result_data = 5;
   
+  // 结果数据 JSON 格式（与 DTO 兼容）
+  string result_json = 13;
+  
   // 结果数据类型 (MIME type)
   string result_data_type = 6;
+  
+  // 错误码（与 DTO 兼容）
+  string error_code = 14;
   
   // 错误信息
   string error_message = 7;

@@ -1,6 +1,6 @@
 package io.opentelemetry.sdk.extension.controlplane.task.status;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionResult;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -15,6 +15,9 @@ import javax.annotation.Nullable;
  * <p>目标：
  * - **事件驱动**：执行器发射状态事件即可，避免 sleep/polling。
  * - **统一管理**：集中做去重/节流/广播，避免各执行器自己实现一套。
+ *
+ * <p><b>Phase 5 重构</b>：使用 {@link TaskExecutionResult.Status} 替代旧的
+ * {@code ControlPlaneClient.TaskStatus}。
  */
 public final class TaskStatusEventManager {
 
@@ -29,7 +32,7 @@ public final class TaskStatusEventManager {
   private final Map<String, AtomicLong> lastRunningReportAt = new ConcurrentHashMap<>();
 
   /** taskId -> terminal status set */
-  private final Map<String, TaskStatus> terminalStatus = new ConcurrentHashMap<>();
+  private final Map<String, TaskExecutionResult.Status> terminalStatus = new ConcurrentHashMap<>();
 
   public interface TaskStatusEventListener {
     void onEvent(TaskStatusEvent event);
@@ -68,8 +71,11 @@ public final class TaskStatusEventManager {
 
   private void emitRunning(String taskId, String agentId, String message) {
     // 如果已经进入终态，不再发 RUNNING
-    TaskStatus t = terminalStatus.get(taskId);
-    if (t == TaskStatus.SUCCESS || t == TaskStatus.FAILED || t == TaskStatus.TIMEOUT || t == TaskStatus.CANCELLED) {
+    TaskExecutionResult.Status t = terminalStatus.get(taskId);
+    if (t == TaskExecutionResult.Status.SUCCESS 
+        || t == TaskExecutionResult.Status.FAILED 
+        || t == TaskExecutionResult.Status.TIMEOUT 
+        || t == TaskExecutionResult.Status.CANCELLED) {
       return;
     }
 

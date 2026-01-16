@@ -5,9 +5,17 @@
 
 package io.opentelemetry.sdk.extension.controlplane.status;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.AgentStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.JvmMetrics;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.OtlpExportStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusResponse;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -33,13 +41,16 @@ import javax.annotation.Nullable;
  *   <li>记录上报成功/失败统计
  *   <li>提供心跳健康探测能力
  * </ul>
+ *
+ * <p><b>Phase 5 重构</b>：直接使用 {@link ControlPlaneService}（Protobuf-only），
+ * 消除对旧 ControlPlaneClient 的依赖。
  */
 public final class HeartbeatReporter {
 
   private static final Logger logger = Logger.getLogger(HeartbeatReporter.class.getName());
 
   private final ControlPlaneConfig config;
-  private final ControlPlaneClient client;
+  private final ControlPlaneService service;
   private final AgentStatusAggregator statusAggregator;
   private final ScheduledExecutorService scheduler;
 
@@ -71,7 +82,7 @@ public final class HeartbeatReporter {
 
   private HeartbeatReporter(Builder builder) {
     this.config = Objects.requireNonNull(builder.config, "config is required");
-    this.client = Objects.requireNonNull(builder.client, "client is required");
+    this.service = Objects.requireNonNull(builder.service, "service is required");
     this.statusAggregator =
         builder.statusAggregator != null ? builder.statusAggregator : new AgentStatusAggregator();
     this.scheduler =
@@ -228,22 +239,33 @@ public final class HeartbeatReporter {
     try {
       // 收集状态数据
       Map<String, Object> statusData = statusAggregator.collectAll();
-      byte[] jsonData = statusAggregator.collectAsJsonBytes();
+      String agentId = (String) statusData.getOrDefault("agentId", "");
 
-      // 创建状态请求
-      StatusRequestImpl request =
-          new StatusRequestImpl(
-              (String) statusData.getOrDefault("agentId", ""), jsonData);
+      // Phase 5: 直接使用 Protobuf Builder 构建请求，填充完整状态数据
+      StatusRequest.Builder requestBuilder = StatusRequest.newBuilder()
+          .setAgentIdentity(buildAgentIdentity(statusData))
+          .setAgentId(agentId)
+          .setTimestampMillis(now);
+
+      // 填充 Agent 状态
+      requestBuilder.setAgentStatus(buildAgentStatus(statusData));
+
+      // 填充 JVM 指标
+      requestBuilder.setJvmMetrics(buildJvmMetrics(statusData));
+
+      StatusRequest request = requestBuilder.build();
 
       // 发送状态上报
-      CompletableFuture<ControlPlaneClient.StatusResponse> responseFuture =
-          client.reportStatus(request);
+      CompletableFuture<StatusResponse> responseFuture = service.reportStatus(request);
 
       // 等待响应（带超时）
-      ControlPlaneClient.StatusResponse response =
-          responseFuture.get(30, TimeUnit.SECONDS);
+      StatusResponse response = responseFuture.get(30, TimeUnit.SECONDS);
 
-      if (response.isSuccess()) {
+      // Phase 5: 直接使用 Protobuf 字段判断成功
+      boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
+          || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+
+      if (success) {
         successCount.incrementAndGet();
         lastSuccessTimeMs.set(now);
         lastError = null;
@@ -257,14 +279,14 @@ public final class HeartbeatReporter {
         return true;
       } else {
         failureCount.incrementAndGet();
-        lastError = response.getErrorMessage();
+        lastError = response.getStatus().getMessage();
 
         logger.log(
             Level.WARNING,
             "Heartbeat #{0} failed: {1}",
-            new Object[] {count, response.getErrorMessage()});
+            new Object[] {count, response.getStatus().getMessage()});
 
-        notifyListener(/* success= */ false, statusData, response.getErrorMessage());
+        notifyListener(/* success= */ false, statusData, response.getStatus().getMessage());
         return false;
       }
     } catch (InterruptedException e) {
@@ -321,31 +343,205 @@ public final class HeartbeatReporter {
     }
   }
 
-  /** StatusRequest 实现 */
-  private static final class StatusRequestImpl implements ControlPlaneClient.StatusRequest {
-    private final String agentId;
-    private final byte[] statusData;
+  /**
+   * 从收集的状态数据构建 AgentIdentity Protobuf 消息
+   */
+  @SuppressWarnings("unchecked")
+  private static AgentIdentity buildAgentIdentity(Map<String, Object> statusData) {
+    AgentIdentity.Builder builder = AgentIdentity.newBuilder();
 
-    StatusRequestImpl(String agentId, byte[] statusData) {
-      this.agentId = agentId;
-      this.statusData = statusData;
+    // agent_id
+    String agentId = (String) statusData.get("agentId");
+    if (agentId != null) {
+      builder.setAgentId(agentId);
     }
 
-    @Override
-    public String getAgentId() {
-      return agentId;
+    // host_name
+    String hostname = (String) statusData.get("hostname");
+    if (hostname != null) {
+      builder.setHostName(hostname);
     }
 
-    @Override
-    public byte[] getStatusData() {
-      return statusData;
+    // process_id
+    String processId = (String) statusData.get("processId");
+    if (processId != null) {
+      builder.setProcessId(processId);
     }
+
+    // sdk_version
+    String sdkVersion = (String) statusData.get("sdkVersion");
+    if (sdkVersion != null) {
+      builder.setSdkVersion(sdkVersion);
+    }
+
+    // service_name
+    String serviceName = (String) statusData.get("serviceName");
+    if (serviceName != null) {
+      builder.setServiceName(serviceName);
+    }
+
+    // service_namespace
+    String serviceNamespace = (String) statusData.get("serviceNamespace");
+    if (serviceNamespace != null) {
+      builder.setServiceNamespace(serviceNamespace);
+    }
+
+    // start_time_millis
+    Object startupTimestamp = statusData.get("startupTimestamp");
+    if (startupTimestamp instanceof Number) {
+      builder.setStartTimeMillis(((Number) startupTimestamp).longValue());
+    }
+
+    // attributes (from labels)
+    Object labels = statusData.get("labels");
+    if (labels instanceof Map) {
+      Map<String, String> labelsMap = (Map<String, String>) labels;
+      builder.putAllAttributes(labelsMap);
+    }
+
+    return builder.build();
+  }
+
+  /**
+   * 从收集的状态数据构建 AgentStatus Protobuf 消息
+   */
+  private static AgentStatus buildAgentStatus(Map<String, Object> statusData) {
+    AgentStatus.Builder builder = AgentStatus.newBuilder();
+
+    // 设置运行状态
+    String runningState = (String) statusData.get("runningState");
+    if (runningState != null) {
+      try {
+        builder.setState(AgentStatus.RunningState.valueOf("RUNNING_STATE_" + runningState.toUpperCase(Locale.ROOT)));
+      } catch (IllegalArgumentException e) {
+        builder.setState(AgentStatus.RunningState.RUNNING_STATE_RUNNING);
+      }
+    } else {
+      builder.setState(AgentStatus.RunningState.RUNNING_STATE_RUNNING);
+    }
+
+    // 设置配置版本
+    String configVersion = (String) statusData.get("configVersion");
+    if (configVersion != null) {
+      builder.setCurrentConfigVersion(configVersion);
+    }
+
+    // 设置运行时长
+    Object uptimeMs = statusData.get("uptimeMs");
+    if (uptimeMs instanceof Number) {
+      builder.setUptimeMillis(((Number) uptimeMs).longValue());
+    }
+
+    // 设置 OTLP 导出状态
+    builder.setOtlpStatus(buildOtlpExportStatus(statusData));
+
+    return builder.build();
+  }
+
+  /**
+   * 从收集的状态数据构建 OtlpExportStatus Protobuf 消息
+   */
+  private static OtlpExportStatus buildOtlpExportStatus(Map<String, Object> statusData) {
+    OtlpExportStatus.Builder builder = OtlpExportStatus.newBuilder();
+
+    // 设置健康状态
+    String otlpHealthState = (String) statusData.get("otlpHealthState");
+    if (otlpHealthState != null) {
+      try {
+        builder.setState(OtlpExportStatus.HealthState.valueOf("HEALTH_STATE_" + otlpHealthState.toUpperCase(Locale.ROOT)));
+      } catch (IllegalArgumentException e) {
+        builder.setState(OtlpExportStatus.HealthState.HEALTH_STATE_UNKNOWN);
+      }
+    }
+
+    // 从 spanExportStats 提取统计信息
+    @SuppressWarnings("unchecked")
+    Map<String, Object> exportStats = (Map<String, Object>) statusData.get("spanExportStats");
+    if (exportStats != null) {
+      Object successCount = exportStats.get("successCount");
+      if (successCount instanceof Number) {
+        builder.setSuccessCount(((Number) successCount).longValue());
+      }
+      Object failureCount = exportStats.get("failureCount");
+      if (failureCount instanceof Number) {
+        builder.setFailureCount(((Number) failureCount).longValue());
+      }
+      Object lastExportTime = exportStats.get("lastExportTime");
+      if (lastExportTime instanceof Number) {
+        builder.setLastSuccessTimeMillis(((Number) lastExportTime).longValue());
+      }
+      String lastError = (String) exportStats.get("lastError");
+      if (lastError != null) {
+        builder.setLastErrorMessage(lastError);
+      }
+    }
+
+    return builder.build();
+  }
+
+  /**
+   * 从收集的状态数据构建 JvmMetrics Protobuf 消息
+   */
+  private static JvmMetrics buildJvmMetrics(Map<String, Object> statusData) {
+    JvmMetrics.Builder builder = JvmMetrics.newBuilder();
+
+    // 堆内存
+    Object heapMemoryUsed = statusData.get("heapMemoryUsed");
+    if (heapMemoryUsed instanceof Number) {
+      builder.setHeapMemoryUsed(((Number) heapMemoryUsed).longValue());
+    }
+
+    Object heapMemoryMax = statusData.get("heapMemoryMax");
+    if (heapMemoryMax instanceof Number) {
+      builder.setHeapMemoryMax(((Number) heapMemoryMax).longValue());
+    }
+
+    // 非堆内存
+    Object nonHeapMemoryUsed = statusData.get("nonHeapMemoryUsed");
+    if (nonHeapMemoryUsed instanceof Number) {
+      builder.setNonHeapMemoryUsed(((Number) nonHeapMemoryUsed).longValue());
+    }
+
+    // 线程
+    Object threadCount = statusData.get("threadCount");
+    if (threadCount instanceof Number) {
+      builder.setThreadCount(((Number) threadCount).intValue());
+    }
+
+    Object daemonThreadCount = statusData.get("daemonThreadCount");
+    if (daemonThreadCount instanceof Number) {
+      builder.setDaemonThreadCount(((Number) daemonThreadCount).intValue());
+    }
+
+    // GC 信息
+    Object gcCount = statusData.get("gcCount");
+    if (gcCount instanceof Number) {
+      builder.setGcCount(((Number) gcCount).longValue());
+    }
+
+    Object gcTimeMillis = statusData.get("gcTimeMillis");
+    if (gcTimeMillis instanceof Number) {
+      builder.setGcTimeMillis(((Number) gcTimeMillis).longValue());
+    }
+
+    // CPU
+    Object cpuUsage = statusData.get("cpuUsage");
+    if (cpuUsage instanceof Number) {
+      builder.setCpuUsage(((Number) cpuUsage).doubleValue());
+    }
+
+    Object systemLoadAverage = statusData.get("systemLoadAverage");
+    if (systemLoadAverage instanceof Number) {
+      builder.setSystemLoadAverage(((Number) systemLoadAverage).doubleValue());
+    }
+
+    return builder.build();
   }
 
   /** Builder for HeartbeatReporter */
   public static final class Builder {
     @Nullable private ControlPlaneConfig config;
-    @Nullable private ControlPlaneClient client;
+    @Nullable private ControlPlaneService service;
     @Nullable private AgentStatusAggregator statusAggregator;
     @Nullable private ScheduledExecutorService scheduler;
     @Nullable private HeartbeatListener listener;
@@ -357,8 +553,16 @@ public final class HeartbeatReporter {
       return this;
     }
 
-    public Builder setClient(ControlPlaneClient client) {
-      this.client = client;
+    /**
+     * 设置控制平面服务
+     *
+     * <p><b>Phase 5</b>：使用 {@link ControlPlaneService}（Protobuf-only）。
+     *
+     * @param service 控制平面服务
+     * @return this builder
+     */
+    public Builder setService(ControlPlaneService service) {
+      this.service = service;
       return this;
     }
 
@@ -381,8 +585,8 @@ public final class HeartbeatReporter {
       if (config == null) {
         throw new IllegalStateException("config is required");
       }
-      if (client == null) {
-        throw new IllegalStateException("client is required");
+      if (service == null) {
+        throw new IllegalStateException("service is required");
       }
       if (statusAggregator == null) {
         statusAggregator = new AgentStatusAggregator();

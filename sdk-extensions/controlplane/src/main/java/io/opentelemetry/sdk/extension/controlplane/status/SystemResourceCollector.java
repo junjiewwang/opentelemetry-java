@@ -56,14 +56,39 @@ public final class SystemResourceCollector implements AgentStatusCollector {
     MemoryUsage nonHeapUsage = memoryMxBean.getNonHeapMemoryUsage();
     data.put("nonHeapMemoryUsed", nonHeapUsage.getUsed());
 
+    // 收集线程信息
+    java.lang.management.ThreadMXBean threadMxBean = ManagementFactory.getThreadMXBean();
+    data.put("threadCount", threadMxBean.getThreadCount());
+    data.put("daemonThreadCount", threadMxBean.getDaemonThreadCount());
+
+    // 收集 GC 信息
+    long gcCount = 0;
+    long gcTimeMillis = 0;
+    for (java.lang.management.GarbageCollectorMXBean gcBean : ManagementFactory.getGarbageCollectorMXBeans()) {
+      long count = gcBean.getCollectionCount();
+      long time = gcBean.getCollectionTime();
+      if (count >= 0) {
+        gcCount += count;
+      }
+      if (time >= 0) {
+        gcTimeMillis += time;
+      }
+    }
+    data.put("gcCount", gcCount);
+    data.put("gcTimeMillis", gcTimeMillis);
+
     // 尝试收集 CPU 使用率
     double cpuUsage = getCpuUsage();
     if (cpuUsage >= 0) {
       data.put("cpuUsage", cpuUsage);
     }
 
-    // 收集线程信息
-    data.put("threadCount", ManagementFactory.getThreadMXBean().getThreadCount());
+    // 收集系统负载
+    OperatingSystemMXBean osMxBean = ManagementFactory.getOperatingSystemMXBean();
+    double loadAverage = osMxBean.getSystemLoadAverage();
+    if (loadAverage >= 0) {
+      data.put("systemLoadAverage", loadAverage);
+    }
 
     return data;
   }

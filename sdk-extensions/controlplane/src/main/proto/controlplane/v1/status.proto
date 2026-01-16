@@ -19,6 +19,9 @@ message StatusRequest {
   // Agent 身份标识
   AgentIdentity agent_identity = 1;
   
+  // Agent ID 字符串（与 DTO 兼容，优先使用此字段）
+  string agent_id = 7;
+  
   // Agent 状态
   AgentStatus agent_status = 2;
   
@@ -31,8 +34,11 @@ message StatusRequest {
   // 配置确认
   ConfigAcknowledgement config_ack = 5;
   
-  // 上报时间 (Unix 纳秒)
-  int64 timestamp_unix_nano = 6;
+  // 上报时间 (毫秒时间戳)
+  int64 timestamp_millis = 6;
+  
+  // 状态数据（JSON 字节数据，与 DTO 兼容）
+  bytes status_data = 8;
 }
 
 // 状态上报响应
@@ -40,14 +46,20 @@ message StatusResponse {
   // 响应状态
   ResponseStatus status = 1;
   
-  // 服务端时间 (Unix 纳秒)
-  int64 server_time_unix_nano = 2;
+  // 服务端时间 (毫秒时间戳)
+  int64 server_time_millis = 2;
   
   // 下次上报建议间隔 (毫秒)
   int64 suggested_report_interval_millis = 3;
   
   // 已确认接收的任务结果 ID 列表
   repeated string acknowledged_task_ids = 4;
+  
+  // 是否成功（与 DTO 兼容）
+  bool success = 5;
+  
+  // 错误信息（与 DTO 兼容）
+  string error_message = 6;
 }
 
 // Agent 状态
@@ -89,11 +101,11 @@ message OtlpExportStatus {
   
   HealthState state = 1;
   
-  // 最后一次成功导出时间 (Unix 纳秒)
-  int64 last_success_time_unix_nano = 2;
+  // 最后一次成功导出时间 (毫秒时间戳)
+  int64 last_success_time_millis = 2;
   
-  // 最后一次失败时间 (Unix 纳秒)
-  int64 last_failure_time_unix_nano = 3;
+  // 最后一次失败时间 (毫秒时间戳)
+  int64 last_failure_time_millis = 3;
   
   // 成功导出计数
   int64 success_count = 4;
@@ -118,8 +130,8 @@ message ControlPlaneStatus {
   
   ConnectionState state = 1;
   
-  // 最后一次连接时间 (Unix 纳秒)
-  int64 last_connected_time_unix_nano = 2;
+  // 最后一次连接时间 (毫秒时间戳)
+  int64 last_connected_time_millis = 2;
   
   // 重连次数
   int32 reconnect_count = 3;

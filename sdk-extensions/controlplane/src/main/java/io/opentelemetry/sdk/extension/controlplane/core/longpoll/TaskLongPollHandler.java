@@ -5,15 +5,17 @@
 
 package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.PollResult;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskInfo;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskRequest;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResponse;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultRequest;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultResponse;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskResponse;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import java.util.HashMap;
@@ -36,6 +38,9 @@ import javax.annotation.Nullable;
  *   <li>独立模式：通过 poll() 方法直接调用 /v1/control/poll/tasks
  *   <li>统一模式：通过 processUnifiedResult() 处理 /v1/control/poll 响应中的 TASK 部分
  * </ul>
+ *
+ * <p><b>Phase 5 重构</b>：直接使用 {@link ControlPlaneService}（Protobuf-only），
+ * 使用 Protobuf {@link Task} 代替旧的 TaskInfo DTO。
  */
 public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> {
 
@@ -56,7 +61,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
     VALID_WITH_WARNING
   }
 
-  private final ControlPlaneClient client;
+  private final ControlPlaneService service;
   private final ControlPlaneStatistics statistics;
   private final LongPollConfig config;
   private final String agentId;
@@ -72,19 +77,19 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   /**
    * 创建任务长轮询处理器
    *
-   * @param client 控制平面客户端
+   * @param service 控制平面服务（Protobuf-only）
    * @param statistics 统计管理器
    * @param config 长轮询配置
    * @param agentId Agent ID
    * @param running 运行状态标志
    */
   public TaskLongPollHandler(
-      ControlPlaneClient client,
+      ControlPlaneService service,
       ControlPlaneStatistics statistics,
       LongPollConfig config,
       String agentId,
       AtomicBoolean running) {
-    this.client = client;
+    this.service = service;
     this.statistics = statistics;
     this.config = config;
     this.agentId = agentId;
@@ -107,18 +112,23 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
 
   @Override
   public HandlerResult handleResponse(TaskResponse response) {
-    if (!response.isSuccess()) {
+    // Phase 5: 直接使用 Protobuf 字段判断成功
+    boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
+        || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+    
+    if (!success) {
       logger.log(
           Level.WARNING,
           "[TASK-ERROR] Task response error from server: {0}",
-          response.getErrorMessage());
+          response.getStatus().getMessage());
       taskLogger.logTaskProgress(
-          currentTaskId, "task_error", "Task response error: " + response.getErrorMessage());
+          currentTaskId, "task_error", "Task response error: " + response.getStatus().getMessage());
       return HandlerResult.noChange();
     }
 
-    List<TaskInfo> taskList = response.getTasks();
-    if (taskList != null && !taskList.isEmpty()) {
+    List<Task> taskList = response.getTasksList();
+    // Protobuf getTasksList() 永远返回非 null 列表，直接检查是否为空
+    if (!taskList.isEmpty()) {
       int taskCount = taskList.size();
       
       // 记录收到的任务列表
@@ -132,7 +142,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
 
       // 处理每个任务
       int processedCount = 0;
-      for (TaskInfo task : taskList) {
+      for (Task task : taskList) {
         processTask(task);
         processedCount++;
       }
@@ -159,7 +169,9 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    *
    * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 TASK 部分
    *
-   * @param result 轮询结果
+   * <p><b>Phase 5</b>：直接使用 Protobuf PollResult 和 Task。
+   *
+   * @param result 轮询结果（Protobuf）
    * @return 是否成功处理
    */
   public boolean processUnifiedResult(PollResult result) {
@@ -169,19 +181,19 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       return false;
     }
 
-    List<TaskInfo> tasks = result.getTasks();
+    // Phase 5: 直接使用 Protobuf 任务列表（永远不为 null）
+    List<Task> tasks = result.getTasksList();
     
     // 增强诊断日志：无论是否有任务都输出详细信息
     logger.log(
         Level.INFO,
-        "[TASK-POLL] Processing unified result: hasChanges={0}, tasksNull={1}, taskCount={2}",
+        "[TASK-POLL] Processing unified result: hasChanges={0}, taskCount={1}",
         new Object[] {
-          result.hasChanges(),
-          tasks == null,
-          tasks != null ? tasks.size() : 0
+          result.getHasChanges(),
+          tasks.size()
         });
     
-    if (result.hasChanges() && tasks != null && !tasks.isEmpty()) {
+    if (result.getHasChanges() && !tasks.isEmpty()) {
       int taskCount = tasks.size();
       
       // 记录任务列表摘要
@@ -195,7 +207,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
 
       // 处理每个任务并记录详情
       int processedCount = 0;
-      for (TaskInfo task : tasks) {
+      for (Task task : tasks) {
         processTask(task);
         processedCount++;
       }
@@ -212,18 +224,18 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       // 增强诊断：输出更多细节
       logger.log(
           Level.INFO,
-          "[TASK-POLL] No pending tasks via unified poll: hasChanges={0}, tasksNull={1}, taskCount={2}",
+          "[TASK-POLL] No pending tasks via unified poll: hasChanges={0}, taskCount={1}",
           new Object[] {
-            result.hasChanges(),
-            tasks == null,
-            tasks != null ? tasks.size() : 0
+            result.getHasChanges(),
+            tasks.size()
           });
       taskLogger.logTaskProgress(
           currentTaskId,
           "no_tasks",
           String.format(
-              "No pending tasks (hasChanges=%s, tasksNull=%s)",
-              result.hasChanges(), tasks == null));
+              Locale.ROOT,
+              "No pending tasks (hasChanges=%s, taskCount=%d)",
+              result.getHasChanges(), tasks.size()));
       return true;
     }
   }
@@ -231,12 +243,18 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   /**
    * 处理单个任务
    *
-   * @param task 任务信息
+   * <p><b>Phase 5</b>：直接使用 Protobuf Task。
+   *
+   * @param task 任务信息（Protobuf）
    */
-  private void processTask(TaskInfo task) {
+  private void processTask(Task task) {
     String subTaskId = task.getTaskId();
-    String taskType = task.getTaskType();
-    int priority = task.getPriority();
+    // Phase 5: 优先使用字符串类型的 taskTypeName，兼容枚举类型
+    String taskType = task.getTaskTypeName().isEmpty() 
+        ? task.getType().name() : task.getTaskTypeName();
+    // Phase 5: 优先使用数值类型的 priorityNum，兼容枚举类型
+    int priority = task.getPriorityNum() > 0 
+        ? task.getPriorityNum() : task.getPriority().getNumber();
     long timeoutMillis = task.getTimeoutMillis();
     String paramsJson = task.getParametersJson();
     long createdAtMillis = task.getCreatedAtMillis();
@@ -273,7 +291,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
         taskLogger.logTaskFailed(subTaskId, "TASK_EXPIRED", expiredErrorMsg);
         // 上报服务端：使用 FAILED + error_code 模式
         reportTaskResultToServer(
-            subTaskId, TaskStatus.FAILED, "TASK_EXPIRED", expiredErrorMsg, nowMillis);
+            subTaskId, TaskResultStatus.TASK_RESULT_STATUS_FAILED, "TASK_EXPIRED", expiredErrorMsg, nowMillis);
         return;
         
       case STALE:
@@ -291,7 +309,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
         taskLogger.logTaskFailed(subTaskId, "TASK_STALE", staleErrorMsg);
         // 上报服务端：使用 FAILED + error_code 模式
         reportTaskResultToServer(
-            subTaskId, TaskStatus.FAILED, "TASK_STALE", staleErrorMsg, nowMillis);
+            subTaskId, TaskResultStatus.TASK_RESULT_STATUS_FAILED, "TASK_STALE", staleErrorMsg, nowMillis);
         return;
         
       case VALID_WITH_WARNING:
@@ -319,7 +337,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
             .put("expiresAt", expiresAtMillis)
             .put("maxAcceptableDelay", maxAcceptableDelayMillis)
             .put("actualDelay", delayMillis)
-            .put("params", paramsJson != null ? paramsJson : "{}")
+            .put("params", paramsJson.isEmpty() ? "{}" : paramsJson)
             .build());
 
     // 确认单个任务已接收
@@ -335,54 +353,62 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   /**
    * 分发任务到执行器
    *
-   * @param task 任务信息
+   * <p><b>Phase 5</b>：直接使用 Protobuf Task。
+   *
+   * @param task 任务信息（Protobuf）
    */
-  private void dispatchTask(TaskInfo task) {
+  private void dispatchTask(Task task) {
     TaskDispatcher dispatcher = this.taskDispatcher;
     if (dispatcher == null) {
+      String taskType = task.getTaskTypeName().isEmpty() 
+          ? task.getType().name() : task.getTaskTypeName();
       logger.log(
           Level.WARNING,
           "[TASK-NO-DISPATCHER] TaskDispatcher not configured, task will not be executed: taskId={0}, type={1}",
-          new Object[] {task.getTaskId(), task.getTaskType()});
+          new Object[] {task.getTaskId(), taskType});
       // 上报失败：无分发器
       long nowMillis = System.currentTimeMillis();
       reportTaskResultToServer(
           task.getTaskId(),
-          TaskStatus.FAILED,
+          TaskResultStatus.TASK_RESULT_STATUS_FAILED,
           "NO_DISPATCHER",
           "TaskDispatcher not configured",
           nowMillis);
       return;
     }
 
+    String taskType = task.getTaskTypeName().isEmpty() 
+        ? task.getType().name() : task.getTaskTypeName();
+
     // 检查是否有对应的执行器
-    if (!dispatcher.hasExecutor(task.getTaskType())) {
+    if (!dispatcher.hasExecutor(taskType)) {
       logger.log(
           Level.WARNING,
           "[TASK-NO-EXECUTOR] No executor registered for task type: {0}, taskId={1}",
-          new Object[] {task.getTaskType(), task.getTaskId()});
+          new Object[] {taskType, task.getTaskId()});
       // TaskDispatcher.dispatchWithResult 内部会处理无执行器的情况并上报
     }
 
     // 分发任务（使用新的返回详细结果的方法）
+    // Phase 5: 直接传递 Protobuf Task
     TaskDispatcher.DispatchResult result = dispatcher.dispatchWithResult(task);
     
     if (result.isSuccess()) {
       logger.log(
           Level.INFO,
           "[TASK-DISPATCHED] Task dispatched to executor: taskId={0}, type={1}",
-          new Object[] {task.getTaskId(), task.getTaskType()});
+          new Object[] {task.getTaskId(), taskType});
     } else if (result.isAlreadyRunning()) {
       // 任务已经在运行中，向服务端上报 RUNNING 状态
       // 这样服务端就知道任务正在执行，不会重复下发
       logger.log(
           Level.INFO,
           "[TASK-ALREADY-RUNNING] Task already running, reporting RUNNING status to server: taskId={0}, type={1}",
-          new Object[] {task.getTaskId(), task.getTaskType()});
+          new Object[] {task.getTaskId(), taskType});
       long nowMillis = System.currentTimeMillis();
       reportTaskResultToServer(
           task.getTaskId(),
-          TaskStatus.RUNNING,
+          TaskResultStatus.TASK_RESULT_STATUS_RUNNING,
           null,
           "Task is already running",
           nowMillis);
@@ -392,7 +418,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       logger.log(
           Level.WARNING,
           "[TASK-DISPATCH-FAILED] Failed to dispatch task: taskId={0}, type={1}, reason={2}",
-          new Object[] {task.getTaskId(), task.getTaskType(), result.getMessage()});
+          new Object[] {task.getTaskId(), taskType, result.getMessage()});
     }
   }
 
@@ -428,71 +454,36 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   /**
    * 上报任务结果到服务端
    *
+   * <p><b>Phase 5</b>：直接使用 Protobuf TaskResultRequest。
+   *
    * @param taskId 任务 ID
-   * @param status 任务状态
+   * @param status 任务状态（Protobuf 枚举）
    * @param errorCode 错误码
    * @param errorMessage 错误信息
    * @param completedAtMillis 完成时间
    */
   private void reportTaskResultToServer(
       String taskId,
-      TaskStatus status,
+      TaskResultStatus status,
       @Nullable String errorCode,
       @Nullable String errorMessage,
       long completedAtMillis) {
     
-    TaskResultRequest request = new TaskResultRequest() {
-      @Override
-      public String getTaskId() {
-        return taskId;
-      }
-
-      @Override
-      public String getAgentId() {
-        return agentId;
-      }
-
-      @Override
-      public TaskStatus getStatus() {
-        return status;
-      }
-
-      @Override
-      @Nullable
-      public String getErrorCode() {
-        return errorCode;
-      }
-
-      @Override
-      @Nullable
-      public String getErrorMessage() {
-        return errorMessage;
-      }
-
-      @Override
-      @Nullable
-      public String getResultJson() {
-        return null;
-      }
-
-      @Override
-      public long getStartedAtMillis() {
-        return completedAtMillis; // 对于被拒绝的任务，开始和完成时间相同
-      }
-
-      @Override
-      public long getCompletedAtMillis() {
-        return completedAtMillis;
-      }
-
-      @Override
-      public long getExecutionTimeMillis() {
-        return 0; // 被拒绝的任务没有执行时间
-      }
-    };
+    // Phase 5: 直接使用 Protobuf Builder
+    TaskResultRequest request = TaskResultRequest.newBuilder()
+        .setTaskId(taskId)
+        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
+        .setAgentId(agentId)
+        .setStatus(status)
+        .setErrorCode(errorCode != null ? errorCode : "")
+        .setErrorMessage(errorMessage != null ? errorMessage : "")
+        .setStartedAtMillis(completedAtMillis)
+        .setCompletedAtMillis(completedAtMillis)
+        .setExecutionTimeMillis(0)
+        .build();
 
     // 异步上报，不阻塞主流程
-    CompletableFuture<TaskResultResponse> future = client.reportTaskResult(request);
+    CompletableFuture<TaskResultResponse> future = service.reportTaskResult(request);
     @SuppressWarnings("FutureReturnValueIgnored")
     Object unused = future.whenComplete((response, error) -> {
       if (error != null) {
@@ -500,11 +491,11 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
             Level.WARNING,
             "[TASK-REPORT] Failed to report task result: taskId={0}, error={1}",
             new Object[] {taskId, error.getMessage()});
-      } else if (response != null && !response.isSuccess()) {
+      } else if (response != null && !response.getAcknowledged()) {
         logger.log(
             Level.WARNING,
             "[TASK-REPORT] Server rejected task result: taskId={0}, error={1}",
-            new Object[] {taskId, response.getErrorMessage()});
+            new Object[] {taskId, response.getStatus().getMessage()});
       } else {
         logger.log(
             Level.INFO,
@@ -517,10 +508,12 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   /**
    * 验证任务时效性
    *
-   * @param task 任务信息
+   * <p><b>Phase 5</b>：直接使用 Protobuf Task。
+   *
+   * @param task 任务信息（Protobuf）
    * @return 验证结果
    */
-  private static TaskValidationResult validateTask(TaskInfo task) {
+  private static TaskValidationResult validateTask(Task task) {
     long nowMillis = System.currentTimeMillis();
     long createdAtMillis = task.getCreatedAtMillis();
     long expiresAtMillis = task.getExpiresAtMillis();
@@ -575,12 +568,14 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    *
    * <p>直接调用 /v1/control/poll/tasks 端点
    *
-   * @return 任务响应 Future
+   * <p><b>Phase 5</b>：返回 Protobuf TaskResponse。
+   *
+   * @return 任务响应 Future（Protobuf）
    */
   @Override
   public CompletableFuture<TaskResponse> poll() {
     statistics.recordTaskPoll();
-    return client.getTasks(createTaskRequest());
+    return service.getTasks(createTaskRequest());
   }
 
   /**
@@ -593,18 +588,16 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
     this.currentTaskId = taskId;
   }
 
-  /** 创建任务请求 */
+  /**
+   * 创建任务请求
+   *
+   * <p><b>Phase 5</b>：直接使用 Protobuf Builder。
+   */
   private TaskRequest createTaskRequest() {
-    return new TaskRequest() {
-      @Override
-      public String getAgentId() {
-        return agentId;
-      }
-
-      @Override
-      public long getLongPollTimeoutMillis() {
-        return config.getTimeoutMillis();
-      }
-    };
+    return TaskRequest.newBuilder()
+        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
+        .setAgentId(agentId)
+        .setLongPollTimeoutMillis(config.getTimeoutMillis())
+        .build();
   }
 }

@@ -5,10 +5,13 @@
 
 package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.PollResult;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.UnifiedPollRequest;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.UnifiedPollResponse;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollResponse;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
@@ -46,6 +49,9 @@ import javax.annotation.Nullable;
  * </ul>
  *
  * <p>采用单线程事件循环模式，避免并发问题：一个长轮询请求在飞行中时，不会发起第二个请求。
+ *
+ * <p><b>Phase 5 重构</b>：直接使用 {@link ControlPlaneService}（Protobuf-only），
+ * 消除中间 DTO 转换层，提升性能和类型安全。
  */
 public final class LongPollCoordinator implements Closeable {
 
@@ -68,8 +74,8 @@ public final class LongPollCoordinator implements Closeable {
   // 配置
   private final LongPollConfig config;
 
-  // 依赖组件
-  private final ControlPlaneClient client;
+  // 依赖组件（Phase 5: 直接使用 ControlPlaneService）
+  private final ControlPlaneService service;
   private final ConnectionStateManager connectionStateManager;
   private final HealthCheckCoordinator healthCheckCoordinator;
   private final ControlPlaneStatistics statistics;
@@ -97,7 +103,7 @@ public final class LongPollCoordinator implements Closeable {
    * 创建长轮询协调器
    *
    * @param config 长轮询配置
-   * @param client 控制平面客户端
+   * @param service 控制平面服务（Protobuf-only）
    * @param connectionStateManager 连接状态管理器
    * @param healthCheckCoordinator 健康检查协调器
    * @param statistics 统计管理器
@@ -105,13 +111,13 @@ public final class LongPollCoordinator implements Closeable {
    */
   public LongPollCoordinator(
       LongPollConfig config,
-      ControlPlaneClient client,
+      ControlPlaneService service,
       ConnectionStateManager connectionStateManager,
       HealthCheckCoordinator healthCheckCoordinator,
       ControlPlaneStatistics statistics,
       String agentId) {
     this.config = config;
-    this.client = client;
+    this.service = service;
     this.connectionStateManager = connectionStateManager;
     this.healthCheckCoordinator = healthCheckCoordinator;
     this.statistics = statistics;
@@ -127,8 +133,8 @@ public final class LongPollCoordinator implements Closeable {
 
     // 初始化 Handler 列表（默认注册配置和任务处理器）
     this.handlers = new ArrayList<>();
-    this.registerHandler(new ConfigLongPollHandler(client, statistics, config, agentId, running))
-        .registerHandler(new TaskLongPollHandler(client, statistics, config, agentId, running));
+    this.registerHandler(new ConfigLongPollHandler(service, statistics, config, agentId, running))
+        .registerHandler(new TaskLongPollHandler(service, statistics, config, agentId, running));
   }
 
   /**
@@ -375,6 +381,8 @@ public final class LongPollCoordinator implements Closeable {
    * <p>一次请求同时获取配置和任务更新，然后分发给各 Handler 处理。 遵循开闭原则：新增轮询类型只需注册
    * Handler，无需修改此方法。
    *
+   * <p><b>Phase 5</b>：直接使用 Protobuf 消息，无需 DTO 转换。
+   *
    * @param taskId 任务ID
    * @param count 轮询计数
    * @return 是否成功
@@ -399,12 +407,12 @@ public final class LongPollCoordinator implements Closeable {
     statistics.recordConfigPoll();
     statistics.recordTaskPoll();
 
-    // 构建统一请求
+    // 构建 Protobuf 请求（Phase 5: 直接使用 Protobuf Builder）
     UnifiedPollRequest request = createUnifiedPollRequest();
 
     try {
       // 发起统一轮询请求
-      CompletableFuture<UnifiedPollResponse> future = client.poll(request);
+      CompletableFuture<UnifiedPollResponse> future = service.poll(request);
       
       // 等待响应（带超时）
       long timeout = config.getTimeoutMillis() + 5000;
@@ -433,14 +441,19 @@ public final class LongPollCoordinator implements Closeable {
    *
    * <p>将响应中的各类型结果分发给对应的 Handler 处理
    *
+   * <p><b>Phase 5</b>：直接处理 Protobuf 响应，无需 DTO 转换。
+   *
    * @param count 轮询计数
-   * @param response 统一响应
+   * @param response 统一响应（Protobuf）
    * @return 是否成功
    */
   private boolean processUnifiedResponse(long count, UnifiedPollResponse response) {
+    // Phase 5: 直接使用 Protobuf 字段判断成功
+    boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
+        || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
     
-    if (!response.isSuccess()) {
-      logger.log(Level.WARNING, "Unified poll failed: {0}", response.getErrorMessage());
+    if (!success) {
+      logger.log(Level.WARNING, "Unified poll failed: {0}", response.getStatus().getMessage());
       return false;
     }
 
@@ -452,9 +465,10 @@ public final class LongPollCoordinator implements Closeable {
     // 遍历响应中的各类型结果，分发给对应的 Handler
     for (LongPollHandler<?> handler : handlers) {
       String typeKey = handler.getType().name();
-      PollResult result = response.getResults().get(typeKey);
-
-      if (result != null) {
+      
+      // Phase 5: 直接从 Protobuf map 获取结果
+      if (response.containsResults(typeKey)) {
+        PollResult result = response.getResultsOrThrow(typeKey);
         try {
           // 使用类型安全的方式处理响应
           boolean processed = processHandlerResult(handler, result);
@@ -475,10 +489,10 @@ public final class LongPollCoordinator implements Closeable {
     logger.log(
         Level.FINE,
         "Unified poll completed (count: {0}): success={1}, failure={2}, hasAnyChanges={3}",
-        new Object[] {count, successCount, failureCount, response.hasAnyChanges()});
+        new Object[] {count, successCount, failureCount, response.getHasAnyChanges()});
 
     // 记录成功统计
-    if (response.getConfigResult() != null) {
+    if (response.containsResults("CONFIG")) {
       statistics.recordConfigFetchSuccess();
     }
 
@@ -489,8 +503,10 @@ public final class LongPollCoordinator implements Closeable {
   /**
    * 处理单个 Handler 的结果
    *
+   * <p><b>Phase 5</b>：使用 Protobuf PollResult。
+   *
    * @param handler 处理器
-   * @param result 轮询结果
+   * @param result 轮询结果（Protobuf）
    * @return 是否成功处理
    */
   private static boolean processHandlerResult(LongPollHandler<?> handler, PollResult result) {
@@ -526,34 +542,28 @@ public final class LongPollCoordinator implements Closeable {
   /**
    * 创建统一轮询请求
    *
-   * @return 统一轮询请求
+   * <p><b>Phase 5</b>：直接构建 Protobuf 请求消息。
+   *
+   * @return 统一轮询请求（Protobuf）
    */
   private UnifiedPollRequest createUnifiedPollRequest() {
     // 从 ConfigHandler 获取当前配置版本和 ETag
     String configVersion = getCurrentConfigVersion();
     String configEtag = getCurrentConfigEtag();
 
-    return new UnifiedPollRequest() {
-      @Override
-      public String getAgentId() {
-        return agentId;
-      }
-
-      @Override
-      public String getCurrentConfigVersion() {
-        return configVersion;
-      }
-
-      @Override
-      public String getCurrentConfigEtag() {
-        return configEtag;
-      }
-
-      @Override
-      public long getTimeoutMillis() {
-        return config.getTimeoutMillis();
-      }
-    };
+    // Phase 5: 直接使用 Protobuf Builder
+    return UnifiedPollRequest.newBuilder()
+        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
+        .setAgentId(agentId)
+        .setCurrentConfigVersion(
+            ConfigVersion.newBuilder()
+                .setVersion(configVersion != null ? configVersion : "")
+                .setEtag(configEtag != null ? configEtag : "")
+                .build())
+        .setCurrentConfigVersionStr(configVersion != null ? configVersion : "")
+        .setCurrentConfigEtag(configEtag != null ? configEtag : "")
+        .setTimeoutMillis(config.getTimeoutMillis())
+        .build();
   }
 
   // ===== Getters =====

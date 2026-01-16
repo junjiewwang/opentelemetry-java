@@ -243,7 +243,7 @@ public final class ControlPlaneAutoConfigurationProvider
                       if (controlPlaneManager != null) {
                         controlPlaneManager.close();
                       }
-                    } catch (Exception e) {
+                    } catch (RuntimeException e) {
                       logger.log(Level.WARNING, "Failed to close control plane manager", e);
                     }
                   },

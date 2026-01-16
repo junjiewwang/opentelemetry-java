@@ -5,11 +5,14 @@
 
 package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.ConfigRequest;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.ConfigResponse;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.PollResult;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import java.util.HashMap;
 import java.util.Map;
@@ -28,12 +31,15 @@ import java.util.logging.Logger;
  *   <li>独立模式：通过 poll() 方法直接调用 /v1/control/poll/config
  *   <li>统一模式：通过 processUnifiedResult() 处理 /v1/control/poll 响应中的 CONFIG 部分
  * </ul>
+ *
+ * <p><b>Phase 5 重构</b>：直接使用 {@link ControlPlaneService}（Protobuf-only），
+ * 消除中间 DTO 转换层。
  */
 public final class ConfigLongPollHandler implements LongPollHandler<ConfigResponse> {
 
   private static final Logger logger = Logger.getLogger(ConfigLongPollHandler.class.getName());
 
-  private final ControlPlaneClient client;
+  private final ControlPlaneService service;
   private final ControlPlaneStatistics statistics;
   private final LongPollConfig config;
   private final String agentId;
@@ -50,19 +56,19 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   /**
    * 创建配置长轮询处理器
    *
-   * @param client 控制平面客户端
+   * @param service 控制平面服务（Protobuf-only）
    * @param statistics 统计管理器
    * @param config 长轮询配置
    * @param agentId Agent ID
    * @param running 运行状态标志
    */
   public ConfigLongPollHandler(
-      ControlPlaneClient client,
+      ControlPlaneService service,
       ControlPlaneStatistics statistics,
       LongPollConfig config,
       String agentId,
       AtomicBoolean running) {
-    this.client = client;
+    this.service = service;
     this.statistics = statistics;
     this.config = config;
     this.agentId = agentId;
@@ -87,35 +93,49 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
 
   @Override
   public HandlerResult handleResponse(ConfigResponse response) {
-    if (!response.isSuccess()) {
+    // Phase 5: 直接使用 Protobuf 字段判断成功
+    boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
+        || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+    
+    if (!success) {
       logger.log(
           Level.WARNING,
           "[CONFIG-ERROR] Config response error from server: {0}",
-          response.getErrorMessage());
+          response.getStatus().getMessage());
       taskLogger.logTaskProgress(
           currentTaskId,
           "config_error",
-          "Config response error: " + response.getErrorMessage());
+          "Config response error: " + response.getStatus().getMessage());
       return HandlerResult.noChange();
     }
 
     statistics.recordConfigFetchSuccess();
 
-    if (response.hasChanges()) {
+    if (response.getHasChanges()) {
+      // 从嵌套的 config.version 中获取版本和 etag
+      String newVersion = response.hasConfig() && response.getConfig().hasVersion()
+          ? response.getConfig().getVersion().getVersion() : "";
+      String newEtag = response.hasConfig() && response.getConfig().hasVersion()
+          ? response.getConfig().getVersion().getEtag() : "";
+      
       // 配置有更新
       logger.log(
           Level.INFO,
           "[CONFIG-RECEIVED] Config updated from server (independent poll), version={0}, etag={1}",
-          new Object[] {response.getConfigVersion(), response.getEtag()});
+          new Object[] {newVersion, newEtag});
       
       taskLogger.logTaskProgress(
           currentTaskId,
           "config_changed",
-          "Config version: " + response.getConfigVersion() + ", etag: " + response.getEtag());
+          "Config version: " + newVersion + ", etag: " + newEtag);
 
       // 更新本地状态
-      this.currentConfigVersion = response.getConfigVersion();
-      this.currentConfigEtag = response.getEtag();
+      if (!newVersion.isEmpty()) {
+        this.currentConfigVersion = newVersion;
+      }
+      if (!newEtag.isEmpty()) {
+        this.currentConfigEtag = newEtag;
+      }
 
       return HandlerResult.changed(
           "version=" + currentConfigVersion + ", etag=" + currentConfigEtag);
@@ -134,7 +154,9 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    *
    * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 CONFIG 部分
    *
-   * @param result 轮询结果
+   * <p><b>Phase 5</b>：直接使用 Protobuf PollResult。
+   *
+   * @param result 轮询结果（Protobuf）
    * @return 是否成功处理
    */
   public boolean processUnifiedResult(PollResult result) {
@@ -143,19 +165,8 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
       return false;
     }
 
-    // 调试日志：输出收到的配置结果详情
-    logger.log(
-        Level.INFO,
-        "[CONFIG-PROCESS] Processing config result: hasChanges={0}, version={1}, etag={2}, currentVersion={3}, currentEtag={4}",
-        new Object[] {
-          result.hasChanges(),
-          result.getConfigVersion(),
-          result.getConfigEtag(),
-          currentConfigVersion,
-          currentConfigEtag
-        });
-
-    if (result.hasChanges()) {
+    if (result.getHasChanges()) {
+      // Phase 5: 直接从 Protobuf 获取版本和 ETag
       String newVersion = result.getConfigVersion();
       String newEtag = result.getConfigEtag();
 
@@ -170,11 +181,11 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
           "config_changed",
           "Config version: " + newVersion + ", etag: " + newEtag);
 
-      // 更新本地状态
-      if (newVersion != null) {
+      // 更新本地状态（Protobuf 字符串不会为 null）
+      if (!newVersion.isEmpty()) {
         this.currentConfigVersion = newVersion;
       }
-      if (newEtag != null) {
+      if (!newEtag.isEmpty()) {
         this.currentConfigEtag = newEtag;
       }
 
@@ -211,12 +222,14 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    *
    * <p>直接调用 /v1/control/poll/config 端点
    *
-   * @return 配置响应 Future
+   * <p><b>Phase 5</b>：返回 Protobuf ConfigResponse。
+   *
+   * @return 配置响应 Future（Protobuf）
    */
   @Override
   public CompletableFuture<ConfigResponse> poll() {
     statistics.recordConfigPoll();
-    return client.getConfig(createConfigRequest());
+    return service.getConfig(createConfigRequest());
   }
 
   /**
@@ -229,29 +242,21 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
     this.currentTaskId = taskId;
   }
 
-  /** 创建配置请求 */
+  /**
+   * 创建配置请求
+   *
+   * <p><b>Phase 5</b>：直接使用 Protobuf Builder。
+   */
   private ConfigRequest createConfigRequest() {
-    return new ConfigRequest() {
-      @Override
-      public String getAgentId() {
-        return agentId;
-      }
-
-      @Override
-      public String getCurrentConfigVersion() {
-        return currentConfigVersion;
-      }
-
-      @Override
-      public String getCurrentEtag() {
-        return currentConfigEtag;
-      }
-
-      @Override
-      public long getLongPollTimeoutMillis() {
-        return config.getTimeoutMillis();
-      }
-    };
+    return ConfigRequest.newBuilder()
+        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
+        .setCurrentVersion(
+            ConfigVersion.newBuilder()
+                .setVersion(currentConfigVersion != null ? currentConfigVersion : "")
+                .setEtag(currentConfigEtag != null ? currentConfigEtag : "")
+                .build())
+        .setLongPollTimeoutMillis(config.getTimeoutMillis())
+        .build();
   }
 
   // ===== Getters =====

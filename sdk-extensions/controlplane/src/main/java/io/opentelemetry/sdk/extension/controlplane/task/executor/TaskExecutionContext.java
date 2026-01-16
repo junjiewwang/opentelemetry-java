@@ -5,7 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import java.util.Collections;
 import java.util.HashMap;
@@ -22,10 +22,13 @@ import javax.annotation.Nullable;
  *   <li>任务元数据（ID、类型、优先级等）
  *   <li>任务参数（JSON 解析后的 Map）
  *   <li>时间约束（超时、创建时间、过期时间）
- *   <li>依赖组件（客户端、调度器等）
+ *   <li>依赖组件（服务、调度器等）
  * </ul>
  *
  * <p>使用 Builder 模式创建实例，确保不可变性。
+ *
+ * <p><b>Phase 5 重构</b>：使用 {@link ControlPlaneService}（Protobuf-only）
+ * 代替旧的 ControlPlaneClient。
  */
 public final class TaskExecutionContext {
 
@@ -39,8 +42,8 @@ public final class TaskExecutionContext {
   private final Map<String, Object> parameters;
   private final String parametersJson;
 
-  // 依赖组件
-  @Nullable private final ControlPlaneClient client;
+  // 依赖组件（Phase 5: 使用 ControlPlaneService）
+  @Nullable private final ControlPlaneService service;
   @Nullable private final ScheduledExecutorService scheduler;
   @Nullable private final TaskStatusEmitter statusEmitter;
 
@@ -57,7 +60,7 @@ public final class TaskExecutionContext {
     this.agentId = builder.agentId;
     this.parameters = Collections.unmodifiableMap(new HashMap<>(builder.parameters));
     this.parametersJson = builder.parametersJson;
-    this.client = builder.client;
+    this.service = builder.service;
     this.scheduler = builder.scheduler;
     this.statusEmitter = builder.statusEmitter;
     this.receivedAtMillis = builder.receivedAtMillis;
@@ -101,9 +104,28 @@ public final class TaskExecutionContext {
     return parametersJson;
   }
 
+  /**
+   * 获取控制平面服务
+   *
+   * <p><b>Phase 5</b>：返回 {@link ControlPlaneService}（Protobuf-only）。
+   *
+   * @return 控制平面服务，可能为 null
+   */
   @Nullable
-  public ControlPlaneClient getClient() {
-    return client;
+  public ControlPlaneService getService() {
+    return service;
+  }
+
+  /**
+   * 获取控制平面客户端
+   *
+   * @return 控制平面客户端，可能为 null
+   * @deprecated 使用 {@link #getService()} 替代
+   */
+  @Deprecated
+  @Nullable
+  public ControlPlaneService getClient() {
+    return service;
   }
 
   @Nullable
@@ -114,7 +136,7 @@ public final class TaskExecutionContext {
   /**
    * 任务状态/进度事件发射器（可选）。
    *
-   * <p>用于执行器在关键事件发生时“实时”上报（例如：RUNNING、阶段进度、READY 等），
+   * <p>用于执行器在关键事件发生时"实时"上报（例如：RUNNING、阶段进度、READY 等），
    * 避免通过定时轮询或 sleep 检查状态。
    */
   @Nullable
@@ -252,7 +274,7 @@ public final class TaskExecutionContext {
     private String agentId = "";
     private Map<String, Object> parameters = new HashMap<>();
     private String parametersJson = "{}";
-    @Nullable private ControlPlaneClient client;
+    @Nullable private ControlPlaneService service;
     @Nullable private ScheduledExecutorService scheduler;
     @Nullable private TaskStatusEmitter statusEmitter;
     private long receivedAtMillis = System.currentTimeMillis();
@@ -302,8 +324,29 @@ public final class TaskExecutionContext {
       return this;
     }
 
-    public Builder client(@Nullable ControlPlaneClient client) {
-      this.client = client;
+    /**
+     * 设置控制平面服务
+     *
+     * <p><b>Phase 5</b>：使用 {@link ControlPlaneService}（Protobuf-only）。
+     *
+     * @param service 控制平面服务
+     * @return this
+     */
+    public Builder service(@Nullable ControlPlaneService service) {
+      this.service = service;
+      return this;
+    }
+
+    /**
+     * 设置控制平面客户端
+     *
+     * @param client 控制平面客户端
+     * @return this
+     * @deprecated 使用 {@link #service(ControlPlaneService)} 替代
+     */
+    @Deprecated
+    public Builder client(@Nullable ControlPlaneService client) {
+      this.service = client;
       return this;
     }
 

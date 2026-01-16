@@ -13,9 +13,21 @@ option java_outer_classname = "ServiceProtos";
 import "controlplane/v1/config.proto";
 import "controlplane/v1/task.proto";
 import "controlplane/v1/status.proto";
+import "controlplane/v1/poll.proto";
 
 // 控制平面服务 (一元长轮询模式，预留双向流扩展)
 service ControlPlaneService {
+  // ===== 推荐使用的统一接口 =====
+  
+  // 统一长轮询（同时获取配置和任务）
+  // 这是推荐的主要方法，一次请求同时获取配置更新和待执行任务
+  rpc UnifiedPoll(UnifiedPollRequest) returns (UnifiedPollResponse);
+  
+  // 上报任务执行结果
+  rpc ReportTaskResult(TaskResultRequest) returns (TaskResultResponse);
+  
+  // ===== 分离式接口（向后兼容） =====
+  
   // 获取配置 (长轮询)
   rpc GetConfig(ConfigRequest) returns (ConfigResponse);
   

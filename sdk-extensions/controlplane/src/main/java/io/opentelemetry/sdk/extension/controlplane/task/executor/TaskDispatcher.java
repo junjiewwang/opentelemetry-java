@@ -5,17 +5,18 @@
 
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskInfo;
-import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultRequest;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskResultResponse;
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus;
+import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEvent;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEventManager;
 import java.io.Closeable;
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -45,6 +46,9 @@ import javax.annotation.Nullable;
  *
  * <p>遵循开闭原则：通过 {@link #registerExecutor(TaskExecutor)} 注册新的执行器，
  * 无需修改分发器代码即可支持新的任务类型。
+ *
+ * <p><b>Phase 5 重构</b>：直接使用 {@link ControlPlaneService}（Protobuf-only），
+ * 使用 Protobuf {@link Task} 代替旧的 TaskInfo DTO。
  */
 public final class TaskDispatcher implements Closeable {
 
@@ -128,8 +132,8 @@ public final class TaskDispatcher implements Closeable {
   /** 调度器（用于超时控制） */
   private final ScheduledExecutorService scheduler;
 
-  /** 控制平面客户端 */
-  private final ControlPlaneClient client;
+  /** 控制平面服务（Phase 5: Protobuf-only） */
+  private final ControlPlaneService service;
 
   /** Agent ID */
   private final String agentId;
@@ -144,38 +148,31 @@ public final class TaskDispatcher implements Closeable {
   private final TaskStatusEventManager statusEventManager = new TaskStatusEventManager();
 
   /** 每个任务当前已上报到服务端的最终状态（用于去重/幂等） */
-  private final Map<String, AtomicReference<TaskStatus>> reportedTerminalStatus =
+  private final Map<String, AtomicReference<TaskResultStatus>> reportedTerminalStatus =
       new ConcurrentHashMap<>();
-
-  /**
-   * 每个任务是否已进入终态（SUCCESS/FAILED/TIMEOUT/CANCELLED）。
-   *
-   * <p>用途：一旦终态被上报/发布，后续任何 RUNNING 事件都必须被屏蔽，避免服务端状态回退。
-   */
-  private final Set<String> terminalTasks = ConcurrentHashMap.newKeySet();
 
   /**
    * 创建任务分发器
    *
-   * @param client 控制平面客户端
+   * @param service 控制平面服务（Protobuf-only）
    * @param agentId Agent ID
    */
-  public TaskDispatcher(ControlPlaneClient client, String agentId) {
-    this(client, agentId, null);
+  public TaskDispatcher(ControlPlaneService service, String agentId) {
+    this(service, agentId, null);
   }
 
   /**
    * 创建任务分发器（带自定义调度器）
    *
-   * @param client 控制平面客户端
+   * @param service 控制平面服务（Protobuf-only）
    * @param agentId Agent ID
    * @param scheduler 调度器（可选，为 null 时内部创建）
    */
   public TaskDispatcher(
-      ControlPlaneClient client,
+      ControlPlaneService service,
       String agentId,
       @Nullable ScheduledExecutorService scheduler) {
-    this.client = client;
+    this.service = service;
     this.agentId = agentId;
     this.executors = new ConcurrentHashMap<>();
     this.runningTasks = ConcurrentHashMap.newKeySet();
@@ -208,26 +205,21 @@ public final class TaskDispatcher implements Closeable {
     String taskId = event.getTaskId();
     TaskExecutionResult result = event.toExecutionResult();
 
-    // 终态后屏蔽：一旦终态已发布，任何 RUNNING 上报都必须丢弃，避免服务端状态回退。
-    if (result.getStatus() == TaskStatus.RUNNING && terminalTasks.contains(taskId)) {
-      return;
-    }
+    // Phase 5: 转换为 Protobuf 状态
+    TaskResultStatus protoStatus = convertToProtoStatus(result.getStatus());
 
     // 终态幂等：SUCCESS/FAILED/TIMEOUT/CANCELLED 只上报一次；RUNNING 可重复但会被管理器做节流/合并。
-    if (result.getStatus() != TaskStatus.RUNNING) {
-      AtomicReference<TaskStatus> ref =
+    if (protoStatus != TaskResultStatus.TASK_RESULT_STATUS_RUNNING) {
+      AtomicReference<TaskResultStatus> ref =
           reportedTerminalStatus.computeIfAbsent(taskId, k -> new AtomicReference<>());
-      TaskStatus prev = ref.get();
-      if (prev == TaskStatus.SUCCESS
-          || prev == TaskStatus.FAILED
-          || prev == TaskStatus.TIMEOUT
-          || prev == TaskStatus.CANCELLED) {
+      TaskResultStatus prev = ref.get();
+      if (prev == TaskResultStatus.TASK_RESULT_STATUS_SUCCESS
+          || prev == TaskResultStatus.TASK_RESULT_STATUS_FAILED
+          || prev == TaskResultStatus.TASK_RESULT_STATUS_TIMEOUT
+          || prev == TaskResultStatus.TASK_RESULT_STATUS_CANCELLED) {
         return;
       }
-      ref.set(result.getStatus());
-
-      // 记录终态发布：从这一刻起屏蔽所有 RUNNING。
-      terminalTasks.add(taskId);
+      ref.set(protoStatus);
     }
 
     reportResult(taskId, result);
@@ -277,13 +269,15 @@ public final class TaskDispatcher implements Closeable {
    *
    * <p>根据任务类型查找执行器，异步执行任务，并在完成后上报结果
    *
-   * @param taskInfo 任务信息
+   * <p><b>Phase 5</b>：接受 Protobuf Task。
+   *
+   * @param task 任务信息（Protobuf）
    * @return 分发是否成功（不代表执行成功）
-   * @deprecated 推荐使用 {@link #dispatchWithResult(TaskInfo)} 获取详细的分发结果
+   * @deprecated 推荐使用 {@link #dispatchWithResult(Task)} 获取详细的分发结果
    */
   @Deprecated
-  public boolean dispatch(TaskInfo taskInfo) {
-    return dispatchWithResult(taskInfo).isSuccess();
+  public boolean dispatch(Task task) {
+    return dispatchWithResult(task).isSuccess();
   }
 
   /**
@@ -292,17 +286,21 @@ public final class TaskDispatcher implements Closeable {
    * <p>根据任务类型查找执行器，异步执行任务，并在完成后上报结果。
    * 返回详细的分发结果，包括状态和原因。
    *
-   * @param taskInfo 任务信息
+   * <p><b>Phase 5</b>：接受 Protobuf Task。
+   *
+   * @param task 任务信息（Protobuf）
    * @return 分发结果
    */
-  public DispatchResult dispatchWithResult(TaskInfo taskInfo) {
+  public DispatchResult dispatchWithResult(Task task) {
     if (closed) {
-      logger.log(Level.WARNING, "TaskDispatcher is closed, rejecting task: {0}", taskInfo.getTaskId());
+      logger.log(Level.WARNING, "TaskDispatcher is closed, rejecting task: {0}", task.getTaskId());
       return DispatchResult.dispatcherClosed();
     }
 
-    String taskId = taskInfo.getTaskId();
-    String taskType = taskInfo.getTaskType();
+    String taskId = task.getTaskId();
+    // Phase 5: 优先使用字符串类型的 taskTypeName
+    String taskType = task.getTaskTypeName().isEmpty() 
+        ? task.getType().name() : task.getTaskTypeName();
 
     // 幂等性检查
     if (!runningTasks.add(taskId)) {
@@ -342,8 +340,8 @@ public final class TaskDispatcher implements Closeable {
       return DispatchResult.executorUnavailable(taskType);
     }
 
-    // 构建执行上下文
-    TaskExecutionContext context = buildContext(taskInfo);
+    // 构建执行上下文（Phase 5: 从 Protobuf Task 构建）
+    TaskExecutionContext context = buildContext(task);
 
     // 为该任务创建 emitter：执行器可在关键事件发生时实时上报状态
     TaskStatusEmitter emitter = statusEventManager.createEmitter(taskId, agentId);
@@ -357,7 +355,7 @@ public final class TaskDispatcher implements Closeable {
         .agentId(context.getAgentId())
         .parameters(context.getParameters())
         .parametersJson(context.getParametersJson())
-        .client(context.getClient())
+        .service(context.getService())
         .scheduler(context.getScheduler())
         .receivedAtMillis(context.getReceivedAtMillis())
         .statusEmitter(emitter)
@@ -421,7 +419,7 @@ public final class TaskDispatcher implements Closeable {
       } else {
         finalResult = result;
         if (result.isSuccess()) {
-          if (result.getStatus() == TaskStatus.RUNNING) {
+          if (result.getStatus() == TaskExecutionResult.Status.RUNNING) {
             logger.log(
                 Level.INFO,
                 "[TASK-RUNNING] Task reported running: taskId={0}, executionTime={1}ms",
@@ -442,17 +440,13 @@ public final class TaskDispatcher implements Closeable {
 
       // 上报结果到服务端
       // 说明：RUNNING 不是终态，终态应由执行器通过 TaskStatusEmitter 上报。
-      if (finalResult.getStatus() != TaskStatus.RUNNING) {
+      if (finalResult.getStatus() != TaskExecutionResult.Status.RUNNING) {
         reportResult(taskId, finalResult);
       }
 
-      // 清理任务级状态机缓存，避免内存增长。
-      terminalTasks.remove(taskId);
-      reportedTerminalStatus.remove(taskId);
-
       // 记录任务完成日志
       if (finalResult.isSuccess()) {
-        if (finalResult.getStatus() != TaskStatus.RUNNING) {
+        if (finalResult.getStatus() != TaskExecutionResult.Status.RUNNING) {
           taskLogger.logTaskCompleted(taskId, finalResult.getResultJson());
         }
       } else {
@@ -505,22 +499,30 @@ public final class TaskDispatcher implements Closeable {
 
   /**
    * 构建任务执行上下文
+   *
+   * <p><b>Phase 5</b>：从 Protobuf Task 构建。
    */
-  private TaskExecutionContext buildContext(TaskInfo taskInfo) {
+  private TaskExecutionContext buildContext(Task task) {
     // 解析参数 JSON
-    Map<String, Object> params = parseParameters(taskInfo.getParametersJson());
+    Map<String, Object> params = parseParameters(task.getParametersJson());
+
+    // Phase 5: 优先使用字符串类型的 taskTypeName 和数值类型的 priorityNum
+    String taskType = task.getTaskTypeName().isEmpty() 
+        ? task.getType().name() : task.getTaskTypeName();
+    int priority = task.getPriorityNum() > 0 
+        ? task.getPriorityNum() : task.getPriority().getNumber();
 
     return TaskExecutionContext.builder()
-        .taskId(taskInfo.getTaskId())
-        .taskType(taskInfo.getTaskType())
-        .priority(taskInfo.getPriority())
-        .timeoutMillis(taskInfo.getTimeoutMillis())
-        .createdAtMillis(taskInfo.getCreatedAtMillis())
-        .expiresAtMillis(taskInfo.getExpiresAtMillis())
+        .taskId(task.getTaskId())
+        .taskType(taskType)
+        .priority(priority)
+        .timeoutMillis(task.getTimeoutMillis())
+        .createdAtMillis(task.getCreatedAtMillis())
+        .expiresAtMillis(task.getExpiresAtMillis())
         .agentId(agentId)
         .parameters(params)
-        .parametersJson(taskInfo.getParametersJson())
-        .client(client)
+        .parametersJson(task.getParametersJson())
+        .service(service)
         .scheduler(scheduler)
         .receivedAtMillis(System.currentTimeMillis())
         .build();
@@ -528,68 +530,73 @@ public final class TaskDispatcher implements Closeable {
 
   /**
    * 解析参数 JSON
-   *
-   * <p>使用 {@link JsonUtils#parseSimpleObject(String)} 进行解析
    */
   private static Map<String, Object> parseParameters(@Nullable String json) {
-    return JsonUtils.parseSimpleObject(json);
+    Map<String, Object> params = new HashMap<>();
+    if (json == null || json.isEmpty() || "{}".equals(json)) {
+      return params;
+    }
+
+    // 简单的 JSON 解析（不引入外部依赖）
+    // 格式：{"key1":"value1","key2":"value2"}
+    try {
+      String content = json.trim();
+      if (content.startsWith("{") && content.endsWith("}")) {
+        content = content.substring(1, content.length() - 1).trim();
+        if (!content.isEmpty()) {
+          // 简单分割（不处理嵌套对象）
+          String[] pairs = content.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
+          for (String pair : pairs) {
+            int colonIndex = pair.indexOf(':');
+            if (colonIndex > 0) {
+              String key = pair.substring(0, colonIndex).trim();
+              String value = pair.substring(colonIndex + 1).trim();
+              // 去除引号
+              key = removeQuotes(key);
+              value = removeQuotes(value);
+              params.put(key, value);
+            }
+          }
+        }
+      }
+    } catch (RuntimeException e) {
+      logger.log(Level.WARNING, "Failed to parse parameters JSON: {0}", e.getMessage());
+    }
+
+    return params;
+  }
+
+  private static String removeQuotes(String s) {
+    if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
+      return s.substring(1, s.length() - 1);
+    }
+    return s;
   }
 
   /**
    * 上报任务结果到服务端
+   *
+   * <p><b>Phase 5</b>：直接使用 Protobuf TaskResultRequest。
    */
   private void reportResult(String taskId, TaskExecutionResult result) {
-    TaskResultRequest request = new TaskResultRequest() {
-      @Override
-      public String getTaskId() {
-        return taskId;
-      }
+    // Phase 5: 转换为 Protobuf 状态
+    TaskResultStatus protoStatus = convertToProtoStatus(result.getStatus());
 
-      @Override
-      public String getAgentId() {
-        return agentId;
-      }
+    // Phase 5: 直接使用 Protobuf Builder
+    TaskResultRequest request = TaskResultRequest.newBuilder()
+        .setTaskId(taskId)
+        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
+        .setAgentId(agentId)
+        .setStatus(protoStatus)
+        .setErrorCode(result.getErrorCode() != null ? result.getErrorCode() : "")
+        .setErrorMessage(result.getErrorMessage() != null ? result.getErrorMessage() : "")
+        .setResultJson(result.getResultJson() != null ? result.getResultJson() : "")
+        .setStartedAtMillis(result.getStartedAtMillis())
+        .setCompletedAtMillis(result.getCompletedAtMillis())
+        .setExecutionTimeMillis(result.getExecutionTimeMillis())
+        .build();
 
-      @Override
-      public TaskStatus getStatus() {
-        return result.getStatus();
-      }
-
-      @Override
-      @Nullable
-      public String getErrorCode() {
-        return result.getErrorCode();
-      }
-
-      @Override
-      @Nullable
-      public String getErrorMessage() {
-        return result.getErrorMessage();
-      }
-
-      @Override
-      @Nullable
-      public String getResultJson() {
-        return result.getResultJson();
-      }
-
-      @Override
-      public long getStartedAtMillis() {
-        return result.getStartedAtMillis();
-      }
-
-      @Override
-      public long getCompletedAtMillis() {
-        return result.getCompletedAtMillis();
-      }
-
-      @Override
-      public long getExecutionTimeMillis() {
-        return result.getExecutionTimeMillis();
-      }
-    };
-
-    CompletableFuture<TaskResultResponse> future = client.reportTaskResult(request);
+    CompletableFuture<TaskResultResponse> future = service.reportTaskResult(request);
     @SuppressWarnings("FutureReturnValueIgnored")
     Object unused = future.whenComplete((response, error) -> {
       if (error != null) {
@@ -597,11 +604,11 @@ public final class TaskDispatcher implements Closeable {
             Level.WARNING,
             "[TASK-REPORT-FAILED] Failed to report task result: taskId={0}, error={1}",
             new Object[] {taskId, error.getMessage()});
-      } else if (response != null && !response.isSuccess()) {
+      } else if (response != null && !response.getAcknowledged()) {
         logger.log(
             Level.WARNING,
             "[TASK-REPORT-REJECTED] Server rejected task result: taskId={0}, error={1}",
-            new Object[] {taskId, response.getErrorMessage()});
+            new Object[] {taskId, response.getStatus().getMessage()});
       } else {
         logger.log(
             Level.INFO,
@@ -609,6 +616,27 @@ public final class TaskDispatcher implements Closeable {
             new Object[] {taskId, result.getStatus()});
       }
     });
+  }
+
+  /**
+   * 转换内部状态到 Protobuf 状态
+   */
+  private static TaskResultStatus convertToProtoStatus(TaskExecutionResult.Status status) {
+    switch (status) {
+      case PENDING:
+        return TaskResultStatus.TASK_RESULT_STATUS_PENDING;
+      case RUNNING:
+        return TaskResultStatus.TASK_RESULT_STATUS_RUNNING;
+      case SUCCESS:
+        return TaskResultStatus.TASK_RESULT_STATUS_SUCCESS;
+      case FAILED:
+        return TaskResultStatus.TASK_RESULT_STATUS_FAILED;
+      case TIMEOUT:
+        return TaskResultStatus.TASK_RESULT_STATUS_TIMEOUT;
+      case CANCELLED:
+        return TaskResultStatus.TASK_RESULT_STATUS_CANCELLED;
+    }
+    return TaskResultStatus.TASK_RESULT_STATUS_UNSPECIFIED;
   }
 
   /**

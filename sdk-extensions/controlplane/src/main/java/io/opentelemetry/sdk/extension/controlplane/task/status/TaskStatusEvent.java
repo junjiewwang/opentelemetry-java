@@ -1,6 +1,5 @@
 package io.opentelemetry.sdk.extension.controlplane.task.status;
 
-import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneClient.TaskStatus;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionResult;
 import java.util.Objects;
 import javax.annotation.Nullable;
@@ -10,12 +9,15 @@ import javax.annotation.Nullable;
  *
  * <p>用于将任务执行过程中的关键节点（RUNNING / SUCCESS / FAILED 等）抽象为事件，
  * 由统一的事件管理器汇总、去重、节流，并最终转换为 {@link TaskExecutionResult} 上报到服务端。
+ *
+ * <p><b>Phase 5 重构</b>：使用 {@link TaskExecutionResult.Status} 替代旧的
+ * {@code ControlPlaneClient.TaskStatus}。
  */
 public final class TaskStatusEvent {
 
   private final String taskId;
   private final String agentId;
-  private final TaskStatus status;
+  private final TaskExecutionResult.Status status;
   @Nullable private final String errorCode;
   @Nullable private final String errorMessage;
   @Nullable private final String resultJson;
@@ -24,7 +26,7 @@ public final class TaskStatusEvent {
   private TaskStatusEvent(
       String taskId,
       String agentId,
-      TaskStatus status,
+      TaskExecutionResult.Status status,
       @Nullable String errorCode,
       @Nullable String errorMessage,
       @Nullable String resultJson,
@@ -42,19 +44,19 @@ public final class TaskStatusEvent {
     String json =
         "{\"status\":\"running\",\"message\":" + escapeJsonString(message) + "}";
     long now = System.currentTimeMillis();
-    return new TaskStatusEvent(taskId, agentId, TaskStatus.RUNNING, null, null, json, now);
+    return new TaskStatusEvent(taskId, agentId, TaskExecutionResult.Status.RUNNING, null, null, json, now);
   }
 
   public static TaskStatusEvent success(String taskId, String agentId, @Nullable String resultJson) {
     long now = System.currentTimeMillis();
-    return new TaskStatusEvent(taskId, agentId, TaskStatus.SUCCESS, null, null, resultJson, now);
+    return new TaskStatusEvent(taskId, agentId, TaskExecutionResult.Status.SUCCESS, null, null, resultJson, now);
   }
 
   public static TaskStatusEvent failed(
       String taskId, String agentId, String errorCode, String errorMessage) {
     long now = System.currentTimeMillis();
     return new TaskStatusEvent(
-        taskId, agentId, TaskStatus.FAILED, errorCode, errorMessage, null, now);
+        taskId, agentId, TaskExecutionResult.Status.FAILED, errorCode, errorMessage, null, now);
   }
 
   public String getTaskId() {
@@ -65,7 +67,7 @@ public final class TaskStatusEvent {
     return agentId;
   }
 
-  public TaskStatus getStatus() {
+  public TaskExecutionResult.Status getStatus() {
     return status;
   }
 
@@ -91,7 +93,7 @@ public final class TaskStatusEvent {
   public TaskExecutionResult toExecutionResult() {
     TaskExecutionResult.Builder b = TaskExecutionResult.builder().status(status);
 
-    if (status == TaskStatus.RUNNING) {
+    if (status == TaskExecutionResult.Status.RUNNING) {
       // RUNNING：没有完成时间，保持 startedAt 为事件时间，completedAt = startedAt
       b.startedAtMillis(timestampMillis).completedAtMillis(timestampMillis).executionTimeMillis(0);
       if (resultJson != null) {
@@ -105,7 +107,7 @@ public final class TaskStatusEvent {
         .completedAtMillis(timestampMillis)
         .executionTimeMillis(0);
 
-    if (status == TaskStatus.SUCCESS) {
+    if (status == TaskExecutionResult.Status.SUCCESS) {
       b.resultJson(resultJson);
     } else {
       b.errorCode(errorCode).errorMessage(errorMessage);
