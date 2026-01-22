@@ -7,13 +7,13 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.TaskStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskPollResult;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.AgentCapabilities;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskResponse;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
@@ -169,12 +169,12 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    *
    * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 TASK 部分
    *
-   * <p><b>Phase 5</b>：直接使用 Protobuf PollResult 和 Task。
+   * <p><b>Phase 5</b>：直接使用 Protobuf TaskPollResult 和 Task。
    *
    * @param result 轮询结果（Protobuf）
    * @return 是否成功处理
    */
-  public boolean processUnifiedResult(PollResult result) {
+  public boolean processUnifiedResult(TaskPollResult result) {
     if (result == null) {
       // 使用 INFO 级别，确保日志可见
       logger.log(Level.INFO, "[TASK-POLL] No task result in unified response (result is null)");
@@ -187,13 +187,13 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
     // 增强诊断日志：无论是否有任务都输出详细信息
     logger.log(
         Level.INFO,
-        "[TASK-POLL] Processing unified result: hasChanges={0}, taskCount={1}",
+        "[TASK-POLL] Processing unified result: hasTasks={0}, taskCount={1}",
         new Object[] {
-          result.getHasChanges(),
+          result.getHasTasks(),
           tasks.size()
         });
     
-    if (result.getHasChanges() && !tasks.isEmpty()) {
+    if (result.getHasTasks() && !tasks.isEmpty()) {
       int taskCount = tasks.size();
       
       // 记录任务列表摘要
@@ -224,9 +224,9 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       // 增强诊断：输出更多细节
       logger.log(
           Level.INFO,
-          "[TASK-POLL] No pending tasks via unified poll: hasChanges={0}, taskCount={1}",
+          "[TASK-POLL] No pending tasks via unified poll: hasTasks={0}, taskCount={1}",
           new Object[] {
-            result.getHasChanges(),
+            result.getHasTasks(),
             tasks.size()
           });
       taskLogger.logTaskProgress(
@@ -234,8 +234,8 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
           "no_tasks",
           String.format(
               Locale.ROOT,
-              "No pending tasks (hasChanges=%s, taskCount=%d)",
-              result.getHasChanges(), tasks.size()));
+              "No pending tasks (hasTasks=%s, taskCount=%d)",
+              result.getHasTasks(), tasks.size()));
       return true;
     }
   }
@@ -291,7 +291,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
         taskLogger.logTaskFailed(subTaskId, "TASK_EXPIRED", expiredErrorMsg);
         // 上报服务端：使用 FAILED + error_code 模式
         reportTaskResultToServer(
-            subTaskId, TaskResultStatus.TASK_RESULT_STATUS_FAILED, "TASK_EXPIRED", expiredErrorMsg, nowMillis);
+            subTaskId, TaskStatus.TASK_STATUS_FAILED, "TASK_EXPIRED", expiredErrorMsg, nowMillis);
         return;
         
       case STALE:
@@ -309,7 +309,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
         taskLogger.logTaskFailed(subTaskId, "TASK_STALE", staleErrorMsg);
         // 上报服务端：使用 FAILED + error_code 模式
         reportTaskResultToServer(
-            subTaskId, TaskResultStatus.TASK_RESULT_STATUS_FAILED, "TASK_STALE", staleErrorMsg, nowMillis);
+            subTaskId, TaskStatus.TASK_STATUS_FAILED, "TASK_STALE", staleErrorMsg, nowMillis);
         return;
         
       case VALID_WITH_WARNING:
@@ -370,7 +370,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       long nowMillis = System.currentTimeMillis();
       reportTaskResultToServer(
           task.getTaskId(),
-          TaskResultStatus.TASK_RESULT_STATUS_FAILED,
+          TaskStatus.TASK_STATUS_FAILED,
           "NO_DISPATCHER",
           "TaskDispatcher not configured",
           nowMillis);
@@ -408,7 +408,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       long nowMillis = System.currentTimeMillis();
       reportTaskResultToServer(
           task.getTaskId(),
-          TaskResultStatus.TASK_RESULT_STATUS_RUNNING,
+          TaskStatus.TASK_STATUS_RUNNING,
           null,
           "Task is already running",
           nowMillis);
@@ -464,7 +464,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    */
   private void reportTaskResultToServer(
       String taskId,
-      TaskResultStatus status,
+      TaskStatus status,
       @Nullable String errorCode,
       @Nullable String errorMessage,
       long completedAtMillis) {
@@ -472,7 +472,6 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
     // Phase 5: 直接使用 Protobuf Builder
     TaskResultRequest request = TaskResultRequest.newBuilder()
         .setTaskId(taskId)
-        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
         .setAgentId(agentId)
         .setStatus(status)
         .setErrorCode(errorCode != null ? errorCode : "")
@@ -595,9 +594,9 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    */
   private TaskRequest createTaskRequest() {
     return TaskRequest.newBuilder()
-        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
         .setAgentId(agentId)
         .setLongPollTimeoutMillis(config.getTimeoutMillis())
+        .setCapabilities(AgentCapabilities.newBuilder().build())
         .build();
   }
 }

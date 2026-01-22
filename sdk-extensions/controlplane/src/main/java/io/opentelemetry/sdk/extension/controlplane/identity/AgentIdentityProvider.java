@@ -5,6 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.identity;
 
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos;
 import java.lang.reflect.Method;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -82,7 +83,7 @@ public final class AgentIdentityProvider {
         .setHostName(hostname)
         .setIp(getIpAddress())
         .setProcessId(String.valueOf(pid))
-        .setStartTimeUnixNano(startTime * 1_000_000) // 转换为纳秒
+        .setStartTimeMillis(startTime) // 毫秒时间戳
         .setSdkVersion(getSdkVersion())
         .setServiceName(serviceName != null ? serviceName : getServiceName())
         .setServiceNamespace(serviceNamespace != null ? serviceNamespace : getServiceNamespace())
@@ -197,36 +198,42 @@ public final class AgentIdentityProvider {
   /**
    * 获取 IP 地址
    *
-   * <p>优先从网络接口获取非回环的 IPv4 地址，如果获取失败则尝试使用默认方式
+   * <p>优先级：
+   * <ol>
+   *   <li>环境变量 POD_IP（K8s Downward API 注入）</li>
+   *   <li>环境变量 HOST_IP（自定义配置）</li>
+   *   <li>遍历网卡获取非回环 IPv4 地址</li>
+   *   <li>兜底返回 unknown</li>
+   * </ol>
    *
-   * @return IP 地址，如果无法获取则返回空字符串
+   * @return IP 地址，如果无法获取则返回 unknown
    */
   private static String getIpAddress() {
-    // 优先从环境变量获取（支持手动指定）
-    String ip = System.getProperty("otel.agent.ip");
-    if (ip != null && !ip.isEmpty()) {
-      return ip;
-    }
-    ip = System.getenv("OTEL_AGENT_IP");
+    // 1. 从环境变量 POD_IP 获取（K8s Downward API 注入）
+    String ip = System.getenv("POD_IP");
     if (ip != null && !ip.isEmpty()) {
       return ip;
     }
 
-    // 尝试从网络接口获取
+    // 2. 从环境变量 HOST_IP 获取（自定义配置）
+    ip = System.getenv("HOST_IP");
+    if (ip != null && !ip.isEmpty()) {
+      return ip;
+    }
+
+    // 3. 尝试从网络接口获取
     try {
       Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-      if (interfaces != null) {
-        while (interfaces.hasMoreElements()) {
-          NetworkInterface ni = interfaces.nextElement();
-          if (ni.isLoopback() || !ni.isUp()) {
-            continue;
-          }
-          Enumeration<InetAddress> addresses = ni.getInetAddresses();
-          while (addresses.hasMoreElements()) {
-            InetAddress addr = addresses.nextElement();
-            if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
-              return addr.getHostAddress();
-            }
+      while (interfaces.hasMoreElements()) {
+        NetworkInterface ni = interfaces.nextElement();
+        if (ni.isLoopback() || !ni.isUp()) {
+          continue;
+        }
+        Enumeration<InetAddress> addresses = ni.getInetAddresses();
+        while (addresses.hasMoreElements()) {
+          InetAddress addr = addresses.nextElement();
+          if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+            return addr.getHostAddress();
           }
         }
       }
@@ -234,17 +241,7 @@ public final class AgentIdentityProvider {
       logger.log(Level.WARNING, "Failed to get IP addresses from network interfaces", e);
     }
 
-    // 回退方案：使用默认方式
-    try {
-      String defaultIp = InetAddress.getLocalHost().getHostAddress();
-      if (!"127.0.0.1".equals(defaultIp)) {
-        return defaultIp;
-      }
-    } catch (UnknownHostException e) {
-      logger.log(Level.WARNING, "Failed to get local IP", e);
-    }
-
-    return "";
+    return "unknown";
   }
 
   /**
@@ -317,7 +314,7 @@ public final class AgentIdentityProvider {
     private final String sdkVersion;
     private final String serviceName;
     private final String serviceNamespace;
-    private final long startTimeUnixNano;
+    private final long startTimeMillis;
     private final Map<String, String> labels;
     private final Map<String, String> attributes;
 
@@ -329,7 +326,7 @@ public final class AgentIdentityProvider {
       this.sdkVersion = builder.sdkVersion;
       this.serviceName = builder.serviceName;
       this.serviceNamespace = builder.serviceNamespace;
-      this.startTimeUnixNano = builder.startTimeUnixNano;
+      this.startTimeMillis = builder.startTimeMillis;
       this.labels = Collections.unmodifiableMap(new LinkedHashMap<>(builder.labels));
       this.attributes = Collections.unmodifiableMap(new HashMap<>(builder.attributes));
     }
@@ -366,8 +363,8 @@ public final class AgentIdentityProvider {
       return serviceNamespace;
     }
 
-    public long getStartTimeUnixNano() {
-      return startTimeUnixNano;
+    public long getStartTimeMillis() {
+      return startTimeMillis;
     }
 
     public Map<String, String> getLabels() {
@@ -401,6 +398,77 @@ public final class AgentIdentityProvider {
           + '}';
     }
 
+    /**
+     * 转换为 Protobuf AgentIdentity 对象
+     *
+     * <p>字段映射：
+     * <ul>
+     *   <li>startTimeMillis 直接映射到 start_time_millis</li>
+     *   <li>labels 合并到 attributes 中（加 "label." 前缀）</li>
+     * </ul>
+     *
+     * @return Protobuf AgentIdentity 对象
+     */
+    public CommonProtos.AgentIdentity toProto() {
+      // 合并 labels 和 attributes 到 proto 的 attributes 字段
+      Map<String, String> mergedAttributes = new HashMap<>(attributes);
+      // labels 也作为 attributes 的一部分（加上 label. 前缀以区分）
+      for (Map.Entry<String, String> entry : labels.entrySet()) {
+        mergedAttributes.put("label." + entry.getKey(), entry.getValue());
+      }
+
+      return CommonProtos.AgentIdentity.newBuilder()
+          .setAgentId(agentId)
+          .setHostName(hostName)
+          .setIp(ip)
+          .setProcessId(processId)
+          .setSdkVersion(sdkVersion)
+          .setServiceName(serviceName)
+          .setServiceNamespace(serviceNamespace)
+          .setStartTimeMillis(startTimeMillis)
+          .putAllAttributes(mergedAttributes)
+          .build();
+    }
+
+    /**
+     * 从 Protobuf AgentIdentity 对象转换
+     *
+     * <p>字段映射：
+     * <ul>
+     *   <li>start_time_millis 直接映射到 startTimeMillis</li>
+     *   <li>attributes 中 "label." 前缀的提取到 labels</li>
+     * </ul>
+     *
+     * @param proto Protobuf AgentIdentity 对象
+     * @return Java AgentIdentity 对象
+     */
+    public static AgentIdentity fromProto(CommonProtos.AgentIdentity proto) {
+      Map<String, String> labels = new LinkedHashMap<>();
+      Map<String, String> attributes = new HashMap<>();
+
+      // 分离 labels 和 attributes
+      for (Map.Entry<String, String> entry : proto.getAttributesMap().entrySet()) {
+        if (entry.getKey().startsWith("label.")) {
+          labels.put(entry.getKey().substring(6), entry.getValue()); // 移除 "label." 前缀
+        } else {
+          attributes.put(entry.getKey(), entry.getValue());
+        }
+      }
+
+      return AgentIdentity.builder()
+          .setAgentId(proto.getAgentId())
+          .setHostName(proto.getHostName())
+          .setIp(proto.getIp())
+          .setProcessId(proto.getProcessId())
+          .setSdkVersion(proto.getSdkVersion())
+          .setServiceName(proto.getServiceName())
+          .setServiceNamespace(proto.getServiceNamespace())
+          .setStartTimeMillis(proto.getStartTimeMillis())
+          .setLabels(labels)
+          .setAttributes(attributes)
+          .build();
+    }
+
     /** Builder for AgentIdentity */
     public static final class Builder {
       private String agentId = "";
@@ -410,7 +478,7 @@ public final class AgentIdentityProvider {
       private String sdkVersion = "";
       private String serviceName = "";
       private String serviceNamespace = "";
-      private long startTimeUnixNano = 0;
+      private long startTimeMillis = 0;
       private Map<String, String> labels = new LinkedHashMap<>();
       private Map<String, String> attributes = new HashMap<>();
 
@@ -451,8 +519,8 @@ public final class AgentIdentityProvider {
         return this;
       }
 
-      public Builder setStartTimeUnixNano(long startTimeUnixNano) {
-        this.startTimeUnixNano = startTimeUnixNano;
+      public Builder setStartTimeMillis(long startTimeMillis) {
+        this.startTimeMillis = startTimeMillis;
         return this;
       }
 

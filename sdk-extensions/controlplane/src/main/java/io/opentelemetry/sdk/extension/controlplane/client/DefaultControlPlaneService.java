@@ -22,6 +22,7 @@ import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusR
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.ChunkedTaskResult;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.ChunkedUploadResponse;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.ChunkUploadStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskResponse;
@@ -75,8 +76,7 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
     checkNotClosed();
     checkOtlpExportMetrics();
 
-    String agentId =
-        request.hasAgentIdentity() ? request.getAgentIdentity().getAgentId() : "unknown";
+    String agentId = request.getAgentId();
     String configVersion =
         request.hasCurrentConfigVersion() ? request.getCurrentConfigVersion().getVersion() : "";
     long timeoutMillis = request.getTimeoutMillis();
@@ -102,8 +102,8 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
                   response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
                       || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
               int taskCount =
-                  response.containsResults("TASK")
-                      ? response.getResultsOrThrow("TASK").getTasksCount()
+                  response.hasTaskResult()
+                      ? response.getTaskResult().getTasksCount()
                       : 0;
 
               logger.logPollResponse(
@@ -368,7 +368,7 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
 
   private static ChunkedUploadResponse buildErrorChunkedUploadResponse(String message) {
     return ChunkedUploadResponse.newBuilder()
-        .setStatus(ChunkedUploadResponse.Status.STATUS_UPLOAD_FAILED)
+        .setStatus(ChunkUploadStatus.CHUNK_UPLOAD_STATUS_UPLOAD_FAILED)
         .setErrorMessage(message != null ? message : "Unknown error")
         .build();
   }

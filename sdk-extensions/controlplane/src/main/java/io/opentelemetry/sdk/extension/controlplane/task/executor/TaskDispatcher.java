@@ -6,10 +6,9 @@
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.TaskStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
@@ -148,7 +147,7 @@ public final class TaskDispatcher implements Closeable {
   private final TaskStatusEventManager statusEventManager = new TaskStatusEventManager();
 
   /** 每个任务当前已上报到服务端的最终状态（用于去重/幂等） */
-  private final Map<String, AtomicReference<TaskResultStatus>> reportedTerminalStatus =
+  private final Map<String, AtomicReference<TaskStatus>> reportedTerminalStatus =
       new ConcurrentHashMap<>();
 
   /**
@@ -206,17 +205,17 @@ public final class TaskDispatcher implements Closeable {
     TaskExecutionResult result = event.toExecutionResult();
 
     // Phase 5: 转换为 Protobuf 状态
-    TaskResultStatus protoStatus = convertToProtoStatus(result.getStatus());
+    TaskStatus protoStatus = convertToProtoStatus(result.getStatus());
 
     // 终态幂等：SUCCESS/FAILED/TIMEOUT/CANCELLED 只上报一次；RUNNING 可重复但会被管理器做节流/合并。
-    if (protoStatus != TaskResultStatus.TASK_RESULT_STATUS_RUNNING) {
-      AtomicReference<TaskResultStatus> ref =
+    if (protoStatus != TaskStatus.TASK_STATUS_RUNNING) {
+      AtomicReference<TaskStatus> ref =
           reportedTerminalStatus.computeIfAbsent(taskId, k -> new AtomicReference<>());
-      TaskResultStatus prev = ref.get();
-      if (prev == TaskResultStatus.TASK_RESULT_STATUS_SUCCESS
-          || prev == TaskResultStatus.TASK_RESULT_STATUS_FAILED
-          || prev == TaskResultStatus.TASK_RESULT_STATUS_TIMEOUT
-          || prev == TaskResultStatus.TASK_RESULT_STATUS_CANCELLED) {
+      TaskStatus prev = ref.get();
+      if (prev == TaskStatus.TASK_STATUS_SUCCESS
+          || prev == TaskStatus.TASK_STATUS_FAILED
+          || prev == TaskStatus.TASK_STATUS_TIMEOUT
+          || prev == TaskStatus.TASK_STATUS_CANCELLED) {
         return;
       }
       ref.set(protoStatus);
@@ -580,12 +579,11 @@ public final class TaskDispatcher implements Closeable {
    */
   private void reportResult(String taskId, TaskExecutionResult result) {
     // Phase 5: 转换为 Protobuf 状态
-    TaskResultStatus protoStatus = convertToProtoStatus(result.getStatus());
+    TaskStatus protoStatus = convertToProtoStatus(result.getStatus());
 
     // Phase 5: 直接使用 Protobuf Builder
     TaskResultRequest request = TaskResultRequest.newBuilder()
         .setTaskId(taskId)
-        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
         .setAgentId(agentId)
         .setStatus(protoStatus)
         .setErrorCode(result.getErrorCode() != null ? result.getErrorCode() : "")
@@ -621,22 +619,22 @@ public final class TaskDispatcher implements Closeable {
   /**
    * 转换内部状态到 Protobuf 状态
    */
-  private static TaskResultStatus convertToProtoStatus(TaskExecutionResult.Status status) {
+  private static TaskStatus convertToProtoStatus(TaskExecutionResult.Status status) {
     switch (status) {
       case PENDING:
-        return TaskResultStatus.TASK_RESULT_STATUS_PENDING;
+        return TaskStatus.TASK_STATUS_PENDING;
       case RUNNING:
-        return TaskResultStatus.TASK_RESULT_STATUS_RUNNING;
+        return TaskStatus.TASK_STATUS_RUNNING;
       case SUCCESS:
-        return TaskResultStatus.TASK_RESULT_STATUS_SUCCESS;
+        return TaskStatus.TASK_STATUS_SUCCESS;
       case FAILED:
-        return TaskResultStatus.TASK_RESULT_STATUS_FAILED;
+        return TaskStatus.TASK_STATUS_FAILED;
       case TIMEOUT:
-        return TaskResultStatus.TASK_RESULT_STATUS_TIMEOUT;
+        return TaskStatus.TASK_STATUS_TIMEOUT;
       case CANCELLED:
-        return TaskResultStatus.TASK_RESULT_STATUS_CANCELLED;
+        return TaskStatus.TASK_STATUS_CANCELLED;
     }
-    return TaskResultStatus.TASK_RESULT_STATUS_UNSPECIFIED;
+    return TaskStatus.TASK_STATUS_UNSPECIFIED;
   }
 
   /**

@@ -25,6 +25,7 @@ import javax.annotation.Nullable;
  *   <li>arthas-core.jar - Arthas 核心 jar</li>
  *   <li>arthas-client.jar - Arthas 客户端 jar</li>
  *   <li>async-profiler native library - profiler 命令依赖</li>
+ *   <li>Arthas JNI library - vmtool 命令依赖</li>
  * </ul>
  *
  * <p>设计原则：
@@ -116,6 +117,11 @@ public final class ArthasResourceExtractor {
       // 使 Arthas profiler 命令能够找到 libasyncProfiler.so
       // 失败不阻塞 Arthas 启动，仅影响 profiler 命令
       extractAsyncProfilerLibrary(tempDir);
+
+      // 【关键】提取 Arthas JNI library 到 arthas-home/lib 目录
+      // 使 Arthas vmtool 命令能够找到 libArthasJniLibrary
+      // 失败不阻塞 Arthas 启动，仅影响 vmtool 命令
+      extractArthasJniLibrary(tempDir);
 
       // 构建 URL 数组
       int urlCount = clientJar != null ? 2 : 1;
@@ -218,6 +224,48 @@ public final class ArthasResourceExtractor {
           Level.WARNING,
           "[ARTHAS] Error extracting async-profiler library: {0}. "
               + "Arthas profiler command will not work.",
+          e.getMessage());
+    }
+  }
+
+  /**
+   * 提取 Arthas JNI library 到 arthas-home 的 lib 目录
+   *
+   * <p>Arthas vmtool 命令查找 JNI 库的路径是： <code>{arthas-home}/lib/libArthasJniLibrary-{platform}.{ext}</code>
+   *
+   * <p>失败不阻塞 Arthas 启动，仅记录警告日志。vmtool 命令将不可用。
+   *
+   * @param arthasHome Arthas 运行时根目录
+   */
+  public static void extractArthasJniLibrary(Path arthasHome) {
+    try {
+      // 使用 ArthasJniLibraryExtractor 提取库文件
+      ArthasJniLibraryExtractor.ExtractionResult result =
+          ArthasJniLibraryExtractor.extractTo(arthasHome);
+
+      if (result.isSuccess()) {
+        if (result.isSkipped()) {
+          logger.log(
+              Level.FINE,
+              "[ARTHAS] JNI library already exists: {0}",
+              result.getLibraryPath());
+        } else {
+          logger.log(
+              Level.INFO, "[ARTHAS] JNI library extracted: {0}", result.getLibraryPath());
+        }
+      } else {
+        // 提取失败，记录警告但不阻塞
+        logger.log(
+            Level.WARNING,
+            "[ARTHAS] Failed to extract JNI library: {0}. "
+                + "Arthas vmtool command will not work.",
+            result.getMessage());
+      }
+    } catch (RuntimeException e) {
+      // 捕获所有异常，防止影响 Arthas 启动
+      logger.log(
+          Level.WARNING,
+          "[ARTHAS] Error extracting JNI library: {0}. " + "Arthas vmtool command will not work.",
           e.getMessage());
     }
   }

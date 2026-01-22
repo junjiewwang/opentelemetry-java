@@ -7,12 +7,11 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.ConfigPollResult;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import java.util.HashMap;
 import java.util.Map;
@@ -154,12 +153,12 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    *
    * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 CONFIG 部分
    *
-   * <p><b>Phase 5</b>：直接使用 Protobuf PollResult。
+   * <p><b>Phase 5</b>：直接使用 Protobuf ConfigPollResult。
    *
    * @param result 轮询结果（Protobuf）
    * @return 是否成功处理
    */
-  public boolean processUnifiedResult(PollResult result) {
+  public boolean processUnifiedResult(ConfigPollResult result) {
     if (result == null) {
       logger.log(Level.FINE, "[CONFIG-POLL] No config result in unified response");
       return false;
@@ -249,7 +248,7 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    */
   private ConfigRequest createConfigRequest() {
     return ConfigRequest.newBuilder()
-        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
+        .setAgentId(agentId)
         .setCurrentVersion(
             ConfigVersion.newBuilder()
                 .setVersion(currentConfigVersion != null ? currentConfigVersion : "")

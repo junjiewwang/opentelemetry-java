@@ -6,12 +6,13 @@
 package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.AgentIdentity;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.PollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.ConfigPollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskPollResult;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollResponse;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.AgentCapabilities;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
@@ -462,27 +463,31 @@ public final class LongPollCoordinator implements Closeable {
     int successCount = 0;
     int failureCount = 0;
 
-    // 遍历响应中的各类型结果，分发给对应的 Handler
+    // Phase 5: 直接处理 ConfigPollResult 和 TaskPollResult
     for (LongPollHandler<?> handler : handlers) {
-      String typeKey = handler.getType().name();
+      LongPollType type = handler.getType();
       
-      // Phase 5: 直接从 Protobuf map 获取结果
-      if (response.containsResults(typeKey)) {
-        PollResult result = response.getResultsOrThrow(typeKey);
-        try {
-          // 使用类型安全的方式处理响应
-          boolean processed = processHandlerResult(handler, result);
-          if (processed) {
-            successCount++;
-          }
-        } catch (RuntimeException e) {
-          logger.log(
-              Level.WARNING,
-              "Handler {0} failed to process result: {1}",
-              new Object[] {typeKey, e.getMessage()});
-          handler.handleError(e);
-          failureCount++;
+      try {
+        boolean processed = false;
+        if (type == LongPollType.CONFIG && response.hasConfigResult()) {
+          ConfigPollResult configResult = response.getConfigResult();
+          ConfigLongPollHandler configHandler = (ConfigLongPollHandler) handler;
+          processed = configHandler.processUnifiedResult(configResult);
+        } else if (type == LongPollType.TASK && response.hasTaskResult()) {
+          TaskPollResult taskResult = response.getTaskResult();
+          TaskLongPollHandler taskHandler = (TaskLongPollHandler) handler;
+          processed = taskHandler.processUnifiedResult(taskResult);
         }
+        if (processed) {
+          successCount++;
+        }
+      } catch (RuntimeException e) {
+        logger.log(
+            Level.WARNING,
+            "Handler {0} failed to process result: {1}",
+            new Object[] {type.name(), e.getMessage()});
+        handler.handleError(e);
+        failureCount++;
       }
     }
 
@@ -492,7 +497,7 @@ public final class LongPollCoordinator implements Closeable {
         new Object[] {count, successCount, failureCount, response.getHasAnyChanges()});
 
     // 记录成功统计
-    if (response.containsResults("CONFIG")) {
+    if (response.hasConfigResult()) {
       statistics.recordConfigFetchSuccess();
     }
 
@@ -500,29 +505,7 @@ public final class LongPollCoordinator implements Closeable {
     return failureCount == 0 || successCount > 0;
   }
 
-  /**
-   * 处理单个 Handler 的结果
-   *
-   * <p><b>Phase 5</b>：使用 Protobuf PollResult。
-   *
-   * @param handler 处理器
-   * @param result 轮询结果（Protobuf）
-   * @return 是否成功处理
-   */
-  private static boolean processHandlerResult(LongPollHandler<?> handler, PollResult result) {
-    LongPollType type = handler.getType();
 
-    if (type == LongPollType.CONFIG) {
-      ConfigLongPollHandler configHandler = (ConfigLongPollHandler) handler;
-      return configHandler.processUnifiedResult(result);
-    } else if (type == LongPollType.TASK) {
-      TaskLongPollHandler taskHandler = (TaskLongPollHandler) handler;
-      return taskHandler.processUnifiedResult(result);
-    }
-
-    logger.log(Level.WARNING, "Unknown handler type: {0}", type);
-    return false;
-  }
 
   /**
    * 通知所有 Handler 发生错误
@@ -553,16 +536,14 @@ public final class LongPollCoordinator implements Closeable {
 
     // Phase 5: 直接使用 Protobuf Builder
     return UnifiedPollRequest.newBuilder()
-        .setAgentIdentity(AgentIdentity.newBuilder().setAgentId(agentId).build())
         .setAgentId(agentId)
         .setCurrentConfigVersion(
             ConfigVersion.newBuilder()
                 .setVersion(configVersion != null ? configVersion : "")
                 .setEtag(configEtag != null ? configEtag : "")
                 .build())
-        .setCurrentConfigVersionStr(configVersion != null ? configVersion : "")
-        .setCurrentConfigEtag(configEtag != null ? configEtag : "")
         .setTimeoutMillis(config.getTimeoutMillis())
+        .setCapabilities(AgentCapabilities.newBuilder().build())
         .build();
   }
 
