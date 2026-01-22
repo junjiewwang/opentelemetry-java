@@ -25,13 +25,8 @@ import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
-import io.opentelemetry.sdk.extension.controlplane.status.AgentStatusAggregator;
 import io.opentelemetry.sdk.extension.controlplane.status.ControlPlaneStateCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.HeartbeatReporter;
-import io.opentelemetry.sdk.extension.controlplane.status.IdentityCollector;
-import io.opentelemetry.sdk.extension.controlplane.status.OtlpExportMetricsCollector;
-import io.opentelemetry.sdk.extension.controlplane.status.SystemResourceCollector;
-import io.opentelemetry.sdk.extension.controlplane.status.UptimeCollector;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
@@ -39,7 +34,6 @@ import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
 import java.time.Duration;
-import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -95,10 +89,7 @@ public final class ControlPlaneManager implements Closeable {
   private final AgentIdentityProvider.AgentIdentity agentIdentity;
 
   // 状态收集和心跳上报
-  private final AgentStatusAggregator statusAggregator;
   private final HeartbeatReporter heartbeatReporter;
-  private final ControlPlaneStateCollector controlPlaneStateCollector;
-  private final UptimeCollector uptimeCollector;
 
   // Arthas 集成
   @Nullable private final ArthasIntegration arthasIntegration;
@@ -129,10 +120,7 @@ public final class ControlPlaneManager implements Closeable {
     this.service = ControlPlaneService.create(this.config, this.exportMetrics);
 
     // 初始化状态收集器
-    this.statusAggregator = new AgentStatusAggregator();
-    this.controlPlaneStateCollector = new ControlPlaneStateCollector();
-    this.uptimeCollector = new UptimeCollector();
-    initializeStatusCollectors();
+    ControlPlaneStateCollector controlPlaneStateCollector = new ControlPlaneStateCollector();
 
     // 初始化心跳上报器（Phase 5: 使用 ControlPlaneService）
     // 注意：心跳上报器需要在健康检查协调器之前初始化
@@ -140,7 +128,6 @@ public final class ControlPlaneManager implements Closeable {
         HeartbeatReporter.builder()
             .setConfig(this.config)
             .setService(this.service)
-            .setStatusAggregator(this.statusAggregator)
             .setScheduler(this.taskManager.getScheduler())
             .setListener(this::onHeartbeatComplete)
             .build();
@@ -152,7 +139,7 @@ public final class ControlPlaneManager implements Closeable {
     // 初始化统计管理器
     this.statistics =
         new ControlPlaneStatistics(
-            this.controlPlaneStateCollector,
+            controlPlaneStateCollector,
             this.connectionStateManager,
             this.healthCheckCoordinator,
             this.config.getControlPlaneUrl() + "/config");
@@ -192,21 +179,6 @@ public final class ControlPlaneManager implements Closeable {
    */
   public static Builder builder() {
     return new Builder();
-  }
-
-  /** 初始化状态收集器 */
-  private void initializeStatusCollectors() {
-    statusAggregator.registerCollector(new IdentityCollector());
-    statusAggregator.registerCollector(uptimeCollector);
-    statusAggregator.registerCollector(controlPlaneStateCollector);
-    statusAggregator.registerCollector(new OtlpExportMetricsCollector(exportMetrics));
-    statusAggregator.registerCollector(
-        new SystemResourceCollector(config.isIncludeSystemResource()));
-
-    logger.log(
-        Level.FINE,
-        "Initialized {0} status collectors: {1}",
-        new Object[] {statusAggregator.getCollectorCount(), statusAggregator.getCollectorNames()});
   }
 
   /** 启动控制平面管理器 */
@@ -367,8 +339,7 @@ public final class ControlPlaneManager implements Closeable {
       taskDispatcher = null;
     }
 
-    // 更新运行状态
-    uptimeCollector.setRunningState(UptimeCollector.RunningState.STOPPED);
+    // 更新连接状态
     connectionStateManager.setState(ConnectionState.DISCONNECTED);
 
     logger.log(Level.INFO, "Control plane manager stopped");
@@ -431,15 +402,6 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   /**
-   * 获取状态聚合器
-   *
-   * @return 状态聚合器
-   */
-  public AgentStatusAggregator getStatusAggregator() {
-    return statusAggregator;
-  }
-
-  /**
    * 获取心跳上报器
    *
    * @return 心跳上报器
@@ -498,7 +460,7 @@ public final class ControlPlaneManager implements Closeable {
 
   /** 心跳完成回调 */
   private void onHeartbeatComplete(
-      boolean success, @Nullable Map<String, Object> statusData, @Nullable String error) {
+      boolean success, @Nullable String error) {
     statistics.recordStatusReport();
 
     if (success) {

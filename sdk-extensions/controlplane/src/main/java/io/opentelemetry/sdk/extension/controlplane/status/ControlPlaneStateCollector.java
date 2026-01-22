@@ -5,16 +5,14 @@
 
 package io.opentelemetry.sdk.extension.controlplane.status;
 
-import java.util.HashMap;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
 /**
- * 控制平面状态收集器
+ * 控制平面状态持有器
  *
- * <p>收集控制平面的连接状态信息，包括：
+ * <p>持有控制平面的连接状态信息，用于统计和监控，包括：
  * <ul>
  *   <li>connectionState - 连接状态
  *   <li>configVersion - 当前配置版本
@@ -23,9 +21,7 @@ import javax.annotation.Nullable;
  *   <li>taskPollCount - 任务轮询次数
  * </ul>
  */
-public final class ControlPlaneStateCollector implements AgentStatusCollector {
-
-  private static final String NAME = "controlPlaneState";
+public final class ControlPlaneStateCollector {
 
   private final AtomicReference<String> connectionState;
   private final AtomicReference<String> configVersion;
@@ -41,38 +37,6 @@ public final class ControlPlaneStateCollector implements AgentStatusCollector {
     this.configPollCount = new AtomicLong(0);
     this.taskPollCount = new AtomicLong(0);
     this.statusReportCount = new AtomicLong(0);
-  }
-
-  @Override
-  public String getName() {
-    return NAME;
-  }
-
-  @Override
-  public Map<String, Object> collect() {
-    Map<String, Object> data = new HashMap<>();
-    data.put("connectionState", connectionState.get());
-    
-    String version = configVersion.get();
-    if (version != null && !version.isEmpty()) {
-      data.put("configVersion", version);
-    }
-    
-    long fetchTime = lastConfigFetchTime.get();
-    if (fetchTime > 0) {
-      data.put("lastConfigFetchTime", fetchTime);
-    }
-    
-    data.put("configPollCount", configPollCount.get());
-    data.put("taskPollCount", taskPollCount.get());
-    data.put("statusReportCount", statusReportCount.get());
-    
-    return data;
-  }
-
-  @Override
-  public int getPriority() {
-    return 15;
   }
 
   // ============ 状态更新方法 ============
