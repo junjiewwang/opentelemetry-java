@@ -5,7 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.core;
 
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.status.HeartbeatReporter;
 import java.util.Locale;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -13,19 +13,20 @@ import java.util.logging.Logger;
 /**
  * 健康检查协调器。
  *
- * <p>负责协调 OTLP 健康状态和控制平面连接状态，包括：
+ * <p>负责协调健康状态和控制平面连接状态，包括：
  *
  * <ul>
- *   <li>监听 OTLP 健康状态变化
- *   <li>根据健康状态决定是否允许连接
+ *   <li>根据心跳健康状态决定是否允许连接
  *   <li>健康状态与连接状态的联动
  * </ul>
+ *
+ * <p>使用心跳作为唯一健康判断依据，避免因服务端下发低采样率或停止采集导致的误判。
  */
-public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthStateListener {
+public final class HealthCheckCoordinator {
 
   private static final Logger logger = Logger.getLogger(HealthCheckCoordinator.class.getName());
 
-  private final OtlpHealthMonitor healthMonitor;
+  private final HeartbeatReporter heartbeatReporter;
   private final ConnectionStateManager connectionStateManager;
   private final ConnectionGatePolicy gatePolicy;
 
@@ -34,39 +35,41 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
   /**
    * 创建健康检查协调器
    *
-   * @param healthMonitor OTLP 健康监控器
+   * @param heartbeatReporter 心跳上报器（必选）
    * @param connectionStateManager 连接状态管理器
    */
   public HealthCheckCoordinator(
-      OtlpHealthMonitor healthMonitor, ConnectionStateManager connectionStateManager) {
-    this(healthMonitor, connectionStateManager, ConnectionGatePolicies.defaultPolicy());
+      HeartbeatReporter heartbeatReporter, ConnectionStateManager connectionStateManager) {
+    this(heartbeatReporter, connectionStateManager, ConnectionGatePolicies.heartbeatOnlyPolicy());
   }
 
   /**
-   * 创建健康检查协调器（可注入 GatePolicy）
+   * 创建健康检查协调器（可自定义策略）
    *
-   * @param healthMonitor OTLP 健康监控器
+   * @param heartbeatReporter 心跳上报器（必选）
    * @param connectionStateManager 连接状态管理器
    * @param gatePolicy 连接开闸策略
    */
   public HealthCheckCoordinator(
-      OtlpHealthMonitor healthMonitor,
+      HeartbeatReporter heartbeatReporter,
       ConnectionStateManager connectionStateManager,
       ConnectionGatePolicy gatePolicy) {
-    this.healthMonitor = healthMonitor;
+    this.heartbeatReporter = heartbeatReporter;
     this.connectionStateManager = connectionStateManager;
     this.gatePolicy = gatePolicy;
   }
 
-  /** 启动协调器，注册监听器 */
+  /**
+   * 启动协调器
+   */
   public void start() {
-    healthMonitor.addListener(this);
     logger.log(Level.FINE, "Health check coordinator started");
   }
 
-  /** 停止协调器，移除监听器 */
+  /**
+   * 停止协调器
+   */
   public void stop() {
-    healthMonitor.removeListener(this);
     logger.log(Level.FINE, "Health check coordinator stopped");
   }
 
@@ -76,7 +79,7 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
    * @return 是否应该连接
    */
   public boolean shouldConnect() {
-    GateDecision decision = gatePolicy.decide(healthMonitor);
+    GateDecision decision = gatePolicy.decide(this);
     lastGateDecision = decision;
 
     if (!decision.isAllowed()) {
@@ -85,8 +88,8 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
         connectionStateManager.markWaitingForOtlp();
         logger.log(
             Level.INFO,
-            "Control plane connection gated (otlpState={0}, gate={1}), waiting for recovery before connecting to control plane",
-            new Object[] {healthMonitor.getState(), decision});
+            "Control plane connection gated (gate={0}), waiting for recovery before connecting",
+            decision);
       }
       return false;
     }
@@ -99,74 +102,39 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
   }
 
   /**
-   * 检查 OTLP 是否健康
+   * 获取心跳上报器
+   *
+   * @return 心跳上报器
+   */
+  public HeartbeatReporter getHeartbeatReporter() {
+    return heartbeatReporter;
+  }
+
+  /**
+   * 检查心跳是否健康
    *
    * @return 是否健康
    */
-  public boolean isOtlpHealthy() {
-    return healthMonitor.isHealthy();
+  public boolean isHeartbeatHealthy() {
+    return heartbeatReporter.isHealthy();
   }
 
   /**
-   * 获取 OTLP 健康状态
-   *
-   * @return 健康状态
-   */
-  public OtlpHealthMonitor.HealthState getOtlpHealthState() {
-    return healthMonitor.getState();
-  }
-
-  /**
-   * 构建详细的 OTLP 健康信息字符串
+   * 构建详细的健康信息字符串
    *
    * @return 健康信息字符串
    */
-  public String buildOtlpHealthInfo() {
-    OtlpHealthMonitor.HealthState state = healthMonitor.getState();
-    long successCount = healthMonitor.getSuccessCount();
-    long failureCount = healthMonitor.getFailureCount();
-    double successRate = healthMonitor.getSuccessRate();
-    long totalSamples = successCount + failureCount;
-    int activeSignals = healthMonitor.getActiveSignalCount();
+  public String buildHealthInfo() {
+    double heartbeatRate = heartbeatReporter.getSuccessRate();
+    long heartbeatCount = heartbeatReporter.getHeartbeatCount();
+    boolean heartbeatHealthy = heartbeatReporter.isHealthy();
 
-    // 当没有采样数据时，显示更友好的提示
-    if (totalSamples == 0 && activeSignals == 0) {
-      return "state=UNKNOWN, no samples yet (waiting for exports), gate=" + lastGateDecision;
-    }
-
-    // 格式: state=HEALTHY, success/fail=95/5, rate=95.0%, signals=2
-    return String.format(
-        Locale.ROOT,
-        "state=%s, success/fail=%d/%d, rate=%.1f%%, signals=%d, gate=%s",
-        state,
-        successCount,
-        failureCount,
-        successRate * 100,
-        activeSignals,
-        lastGateDecision);
+    return String.format(Locale.ROOT,
+        "heartbeat={healthy=%s, rate=%.1f%%, count=%d}, gate=%s",
+        heartbeatHealthy, heartbeatRate * 100, heartbeatCount, lastGateDecision);
   }
 
-  @Override
-  public void onStateChanged(
-      OtlpHealthMonitor.HealthState previousState, OtlpHealthMonitor.HealthState newState) {
-    logger.log(
-        Level.INFO,
-        "OTLP health state changed: {0} -> {1}",
-        new Object[] {previousState, newState});
-
-    ConnectionStateManager.ConnectionState currentConnectionState = connectionStateManager.getState();
-
-    // 仅做状态提示，不再直接用 health state 驱动连接开关。
-    // 连接开关由 shouldConnect() + gatePolicy 决定。
-    if (currentConnectionState == ConnectionStateManager.ConnectionState.WAITING_FOR_OTLP) {
-      GateDecision decision = gatePolicy.decide(healthMonitor);
-      lastGateDecision = decision;
-      if (decision.isAllowed()) {
-        connectionStateManager.markConnecting();
-        logger.log(Level.INFO, "OTLP gate opened ({0}), reconnecting to control plane", decision);
-      }
-    }
-  }
+  // ==================== Gate 决策 ====================
 
   /**
    * Gate 决策
@@ -202,13 +170,21 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
     }
   }
 
+  // ==================== 连接开闸策略 ====================
+
   /**
    * 连接开闸策略。
    *
-   * <p>将“健康评估”(monitor) 与 “是否允许连接”(gate) 解耦，避免语义混乱。
+   * <p>将"健康评估"与"是否允许连接"解耦。
    */
   public interface ConnectionGatePolicy {
-    GateDecision decide(OtlpHealthMonitor monitor);
+    /**
+     * 决定是否允许连接
+     *
+     * @param coordinator 健康检查协调器
+     * @return Gate 决策
+     */
+    GateDecision decide(HealthCheckCoordinator coordinator);
   }
 
   /** 内置策略集合 */
@@ -217,57 +193,107 @@ public final class HealthCheckCoordinator implements OtlpHealthMonitor.HealthSta
     private ConnectionGatePolicies() {}
 
     /**
-     * 默认策略：
+     * 仅心跳策略（默认）
      *
-     * <ul>
-     *   <li>HEALTHY/UNKNOWN: 允许连接（保持现有语义）
-     *   <li>DEGRADED: 若最近有成功(默认10s)则快速放行，否则阻断
-     *   <li>UNHEALTHY: 阻断
-     * </ul>
+     * <p>仅使用心跳作为健康判断依据，解决采样配置导致信号稀疏时的误判问题。
+     *
+     * <p>决策逻辑：
+     * <ol>
+     *   <li>如果心跳健康（成功率 &gt;= 80%）：允许连接</li>
+     *   <li>如果心跳严重不健康（成功率 &lt; 50%）：阻断连接</li>
+     *   <li>中间状态（50%~80%）或无心跳记录：允许连接（乐观策略）</li>
+     * </ol>
+     *
+     * @return 仅心跳策略
      */
-    public static ConnectionGatePolicy defaultPolicy() {
-      return new RecentSuccessFastOpenPolicy(/* fastOpenWindowMillis= */ 10_000);
+    public static ConnectionGatePolicy heartbeatOnlyPolicy() {
+      return new HeartbeatOnlyGatePolicy(
+          /* heartbeatIntervalMillis= */ 30_000,
+          /* heartbeatUnhealthyThreshold= */ 0.5);
+    }
+
+    /**
+     * 仅心跳策略（可配置心跳间隔）
+     *
+     * @param heartbeatIntervalMillis 心跳间隔（毫秒），用于判断心跳是否卡住
+     * @return 仅心跳策略
+     */
+    public static ConnectionGatePolicy heartbeatOnlyPolicy(long heartbeatIntervalMillis) {
+      return new HeartbeatOnlyGatePolicy(
+          heartbeatIntervalMillis,
+          /* heartbeatUnhealthyThreshold= */ 0.5);
+    }
+
+    /**
+     * 仅心跳策略（可配置心跳间隔和不健康阈值）
+     *
+     * @param heartbeatIntervalMillis 心跳间隔（毫秒），用于判断心跳是否卡住
+     * @param heartbeatUnhealthyThreshold 心跳不健康阈值（成功率低于此值则阻断）
+     * @return 仅心跳策略
+     */
+    public static ConnectionGatePolicy heartbeatOnlyPolicy(
+        long heartbeatIntervalMillis, double heartbeatUnhealthyThreshold) {
+      return new HeartbeatOnlyGatePolicy(heartbeatIntervalMillis, heartbeatUnhealthyThreshold);
     }
   }
 
+  // ==================== 策略实现 ====================
+
   /**
-   * 快速恢复策略：只要最近一段时间内有成功样本，就允许连接进入“半开/探测”状态。
+   * 仅心跳策略
    *
-   * <p>实现目标：满足“看到 success 就尽快恢复”，同时保留 monitor 的窗口稳定性。
+   * <p>仅使用心跳作为健康判断依据，不依赖 OTLP 信号。
+   * 中间状态采用乐观策略（允许连接），确保控制平面连接的可用性。
    */
-  static final class RecentSuccessFastOpenPolicy implements ConnectionGatePolicy {
+  static final class HeartbeatOnlyGatePolicy implements ConnectionGatePolicy {
 
-    private final long fastOpenWindowMillis;
+    private final long heartbeatIntervalMillis;
+    private final double heartbeatUnhealthyThreshold;
 
-    RecentSuccessFastOpenPolicy(long fastOpenWindowMillis) {
-      this.fastOpenWindowMillis = fastOpenWindowMillis;
+    HeartbeatOnlyGatePolicy(long heartbeatIntervalMillis, double heartbeatUnhealthyThreshold) {
+      this.heartbeatIntervalMillis = heartbeatIntervalMillis;
+      this.heartbeatUnhealthyThreshold = heartbeatUnhealthyThreshold;
     }
 
     @Override
-    public GateDecision decide(OtlpHealthMonitor monitor) {
-      OtlpHealthMonitor.HealthState state = monitor.getState();
+    public GateDecision decide(HealthCheckCoordinator coordinator) {
+      HeartbeatReporter heartbeat = coordinator.getHeartbeatReporter();
 
-      if (state == OtlpHealthMonitor.HealthState.HEALTHY
-          || state == OtlpHealthMonitor.HealthState.UNKNOWN) {
-        return GateDecision.allowed("otlp_state=" + state);
+      // 1. 心跳新鲜度检查：避免心跳卡住导致误判
+      long lastHbTimeMs = heartbeat.getLastHeartbeatTimeMs();
+      long now = System.currentTimeMillis();
+
+      if (lastHbTimeMs > 0 && (now - lastHbTimeMs) > 2 * heartbeatIntervalMillis) {
+        // 心跳超过2个周期未更新，可能卡住，乐观允许连接
+        return GateDecision.allowed("heartbeat_stale,optimistic");
       }
 
-      if (state == OtlpHealthMonitor.HealthState.UNHEALTHY) {
-        return GateDecision.blocked("otlp_state=UNHEALTHY");
+      // 2. 至少有1次心跳记录才开始判断
+      if (heartbeat.getHeartbeatCount() < 1) {
+        // 无心跳记录，乐观允许连接
+        return GateDecision.allowed("no_heartbeat_yet,optimistic");
       }
 
-      // DEGRADED: 允许“快速开闸”以便尽快重连并继续探测
-      long lastSuccessNano = monitor.getLastSuccessTimeNano();
-      if (lastSuccessNano <= 0) {
-        return GateDecision.blocked("otlp_state=DEGRADED,no_recent_success");
+      // 3. 核心判断：直接复用 HeartbeatReporter.isHealthy()
+      if (heartbeat.isHealthy()) {
+        return GateDecision.allowed(
+            "heartbeat_healthy,rate=" + formatPercent(heartbeat.getSuccessRate()));
       }
 
-      long ageMillis = (System.nanoTime() - lastSuccessNano) / 1_000_000;
-      if (ageMillis <= fastOpenWindowMillis) {
-        return GateDecision.allowed("otlp_state=DEGRADED,recent_success_age_ms=" + ageMillis);
+      // 4. 心跳严重不健康（<50%）→ 阻断
+      double successRate = heartbeat.getSuccessRate();
+      if (successRate < heartbeatUnhealthyThreshold) {
+        return GateDecision.blocked(
+            "heartbeat_unhealthy,rate=" + formatPercent(successRate));
       }
 
-      return GateDecision.blocked("otlp_state=DEGRADED,stale_success_age_ms=" + ageMillis);
+      // 5. 中间状态（50%~80%）→ 乐观允许连接
+      return GateDecision.allowed(
+          "heartbeat_degraded,rate=" + formatPercent(successRate) + ",optimistic");
+    }
+
+    private static String formatPercent(double rate) {
+      return String.format(Locale.ROOT, "%.1f%%", rate * 100);
     }
   }
 }

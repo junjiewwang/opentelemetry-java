@@ -6,7 +6,7 @@
 package io.opentelemetry.sdk.extension.controlplane.spi;
 
 import io.opentelemetry.sdk.common.CompletableResultCode;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.health.SignalType;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
@@ -15,9 +15,9 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 健康监控 SpanExporter 包装器
+ * 导出指标收集 SpanExporter 包装器
  *
- * <p>包装原始的 SpanExporter，监控导出结果以更新 OTLP 健康状态。
+ * <p>包装原始的 SpanExporter，收集导出结果指标。
  * 使用 {@link SignalType#SPAN} 信号类型记录导出结果。
  */
 final class HealthMonitoringSpanExporter implements SpanExporter {
@@ -26,11 +26,11 @@ final class HealthMonitoringSpanExporter implements SpanExporter {
       Logger.getLogger(HealthMonitoringSpanExporter.class.getName());
 
   private final SpanExporter delegate;
-  private final OtlpHealthMonitor healthMonitor;
+  private final OtlpExportMetrics exportMetrics;
 
-  HealthMonitoringSpanExporter(SpanExporter delegate, OtlpHealthMonitor healthMonitor) {
+  HealthMonitoringSpanExporter(SpanExporter delegate, OtlpExportMetrics exportMetrics) {
     this.delegate = delegate;
-    this.healthMonitor = healthMonitor;
+    this.exportMetrics = exportMetrics;
     logger.log(
         Level.INFO,
         "HealthMonitoringSpanExporter created, wrapping: {0}",
@@ -47,10 +47,10 @@ final class HealthMonitoringSpanExporter implements SpanExporter {
         () -> {
           if (result.isSuccess()) {
             // 使用新的多信号源 API
-            healthMonitor.recordSuccess(SignalType.SPAN);
+            exportMetrics.recordSuccess(SignalType.SPAN);
             logger.log(Level.FINE, "Span export succeeded, recorded success");
           } else {
-            healthMonitor.recordFailure("Span export failed", SignalType.SPAN);
+            exportMetrics.recordFailure("Span export failed", SignalType.SPAN);
             logger.log(Level.FINE, "Span export failed, recorded failure");
           }
         });

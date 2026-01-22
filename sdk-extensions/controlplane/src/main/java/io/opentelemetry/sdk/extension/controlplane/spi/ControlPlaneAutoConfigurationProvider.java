@@ -13,7 +13,7 @@ import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.metrics.export.MetricExporter;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
@@ -26,10 +26,10 @@ import javax.annotation.Nullable;
  *
  * <p>通过 SPI 机制自动集成到 OpenTelemetry SDK 自动配置中。
  *
- * <p>支持多信号源健康监控：
+ * <p>支持多信号源指标收集：
  * <ul>
- *   <li>SpanExporter - 监控 Span 导出健康状态</li>
- *   <li>MetricExporter - 监控 Metric 导出健康状态（更稳定，权重更高）</li>
+ *   <li>SpanExporter - 收集 Span 导出指标</li>
+ *   <li>MetricExporter - 收集 Metric 导出指标（更稳定，权重更高）</li>
  * </ul>
  */
 public final class ControlPlaneAutoConfigurationProvider
@@ -40,7 +40,7 @@ public final class ControlPlaneAutoConfigurationProvider
 
   @Nullable private static volatile ControlPlaneManager controlPlaneManager;
   @Nullable private static volatile DynamicSampler dynamicSampler;
-  @Nullable private static volatile OtlpHealthMonitor healthMonitor;
+  @Nullable private static volatile OtlpExportMetrics exportMetrics;
 
   @Override
   public void customize(AutoConfigurationCustomizer autoConfiguration) {
@@ -66,8 +66,8 @@ public final class ControlPlaneAutoConfigurationProvider
             return exporter;
           }
 
-          // 包装 exporter 以监控导出状态
-          return wrapSpanExporterWithHealthMonitor(exporter, config);
+          // 包装 exporter 以收集导出指标
+          return wrapSpanExporterWithExportMetrics(exporter, config);
         });
 
     // 添加 MetricExporter 自定义 (用于监控 OTLP Metric 导出健康状态)
@@ -77,8 +77,8 @@ public final class ControlPlaneAutoConfigurationProvider
             return exporter;
           }
 
-          // 包装 exporter 以监控导出状态
-          return wrapMetricExporterWithHealthMonitor(exporter, config);
+          // 包装 exporter 以收集导出指标
+          return wrapMetricExporterWithExportMetrics(exporter, config);
         });
 
     // 添加 TracerProvider 自定义
@@ -125,36 +125,34 @@ public final class ControlPlaneAutoConfigurationProvider
   }
 
   /**
-   * 确保健康监控器已创建
+   * 确保导出指标收集器已创建
    */
-  private static OtlpHealthMonitor ensureHealthMonitor(ConfigProperties config) {
-    if (healthMonitor == null) {
+  private static OtlpExportMetrics ensureExportMetrics(ConfigProperties config) {
+    if (exportMetrics == null) {
       synchronized (ControlPlaneAutoConfigurationProvider.class) {
-        if (healthMonitor == null) {
+        if (exportMetrics == null) {
           ControlPlaneConfig controlConfig = ControlPlaneConfig.create(config);
-          healthMonitor =
-              new OtlpHealthMonitor(
-                  controlConfig.getHealthWindowSize(),
-                  controlConfig.getHealthyThreshold(),
-                  controlConfig.getUnhealthyThreshold());
+          exportMetrics = OtlpExportMetrics.builder()
+              .windowMillis(controlConfig.getHealthWindowMillis())
+              .minSamples(controlConfig.getHealthMinSamples())
+              .build();
           logger.log(
               Level.INFO,
-              "Created OtlpHealthMonitor with windowSize={0}, healthyThreshold={1}, unhealthyThreshold={2}",
+              "Created OtlpExportMetrics with windowMillis={0}, minSamples={1}",
               new Object[] {
-                controlConfig.getHealthWindowSize(),
-                controlConfig.getHealthyThreshold(),
-                controlConfig.getUnhealthyThreshold()
+                controlConfig.getHealthWindowMillis(),
+                controlConfig.getHealthMinSamples()
               });
         }
       }
     }
-    return healthMonitor;
+    return exportMetrics;
   }
 
   /**
-   * 包装 SpanExporter 以监控健康状态
+   * 包装 SpanExporter 以收集导出指标
    */
-  private static SpanExporter wrapSpanExporterWithHealthMonitor(
+  private static SpanExporter wrapSpanExporterWithExportMetrics(
       SpanExporter exporter, ConfigProperties config) {
 
     logger.log(
@@ -162,14 +160,14 @@ public final class ControlPlaneAutoConfigurationProvider
         "Wrapping SpanExporter with HealthMonitoringSpanExporter: {0}",
         exporter.getClass().getName());
 
-    OtlpHealthMonitor monitor = ensureHealthMonitor(config);
-    return new HealthMonitoringSpanExporter(exporter, monitor);
+    OtlpExportMetrics metrics = ensureExportMetrics(config);
+    return new HealthMonitoringSpanExporter(exporter, metrics);
   }
 
   /**
-   * 包装 MetricExporter 以监控健康状态
+   * 包装 MetricExporter 以收集导出指标
    */
-  private static MetricExporter wrapMetricExporterWithHealthMonitor(
+  private static MetricExporter wrapMetricExporterWithExportMetrics(
       MetricExporter exporter, ConfigProperties config) {
 
     logger.log(
@@ -177,8 +175,8 @@ public final class ControlPlaneAutoConfigurationProvider
         "Wrapping MetricExporter with HealthMonitoringMetricExporter: {0}",
         exporter.getClass().getName());
 
-    OtlpHealthMonitor monitor = ensureHealthMonitor(config);
-    return new HealthMonitoringMetricExporter(exporter, monitor);
+    OtlpExportMetrics metrics = ensureExportMetrics(config);
+    return new HealthMonitoringMetricExporter(exporter, metrics);
   }
 
   private static void initializeControlPlane(ConfigProperties config) {
@@ -193,8 +191,8 @@ public final class ControlPlaneAutoConfigurationProvider
 
       ControlPlaneConfig controlConfig = ControlPlaneConfig.create(config);
 
-      // 确保健康监控器已创建
-      OtlpHealthMonitor monitor = ensureHealthMonitor(config);
+      // 确保导出指标收集器已创建
+      OtlpExportMetrics metrics = ensureExportMetrics(config);
 
       // 确保动态采样器已创建
       if (dynamicSampler == null) {
@@ -208,7 +206,7 @@ public final class ControlPlaneAutoConfigurationProvider
       ControlPlaneManager.Builder managerBuilder =
           ControlPlaneManager.builder()
               .setConfig(controlConfig)
-              .setHealthMonitor(monitor)
+              .setExportMetrics(metrics)
               .setConfigManager(configManager)
               .setDynamicSampler(dynamicSampler);
 
@@ -274,12 +272,12 @@ public final class ControlPlaneAutoConfigurationProvider
   }
 
   /**
-   * 获取健康监控器实例
+   * 获取导出指标收集器实例
    *
-   * @return 健康监控器，如果未初始化则返回 null
+   * @return 导出指标收集器，如果未初始化则返回 null
    */
   @Nullable
-  public static OtlpHealthMonitor getHealthMonitor() {
-    return healthMonitor;
+  public static OtlpExportMetrics getExportMetrics() {
+    return exportMetrics;
   }
 }

@@ -199,12 +199,26 @@ public final class ControlPlaneLogger {
    * 记录健康检查警告
    *
    * @param healthState 健康状态
+   * @deprecated 已废弃，使用 {@link #logExportMetricsWarning(double)}
    */
+  @Deprecated
   public void logHealthWarning(String healthState) {
     logger.log(
         Level.FINE,
         "{0} [HEALTH_WARN] OTLP not healthy, state={1}",
         new Object[] {PREFIX, healthState});
+  }
+
+  /**
+   * 记录导出指标警告
+   *
+   * @param successRate 成功率
+   */
+  public void logExportMetricsWarning(double successRate) {
+    logger.log(
+        Level.FINE,
+        "{0} [EXPORT_METRICS_WARN] OTLP export success rate is low, rate={1}",
+        new Object[] {PREFIX, String.format(java.util.Locale.ROOT, "%.1f%%", successRate * 100)});
   }
 
   // ===== 解析错误日志 =====

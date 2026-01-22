@@ -6,7 +6,7 @@
 package io.opentelemetry.sdk.extension.controlplane.spi;
 
 import io.opentelemetry.sdk.common.CompletableResultCode;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.health.SignalType;
 import io.opentelemetry.sdk.metrics.InstrumentType;
 import io.opentelemetry.sdk.metrics.data.AggregationTemporality;
@@ -17,12 +17,12 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 健康监控 MetricExporter 包装器
+ * 导出指标收集 MetricExporter 包装器
  *
- * <p>包装原始的 MetricExporter，监控导出结果以更新 OTLP 健康状态。
+ * <p>包装原始的 MetricExporter，收集导出结果指标。
  * 使用 {@link SignalType#METRIC} 信号类型记录导出结果。
  *
- * <p>Metric 导出相比 Span 导出更稳定和可预测，因此在综合健康计算中权重更高（默认 60%）。
+ * <p>Metric 导出相比 Span 导出更稳定和可预测，因此在综合指标计算中权重更高（默认 60%）。
  */
 public final class HealthMonitoringMetricExporter implements MetricExporter {
 
@@ -30,17 +30,17 @@ public final class HealthMonitoringMetricExporter implements MetricExporter {
       Logger.getLogger(HealthMonitoringMetricExporter.class.getName());
 
   private final MetricExporter delegate;
-  private final OtlpHealthMonitor healthMonitor;
+  private final OtlpExportMetrics exportMetrics;
 
   /**
-   * 创建健康监控 MetricExporter
+   * 创建导出指标收集 MetricExporter
    *
    * @param delegate 原始 MetricExporter
-   * @param healthMonitor 健康监控器
+   * @param exportMetrics 导出指标收集器
    */
-  public HealthMonitoringMetricExporter(MetricExporter delegate, OtlpHealthMonitor healthMonitor) {
+  public HealthMonitoringMetricExporter(MetricExporter delegate, OtlpExportMetrics exportMetrics) {
     this.delegate = delegate;
-    this.healthMonitor = healthMonitor;
+    this.exportMetrics = exportMetrics;
     logger.log(
         Level.INFO,
         "HealthMonitoringMetricExporter created, wrapping: {0}",
@@ -57,10 +57,10 @@ public final class HealthMonitoringMetricExporter implements MetricExporter {
     result.whenComplete(
         () -> {
           if (result.isSuccess()) {
-            healthMonitor.recordSuccess(SignalType.METRIC);
+            exportMetrics.recordSuccess(SignalType.METRIC);
             logger.log(Level.FINE, "Metric export succeeded, recorded success");
           } else {
-            healthMonitor.recordFailure("Metric export failed", SignalType.METRIC);
+            exportMetrics.recordFailure("Metric export failed", SignalType.METRIC);
             logger.log(Level.FINE, "Metric export failed, recorded failure");
           }
         });

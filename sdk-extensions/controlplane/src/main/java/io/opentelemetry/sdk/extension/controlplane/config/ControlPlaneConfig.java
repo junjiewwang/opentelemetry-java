@@ -86,6 +86,8 @@ public final class ControlPlaneConfig {
   private static final Duration DEFAULT_LONG_POLL_TIMEOUT = Duration.ofSeconds(60);
   private static final Duration DEFAULT_STATUS_REPORT_INTERVAL = Duration.ofSeconds(30);
   private static final int DEFAULT_HEALTH_WINDOW_SIZE = 100;
+  private static final long DEFAULT_HEALTH_WINDOW_MILLIS = 60_000L; // 60 seconds
+  private static final int DEFAULT_HEALTH_MIN_SAMPLES = 5;
   private static final double DEFAULT_HEALTHY_THRESHOLD = 0.9;
   private static final double DEFAULT_UNHEALTHY_THRESHOLD = 0.5;
   private static final int DEFAULT_STORAGE_MAX_FILES = 100;
@@ -317,6 +319,24 @@ public final class ControlPlaneConfig {
 
   public int getHealthWindowSize() {
     return healthWindowSize;
+  }
+
+  /**
+   * 获取健康检查时间窗口（毫秒）
+   *
+   * @return 时间窗口毫秒数
+   */
+  public long getHealthWindowMillis() {
+    return DEFAULT_HEALTH_WINDOW_MILLIS;
+  }
+
+  /**
+   * 获取健康检查最小样本数
+   *
+   * @return 最小样本数
+   */
+  public int getHealthMinSamples() {
+    return DEFAULT_HEALTH_MIN_SAMPLES;
   }
 
   public double getHealthyThreshold() {

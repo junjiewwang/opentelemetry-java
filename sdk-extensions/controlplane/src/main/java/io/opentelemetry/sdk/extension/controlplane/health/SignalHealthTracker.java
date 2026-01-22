@@ -18,7 +18,7 @@ import javax.annotation.Nullable;
  * 使用 {@link TimeWindowBuffer} 存储时间窗口内的样本。
  *
  * <p>职责单一：仅负责单信号的数据收集和成功率计算，
- * 不涉及综合健康判断（由 {@link CompositeHealthCalculator} 负责）。
+ * 不涉及综合健康判断（由 {@link OtlpExportMetrics} 负责汇总）。
  */
 public final class SignalHealthTracker {
 

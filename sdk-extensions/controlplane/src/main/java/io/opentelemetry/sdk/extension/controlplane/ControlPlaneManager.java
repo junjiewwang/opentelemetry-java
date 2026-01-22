@@ -23,13 +23,13 @@ import io.opentelemetry.sdk.extension.controlplane.core.tasks.CleanupTask;
 import io.opentelemetry.sdk.extension.controlplane.core.tasks.StatusReportTask;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.status.AgentStatusAggregator;
 import io.opentelemetry.sdk.extension.controlplane.status.ControlPlaneStateCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.HeartbeatReporter;
 import io.opentelemetry.sdk.extension.controlplane.status.IdentityCollector;
-import io.opentelemetry.sdk.extension.controlplane.status.OtlpHealthCollector;
+import io.opentelemetry.sdk.extension.controlplane.status.OtlpExportMetricsCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.SystemResourceCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.UptimeCollector;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
@@ -88,7 +88,7 @@ public final class ControlPlaneManager implements Closeable {
 
   // 业务组件（Phase 5: 使用 ControlPlaneService）
   private final ControlPlaneService service;
-  private final OtlpHealthMonitor healthMonitor;
+  private final OtlpExportMetrics exportMetrics;
   private final DynamicConfigManager configManager;
   private final DynamicSampler dynamicSampler;
   private final TaskResultPersistence resultPersistence;
@@ -113,7 +113,7 @@ public final class ControlPlaneManager implements Closeable {
   private ControlPlaneManager(Builder builder) {
     // 验证必需参数
     this.config = Objects.requireNonNull(builder.config, "config is required");
-    this.healthMonitor = Objects.requireNonNull(builder.healthMonitor, "healthMonitor is required");
+    this.exportMetrics = Objects.requireNonNull(builder.exportMetrics, "exportMetrics is required");
     this.configManager = Objects.requireNonNull(builder.configManager, "configManager is required");
     this.dynamicSampler =
         Objects.requireNonNull(builder.dynamicSampler, "dynamicSampler is required");
@@ -126,7 +126,7 @@ public final class ControlPlaneManager implements Closeable {
     this.resultPersistence = TaskResultPersistence.create(this.config);
     this.agentIdentity = AgentIdentityProvider.get();
     // Phase 5: 直接使用 ControlPlaneService（Protobuf-only）
-    this.service = ControlPlaneService.create(this.config, this.healthMonitor);
+    this.service = ControlPlaneService.create(this.config, this.exportMetrics);
 
     // 初始化状态收集器
     this.statusAggregator = new AgentStatusAggregator();
@@ -134,9 +134,20 @@ public final class ControlPlaneManager implements Closeable {
     this.uptimeCollector = new UptimeCollector();
     initializeStatusCollectors();
 
-    // 初始化健康检查协调器
+    // 初始化心跳上报器（Phase 5: 使用 ControlPlaneService）
+    // 注意：心跳上报器需要在健康检查协调器之前初始化
+    this.heartbeatReporter =
+        HeartbeatReporter.builder()
+            .setConfig(this.config)
+            .setService(this.service)
+            .setStatusAggregator(this.statusAggregator)
+            .setScheduler(this.taskManager.getScheduler())
+            .setListener(this::onHeartbeatComplete)
+            .build();
+
+    // 初始化健康检查协调器（使用心跳作为健康判断依据）
     this.healthCheckCoordinator =
-        new HealthCheckCoordinator(this.healthMonitor, this.connectionStateManager);
+        new HealthCheckCoordinator(this.heartbeatReporter, this.connectionStateManager);
 
     // 初始化统计管理器
     this.statistics =
@@ -166,16 +177,6 @@ public final class ControlPlaneManager implements Closeable {
             this.statistics,
             this.agentIdentity.getAgentId());
 
-    // 初始化心跳上报器（Phase 5: 使用 ControlPlaneService）
-    this.heartbeatReporter =
-        HeartbeatReporter.builder()
-            .setConfig(this.config)
-            .setService(this.service)
-            .setStatusAggregator(this.statusAggregator)
-            .setScheduler(this.taskManager.getScheduler())
-            .setListener(this::onHeartbeatComplete)
-            .build();
-
     // Arthas 集成
     this.arthasIntegration = builder.arthasIntegration;
 
@@ -198,7 +199,7 @@ public final class ControlPlaneManager implements Closeable {
     statusAggregator.registerCollector(new IdentityCollector());
     statusAggregator.registerCollector(uptimeCollector);
     statusAggregator.registerCollector(controlPlaneStateCollector);
-    statusAggregator.registerCollector(new OtlpHealthCollector(healthMonitor));
+    statusAggregator.registerCollector(new OtlpExportMetricsCollector(exportMetrics));
     statusAggregator.registerCollector(
         new SystemResourceCollector(config.isIncludeSystemResource()));
 
@@ -403,12 +404,12 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   /**
-   * 获取健康监控器
+   * 获取导出指标收集器
    *
-   * @return 健康监控器
+   * @return 导出指标收集器
    */
-  public OtlpHealthMonitor getHealthMonitor() {
-    return healthMonitor;
+  public OtlpExportMetrics getExportMetrics() {
+    return exportMetrics;
   }
 
   /**
@@ -512,7 +513,7 @@ public final class ControlPlaneManager implements Closeable {
   /** Builder for {@link ControlPlaneManager}. */
   public static final class Builder {
     @Nullable private ControlPlaneConfig config;
-    @Nullable private OtlpHealthMonitor healthMonitor;
+    @Nullable private OtlpExportMetrics exportMetrics;
     @Nullable private DynamicConfigManager configManager;
     @Nullable private DynamicSampler dynamicSampler;
     @Nullable private ArthasIntegration arthasIntegration;
@@ -532,13 +533,13 @@ public final class ControlPlaneManager implements Closeable {
     }
 
     /**
-     * 设置健康监控器
+     * 设置导出指标收集器
      *
-     * @param healthMonitor 健康监控器
+     * @param exportMetrics 导出指标收集器
      * @return this builder
      */
-    public Builder setHealthMonitor(OtlpHealthMonitor healthMonitor) {
-      this.healthMonitor = healthMonitor;
+    public Builder setExportMetrics(OtlpExportMetrics exportMetrics) {
+      this.exportMetrics = exportMetrics;
       return this;
     }
 
@@ -673,12 +674,11 @@ public final class ControlPlaneManager implements Closeable {
       if (config == null) {
         throw new IllegalStateException("config is required");
       }
-      if (healthMonitor == null) {
-        healthMonitor =
-            new OtlpHealthMonitor(
-                config.getHealthWindowSize(),
-                config.getHealthyThreshold(),
-                config.getUnhealthyThreshold());
+      if (exportMetrics == null) {
+        exportMetrics = OtlpExportMetrics.builder()
+            .windowMillis(config.getHealthWindowMillis())
+            .minSamples(config.getHealthMinSamples())
+            .build();
       }
       if (configManager == null) {
         configManager = new DynamicConfigManager();

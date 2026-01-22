@@ -5,8 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.status;
 
-import io.opentelemetry.sdk.extension.controlplane.health.CompositeHealthCalculator;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpHealthMonitor;
+import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.health.SignalHealthTracker;
 import io.opentelemetry.sdk.extension.controlplane.health.SignalType;
 import java.util.HashMap;
@@ -14,27 +13,26 @@ import java.util.Map;
 import javax.annotation.Nullable;
 
 /**
- * OTLP 健康状态收集器
+ * OTLP 导出指标收集器
  *
- * <p>收集 OTLP 导出的健康状态信息，包括：
+ * <p>收集 OTLP 导出的统计信息，用于状态上报，包括：
  * <ul>
- *   <li>otlpHealthState - 综合健康状态</li>
  *   <li>compositeSuccessRate - 综合成功率</li>
  *   <li>spanExportStats - Span 导出统计</li>
  *   <li>metricExportStats - Metric 导出统计</li>
- *   <li>healthConfig - 健康检测配置</li>
+ *   <li>exportConfig - 导出配置</li>
  * </ul>
  */
-public final class OtlpHealthCollector implements AgentStatusCollector {
+public final class OtlpExportMetricsCollector implements AgentStatusCollector {
 
-  private static final String NAME = "otlpHealth";
+  private static final String NAME = "otlpExportMetrics";
 
-  private final OtlpHealthMonitor healthMonitor;
+  private final OtlpExportMetrics exportMetrics;
   @Nullable private volatile String lastSpanError;
   @Nullable private volatile String lastMetricError;
 
-  public OtlpHealthCollector(OtlpHealthMonitor healthMonitor) {
-    this.healthMonitor = healthMonitor;
+  public OtlpExportMetricsCollector(OtlpExportMetrics exportMetrics) {
+    this.exportMetrics = exportMetrics;
   }
 
   @Override
@@ -46,11 +44,9 @@ public final class OtlpHealthCollector implements AgentStatusCollector {
   public Map<String, Object> collect() {
     Map<String, Object> data = new HashMap<>();
 
-    // 综合健康状态
-    data.put("otlpHealthState", healthMonitor.getState().name());
-    data.put("compositeSuccessRate", healthMonitor.getSuccessRate());
-    data.put("activeSignalCount", healthMonitor.getActiveSignalCount());
-    data.put("stateTransitionCount", healthMonitor.getStateTransitionCount());
+    // 综合指标
+    data.put("compositeSuccessRate", exportMetrics.getSuccessRate());
+    data.put("activeSignalCount", exportMetrics.getActiveSignalCount());
 
     // Span 导出统计
     Map<String, Object> spanStats = collectSignalStats(SignalType.SPAN, lastSpanError);
@@ -60,14 +56,11 @@ public final class OtlpHealthCollector implements AgentStatusCollector {
     Map<String, Object> metricStats = collectSignalStats(SignalType.METRIC, lastMetricError);
     data.put("metricExportStats", metricStats);
 
-    // 健康配置
-    Map<String, Object> healthConfig = new HashMap<>();
-    healthConfig.put("windowMillis", healthMonitor.getWindowMillis());
-    healthConfig.put("healthyThreshold", healthMonitor.getHealthyThreshold());
-    healthConfig.put("unhealthyThreshold", healthMonitor.getUnhealthyThreshold());
-    healthConfig.put("cooldownMillis", healthMonitor.getCooldownMillis());
-    healthConfig.put("minSamples", healthMonitor.getMinSamples());
-    data.put("healthConfig", healthConfig);
+    // 导出配置
+    Map<String, Object> exportConfig = new HashMap<>();
+    exportConfig.put("windowMillis", exportMetrics.getWindowMillis());
+    exportConfig.put("minSamples", exportMetrics.getMinSamples());
+    data.put("exportConfig", exportConfig);
 
     return data;
   }
@@ -77,7 +70,7 @@ public final class OtlpHealthCollector implements AgentStatusCollector {
    */
   private Map<String, Object> collectSignalStats(SignalType signalType, @Nullable String lastError) {
     Map<String, Object> stats = new HashMap<>();
-    SignalHealthTracker tracker = healthMonitor.getTracker(signalType);
+    SignalHealthTracker tracker = exportMetrics.getTracker(signalType);
 
     if (tracker != null) {
       SignalHealthTracker.SignalHealthSnapshot snapshot = tracker.createSnapshot();
@@ -139,22 +132,11 @@ public final class OtlpHealthCollector implements AgentStatusCollector {
   }
 
   /**
-   * 记录最后一次错误信息（向后兼容，默认记录到 Span）
+   * 获取导出指标快照
    *
-   * @param error 错误信息
-   * @deprecated 使用 {@link #recordLastSpanError(String)} 或 {@link #recordLastMetricError(String)}
+   * @return 导出指标快照
    */
-  @Deprecated
-  public void recordLastError(String error) {
-    recordLastSpanError(error);
-  }
-
-  /**
-   * 获取综合健康快照
-   *
-   * @return 综合健康快照
-   */
-  public CompositeHealthCalculator.CompositeHealthSnapshot getHealthSnapshot() {
-    return healthMonitor.createSnapshot();
+  public OtlpExportMetrics.ExportMetricsSnapshot getExportMetricsSnapshot() {
+    return exportMetrics.createSnapshot();
   }
 }

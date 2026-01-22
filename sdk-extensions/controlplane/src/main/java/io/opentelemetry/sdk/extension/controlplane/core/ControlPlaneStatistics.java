@@ -171,17 +171,17 @@ public final class ControlPlaneStatistics {
    * 强制输出状态日志
    */
   public void logStatus() {
-    String otlpHealthInfo = healthCheckCoordinator.buildOtlpHealthInfo();
+    String healthInfo = healthCheckCoordinator.buildHealthInfo();
 
     logger.log(
         Level.INFO,
-        "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, otlp: [{4}], configUrl: {5}",
+        "Control plane status - state: {0}, configPolls: {1}, taskPolls: {2}, statusReports: {3}, health: [{4}], configUrl: {5}",
         new Object[] {
           connectionStateManager.getState(),
           configPollCount.get(),
           taskPollCount.get(),
           statusReportCount.get(),
-          otlpHealthInfo,
+          healthInfo,
           configUrl
         });
   }
