@@ -8,16 +8,14 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.TaskStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskPollResult;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.AgentCapabilities;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskResponse;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusReporter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -289,9 +287,8 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
             "Task expired: expiresAt=%d, now=%d",
             expiresAtMillis, nowMillis);
         taskLogger.logTaskFailed(subTaskId, "TASK_EXPIRED", expiredErrorMsg);
-        // 上报服务端：使用 FAILED + error_code 模式
-        reportTaskResultToServer(
-            subTaskId, TaskStatus.TASK_STATUS_FAILED, "TASK_EXPIRED", expiredErrorMsg, nowMillis);
+        // 上报服务端：使用统一的状态上报器
+        reportTaskFailed(subTaskId, "TASK_EXPIRED", expiredErrorMsg);
         return;
         
       case STALE:
@@ -307,9 +304,8 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
             "Task too old: delay=%dms > maxAcceptableDelay=%dms",
             delayMillis, effectiveMaxDelay);
         taskLogger.logTaskFailed(subTaskId, "TASK_STALE", staleErrorMsg);
-        // 上报服务端：使用 FAILED + error_code 模式
-        reportTaskResultToServer(
-            subTaskId, TaskStatus.TASK_STATUS_FAILED, "TASK_STALE", staleErrorMsg, nowMillis);
+        // 上报服务端：使用统一的状态上报器
+        reportTaskFailed(subTaskId, "TASK_STALE", staleErrorMsg);
         return;
         
       case VALID_WITH_WARNING:
@@ -366,14 +362,8 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
           Level.WARNING,
           "[TASK-NO-DISPATCHER] TaskDispatcher not configured, task will not be executed: taskId={0}, type={1}",
           new Object[] {task.getTaskId(), taskType});
-      // 上报失败：无分发器
-      long nowMillis = System.currentTimeMillis();
-      reportTaskResultToServer(
-          task.getTaskId(),
-          TaskStatus.TASK_STATUS_FAILED,
-          "NO_DISPATCHER",
-          "TaskDispatcher not configured",
-          nowMillis);
+      // 上报失败：无分发器（使用统一的状态上报器）
+      reportTaskFailed(task.getTaskId(), "NO_DISPATCHER", "TaskDispatcher not configured");
       return;
     }
 
@@ -405,13 +395,8 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
           Level.INFO,
           "[TASK-ALREADY-RUNNING] Task already running, reporting RUNNING status to server: taskId={0}, type={1}",
           new Object[] {task.getTaskId(), taskType});
-      long nowMillis = System.currentTimeMillis();
-      reportTaskResultToServer(
-          task.getTaskId(),
-          TaskStatus.TASK_STATUS_RUNNING,
-          null,
-          "Task is already running",
-          nowMillis);
+      // 使用统一的状态上报器
+      reportTaskRunning(task.getTaskId(), "Task is already running");
     } else {
       // 其他失败情况（NO_EXECUTOR, EXECUTOR_UNAVAILABLE, DISPATCHER_CLOSED）
       // TaskDispatcher 内部已经上报了失败状态
@@ -452,56 +437,41 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   }
 
   /**
-   * 上报任务结果到服务端
+   * 上报任务失败状态
    *
-   * <p><b>Phase 5</b>：直接使用 Protobuf TaskResultRequest。
+   * <p>将上报逻辑委托给统一的 {@link TaskStatusReporter}，消除重复代码。
    *
    * @param taskId 任务 ID
-   * @param status 任务状态（Protobuf 枚举）
    * @param errorCode 错误码
    * @param errorMessage 错误信息
-   * @param completedAtMillis 完成时间
    */
-  private void reportTaskResultToServer(
-      String taskId,
-      TaskStatus status,
-      @Nullable String errorCode,
-      @Nullable String errorMessage,
-      long completedAtMillis) {
-    
-    // Phase 5: 直接使用 Protobuf Builder
-    TaskResultRequest request = TaskResultRequest.newBuilder()
-        .setTaskId(taskId)
-        .setAgentId(agentId)
-        .setStatus(status)
-        .setErrorCode(errorCode != null ? errorCode : "")
-        .setErrorMessage(errorMessage != null ? errorMessage : "")
-        .setStartedAtMillis(completedAtMillis)
-        .setCompletedAtMillis(completedAtMillis)
-        .setExecutionTimeMillis(0)
-        .build();
+  private void reportTaskFailed(String taskId, String errorCode, String errorMessage) {
+    TaskDispatcher dispatcher = this.taskDispatcher;
+    if (dispatcher != null) {
+      // 使用 TaskDispatcher 中的 TaskStatusReporter（Fire-and-Forget 模式）
+      dispatcher.getStatusReporter().fireFailed(taskId, errorCode, errorMessage);
+    } else {
+      // 无分发器时，创建临时上报器
+      TaskStatusReporter reporter = new TaskStatusReporter(service, agentId);
+      reporter.fireFailed(taskId, errorCode, errorMessage);
+    }
+  }
 
-    // 异步上报，不阻塞主流程
-    CompletableFuture<TaskResultResponse> future = service.reportTaskResult(request);
-    @SuppressWarnings("FutureReturnValueIgnored")
-    Object unused = future.whenComplete((response, error) -> {
-      if (error != null) {
-        logger.log(
-            Level.WARNING,
-            "[TASK-REPORT] Failed to report task result: taskId={0}, error={1}",
-            new Object[] {taskId, error.getMessage()});
-      } else if (response != null && !response.getAcknowledged()) {
-        logger.log(
-            Level.WARNING,
-            "[TASK-REPORT] Server rejected task result: taskId={0}, error={1}",
-            new Object[] {taskId, response.getStatus().getMessage()});
-      } else {
-        logger.log(
-            Level.INFO,
-            "[TASK-REPORT] Successfully reported task result: taskId={0}, status={1}",
-            new Object[] {taskId, status});
-      }
-    });
+  /**
+   * 上报任务运行中状态
+   *
+   * @param taskId 任务 ID
+   * @param message 状态信息
+   */
+  private void reportTaskRunning(String taskId, String message) {
+    TaskDispatcher dispatcher = this.taskDispatcher;
+    if (dispatcher != null) {
+      // Fire-and-Forget 模式，非终态无需关心结果
+      dispatcher.getStatusReporter().fireRunning(taskId, message);
+    } else {
+      TaskStatusReporter reporter = new TaskStatusReporter(service, agentId);
+      reporter.fireRunning(taskId, message);
+    }
   }
 
   /**

@@ -8,7 +8,6 @@ package io.opentelemetry.sdk.extension.controlplane.client;
 import io.opentelemetry.sdk.extension.controlplane.client.transport.Transport;
 import io.opentelemetry.sdk.extension.controlplane.client.transport.TransportFactory;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
@@ -130,11 +129,10 @@ public interface ControlPlaneService extends Closeable {
    * 创建服务实例
    *
    * @param config 控制平面配置
-   * @param exportMetrics OTLP 导出指标收集器
    * @return 服务实例
    */
-  static ControlPlaneService create(ControlPlaneConfig config, OtlpExportMetrics exportMetrics) {
+  static ControlPlaneService create(ControlPlaneConfig config) {
     Transport transport = TransportFactory.create(config);
-    return new DefaultControlPlaneService(transport, exportMetrics, config);
+    return new DefaultControlPlaneService(transport, config);
   }
 }

@@ -6,14 +6,12 @@
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.TaskStatus;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEvent;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEventManager;
+import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusReporter;
 import java.io.Closeable;
 import java.util.HashMap;
 import java.util.Locale;
@@ -21,7 +19,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -146,9 +143,8 @@ public final class TaskDispatcher implements Closeable {
   /** 统一任务状态事件管理器（事件驱动上报入口） */
   private final TaskStatusEventManager statusEventManager = new TaskStatusEventManager();
 
-  /** 每个任务当前已上报到服务端的最终状态（用于去重/幂等） */
-  private final Map<String, AtomicReference<TaskStatus>> reportedTerminalStatus =
-      new ConcurrentHashMap<>();
+  /** 统一任务状态上报器 */
+  private final TaskStatusReporter statusReporter;
 
   /**
    * 创建任务分发器
@@ -191,9 +187,12 @@ public final class TaskDispatcher implements Closeable {
       return t;
     });
 
+    // 初始化状态上报器
+    this.statusReporter = new TaskStatusReporter(service, agentId);
+
     logger.log(Level.INFO, "TaskDispatcher initialized for agent: {0}", agentId);
 
-    // 将事件管理器的事件统一转为 reportResult 上报（实时）
+    // 将事件管理器的事件统一转发给状态上报器
     this.statusEventManager.addListener(this::onTaskStatusEvent);
   }
 
@@ -201,27 +200,9 @@ public final class TaskDispatcher implements Closeable {
     if (closed) {
       return;
     }
-    String taskId = event.getTaskId();
-    TaskExecutionResult result = event.toExecutionResult();
-
-    // Phase 5: 转换为 Protobuf 状态
-    TaskStatus protoStatus = convertToProtoStatus(result.getStatus());
-
-    // 终态幂等：SUCCESS/FAILED/TIMEOUT/CANCELLED 只上报一次；RUNNING 可重复但会被管理器做节流/合并。
-    if (protoStatus != TaskStatus.TASK_STATUS_RUNNING) {
-      AtomicReference<TaskStatus> ref =
-          reportedTerminalStatus.computeIfAbsent(taskId, k -> new AtomicReference<>());
-      TaskStatus prev = ref.get();
-      if (prev == TaskStatus.TASK_STATUS_SUCCESS
-          || prev == TaskStatus.TASK_STATUS_FAILED
-          || prev == TaskStatus.TASK_STATUS_TIMEOUT
-          || prev == TaskStatus.TASK_STATUS_CANCELLED) {
-        return;
-      }
-      ref.set(protoStatus);
-    }
-
-    reportResult(taskId, result);
+    // 委托给统一的状态上报器（内部已实现幂等性检查）
+    @SuppressWarnings("FutureReturnValueIgnored")
+    Object unused = statusReporter.report(event.getTaskId(), event.toExecutionResult());
   }
 
   /**
@@ -319,9 +300,9 @@ public final class TaskDispatcher implements Closeable {
           new Object[] {taskType, taskId});
       runningTasks.remove(taskId);
       // 上报失败：无执行器
-      reportResult(taskId, TaskExecutionResult.failed(
-          "NO_EXECUTOR",
-          "No executor registered for task type: " + taskType));
+      @SuppressWarnings("FutureReturnValueIgnored")
+      Object unused1 = statusReporter.reportFailed(taskId, "NO_EXECUTOR",
+          "No executor registered for task type: " + taskType);
       return DispatchResult.noExecutor(taskType);
     }
 
@@ -333,9 +314,9 @@ public final class TaskDispatcher implements Closeable {
           new Object[] {taskType, taskId});
       runningTasks.remove(taskId);
       // 上报失败：执行器不可用
-      reportResult(taskId, TaskExecutionResult.failed(
-          "EXECUTOR_UNAVAILABLE",
-          "Executor for " + taskType + " is not available"));
+      @SuppressWarnings("FutureReturnValueIgnored")
+      Object unused2 = statusReporter.reportFailed(taskId, "EXECUTOR_UNAVAILABLE",
+          "Executor for " + taskType + " is not available");
       return DispatchResult.executorUnavailable(taskType);
     }
 
@@ -437,10 +418,10 @@ public final class TaskDispatcher implements Closeable {
         }
       }
 
-      // 上报结果到服务端
+      // 上报结果到服务端（委托给统一的状态上报器）
       // 说明：RUNNING 不是终态，终态应由执行器通过 TaskStatusEmitter 上报。
       if (finalResult.getStatus() != TaskExecutionResult.Status.RUNNING) {
-        reportResult(taskId, finalResult);
+        statusReporter.report(taskId, finalResult);
       }
 
       // 记录任务完成日志
@@ -573,68 +554,12 @@ public final class TaskDispatcher implements Closeable {
   }
 
   /**
-   * 上报任务结果到服务端
+   * 获取任务状态上报器
    *
-   * <p><b>Phase 5</b>：直接使用 Protobuf TaskResultRequest。
+   * @return 状态上报器
    */
-  private void reportResult(String taskId, TaskExecutionResult result) {
-    // Phase 5: 转换为 Protobuf 状态
-    TaskStatus protoStatus = convertToProtoStatus(result.getStatus());
-
-    // Phase 5: 直接使用 Protobuf Builder
-    TaskResultRequest request = TaskResultRequest.newBuilder()
-        .setTaskId(taskId)
-        .setAgentId(agentId)
-        .setStatus(protoStatus)
-        .setErrorCode(result.getErrorCode() != null ? result.getErrorCode() : "")
-        .setErrorMessage(result.getErrorMessage() != null ? result.getErrorMessage() : "")
-        .setResultJson(result.getResultJson() != null ? result.getResultJson() : "")
-        .setStartedAtMillis(result.getStartedAtMillis())
-        .setCompletedAtMillis(result.getCompletedAtMillis())
-        .setExecutionTimeMillis(result.getExecutionTimeMillis())
-        .build();
-
-    CompletableFuture<TaskResultResponse> future = service.reportTaskResult(request);
-    @SuppressWarnings("FutureReturnValueIgnored")
-    Object unused = future.whenComplete((response, error) -> {
-      if (error != null) {
-        logger.log(
-            Level.WARNING,
-            "[TASK-REPORT-FAILED] Failed to report task result: taskId={0}, error={1}",
-            new Object[] {taskId, error.getMessage()});
-      } else if (response != null && !response.getAcknowledged()) {
-        logger.log(
-            Level.WARNING,
-            "[TASK-REPORT-REJECTED] Server rejected task result: taskId={0}, error={1}",
-            new Object[] {taskId, response.getStatus().getMessage()});
-      } else {
-        logger.log(
-            Level.INFO,
-            "[TASK-REPORT-SUCCESS] Task result reported: taskId={0}, status={1}",
-            new Object[] {taskId, result.getStatus()});
-      }
-    });
-  }
-
-  /**
-   * 转换内部状态到 Protobuf 状态
-   */
-  private static TaskStatus convertToProtoStatus(TaskExecutionResult.Status status) {
-    switch (status) {
-      case PENDING:
-        return TaskStatus.TASK_STATUS_PENDING;
-      case RUNNING:
-        return TaskStatus.TASK_STATUS_RUNNING;
-      case SUCCESS:
-        return TaskStatus.TASK_STATUS_SUCCESS;
-      case FAILED:
-        return TaskStatus.TASK_STATUS_FAILED;
-      case TIMEOUT:
-        return TaskStatus.TASK_STATUS_TIMEOUT;
-      case CANCELLED:
-        return TaskStatus.TASK_STATUS_CANCELLED;
-    }
-    return TaskStatus.TASK_STATUS_UNSPECIFIED;
+  public TaskStatusReporter getStatusReporter() {
+    return statusReporter;
   }
 
   /**

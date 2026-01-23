@@ -42,32 +42,9 @@ public final class ControlPlaneConfig {
   // 轮询配置（configPollInterval 和 taskPollInterval 已由长轮询替代）
   private static final String STATUS_REPORT_INTERVAL = "otel.agent.control.status.report.interval";
 
-  // 健康监控配置
-  private static final String HEALTH_WINDOW_SIZE = "otel.agent.control.health.window.size";
-  private static final String HEALTH_HEALTHY_THRESHOLD =
-      "otel.agent.control.health.healthy.threshold";
-  private static final String HEALTH_UNHEALTHY_THRESHOLD =
-      "otel.agent.control.health.unhealthy.threshold";
-
-  // 持久化配置
-  private static final String STORAGE_DIR = "otel.agent.control.storage.dir";
-  private static final String STORAGE_MAX_FILES = "otel.agent.control.storage.max.files";
-  private static final String STORAGE_MAX_SIZE = "otel.agent.control.storage.max.size";
-
-  // 任务结果配置
-  private static final String TASK_RESULT_MAX_RETRY = "otel.agent.control.task.result.max.retry";
-  private static final String TASK_RESULT_RETRY_INTERVAL =
-      "otel.agent.control.task.result.retry.interval";
-  private static final String TASK_RESULT_EXPIRATION = "otel.agent.control.task.result.expiration";
-  private static final String TASK_RESULT_COMPRESSION_THRESHOLD =
-      "otel.agent.control.task.result.compression.threshold";
-  private static final String TASK_RESULT_CHUNKED_THRESHOLD =
-      "otel.agent.control.task.result.chunked.threshold";
-  private static final String TASK_RESULT_CHUNK_SIZE = "otel.agent.control.task.result.chunk.size";
-  private static final String TASK_RESULT_MAX_SIZE = "otel.agent.control.task.result.max.size";
-
   // 重试配置
   private static final String RETRY_MAX_ATTEMPTS = "otel.agent.control.retry.max.attempts";
+
   private static final String RETRY_INITIAL_BACKOFF = "otel.agent.control.retry.initial.backoff";
   private static final String RETRY_MAX_BACKOFF = "otel.agent.control.retry.max.backoff";
   private static final String RETRY_BACKOFF_MULTIPLIER =
@@ -80,31 +57,41 @@ public final class ControlPlaneConfig {
   // Arthas 配置
   private static final String ARTHAS_ENABLED = "otel.agent.control.arthas.enabled";
 
+  // 存储配置
+  private static final String STORAGE_DIR = "otel.agent.control.storage.dir";
+  private static final String STORAGE_MAX_FILES = "otel.agent.control.storage.max.files";
+  private static final String STORAGE_MAX_SIZE = "otel.agent.control.storage.max.size";
+
+  // 任务结果配置
+  private static final String TASK_RESULT_MAX_RETRY = "otel.agent.control.task.result.max.retry";
+  private static final String TASK_RESULT_RETRY_INTERVAL = "otel.agent.control.task.result.retry.interval";
+  private static final String TASK_RESULT_EXPIRATION = "otel.agent.control.task.result.expiration";
+  private static final String TASK_RESULT_COMPRESSION_THRESHOLD = "otel.agent.control.task.result.compression.threshold";
+  private static final String TASK_RESULT_CHUNKED_THRESHOLD = "otel.agent.control.task.result.chunked.threshold";
+  private static final String TASK_RESULT_CHUNK_SIZE = "otel.agent.control.task.result.chunk.size";
+  private static final String TASK_RESULT_MAX_SIZE = "otel.agent.control.task.result.max.size";
+
   // ===== 默认值常量 =====
   private static final String DEFAULT_PROTOCOL = "grpc";
   private static final String DEFAULT_HTTP_BASE_PATH = "/v1/control";
   private static final Duration DEFAULT_LONG_POLL_TIMEOUT = Duration.ofSeconds(60);
   private static final Duration DEFAULT_STATUS_REPORT_INTERVAL = Duration.ofSeconds(30);
-  private static final int DEFAULT_HEALTH_WINDOW_SIZE = 100;
-  private static final long DEFAULT_HEALTH_WINDOW_MILLIS = 60_000L; // 60 seconds
-  private static final int DEFAULT_HEALTH_MIN_SAMPLES = 5;
-  private static final double DEFAULT_HEALTHY_THRESHOLD = 0.9;
-  private static final double DEFAULT_UNHEALTHY_THRESHOLD = 0.5;
-  private static final int DEFAULT_STORAGE_MAX_FILES = 100;
-  private static final long DEFAULT_STORAGE_MAX_SIZE = 50 * 1024 * 1024L; // 50MB
-  private static final int DEFAULT_TASK_RESULT_MAX_RETRY = 3;
-  private static final Duration DEFAULT_TASK_RESULT_RETRY_INTERVAL = Duration.ofSeconds(60);
-  private static final Duration DEFAULT_TASK_RESULT_EXPIRATION = Duration.ofHours(24);
-  private static final long DEFAULT_COMPRESSION_THRESHOLD = 1024L; // 1KB
-  private static final long DEFAULT_CHUNKED_THRESHOLD = 50 * 1024 * 1024L; // 50MB
-  private static final long DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024L; // 10MB
-  private static final long DEFAULT_MAX_SIZE = 200 * 1024 * 1024L; // 200MB
   private static final int DEFAULT_RETRY_MAX_ATTEMPTS = 5;
   private static final Duration DEFAULT_RETRY_INITIAL_BACKOFF = Duration.ofSeconds(1);
   private static final Duration DEFAULT_RETRY_MAX_BACKOFF = Duration.ofSeconds(30);
   private static final double DEFAULT_RETRY_BACKOFF_MULTIPLIER = 2.0;
   private static final boolean DEFAULT_INCLUDE_SYSTEM_RESOURCE = true;
   private static final boolean DEFAULT_ARTHAS_ENABLED = true;
+
+  // 存储默认值
+  private static final String DEFAULT_STORAGE_DIR = System.getProperty("java.io.tmpdir") + "/otel-controlplane";
+  private static final int DEFAULT_STORAGE_MAX_FILES = 100;
+  private static final long DEFAULT_STORAGE_MAX_SIZE = 100 * 1024 * 1024; // 100MB
+
+  // 任务结果默认值
+  private static final int DEFAULT_TASK_RESULT_MAX_RETRY = 3;
+  private static final Duration DEFAULT_TASK_RESULT_RETRY_INTERVAL = Duration.ofSeconds(5);
+  private static final Duration DEFAULT_TASK_RESULT_EXPIRATION = Duration.ofHours(24);
 
   // ===== 配置字段 =====
   private final boolean enabled;
@@ -113,19 +100,6 @@ public final class ControlPlaneConfig {
   private final String httpBasePath;
   private final Duration longPollTimeout;
   private final Duration statusReportInterval;
-  private final int healthWindowSize;
-  private final double healthyThreshold;
-  private final double unhealthyThreshold;
-  private final String storageDir;
-  private final int storageMaxFiles;
-  private final long storageMaxSize;
-  private final int taskResultMaxRetry;
-  private final Duration taskResultRetryInterval;
-  private final Duration taskResultExpiration;
-  private final long compressionThreshold;
-  private final long chunkedThreshold;
-  private final long chunkSize;
-  private final long maxSize;
   private final int retryMaxAttempts;
   private final Duration retryInitialBackoff;
   private final Duration retryMaxBackoff;
@@ -133,6 +107,22 @@ public final class ControlPlaneConfig {
   private final boolean includeSystemResource;
   private final boolean arthasEnabled;
   @Nullable private final String headers;
+
+  // 存储配置字段
+  private final String storageDir;
+  private final int storageMaxFiles;
+  private final long storageMaxSize;
+
+  // 任务结果配置字段
+  private final int taskResultMaxRetry;
+  private final Duration taskResultRetryInterval;
+  private final Duration taskResultExpiration;
+
+  // TaskResultSizePolicy 相关字段
+  private final long compressionThreshold;
+  private final long chunkedThreshold;
+  private final long chunkSize;
+  private final long maxSize;
 
   // Auth Token (启动时一次性解析)
   @Nullable private final String authToken;
@@ -145,9 +135,13 @@ public final class ControlPlaneConfig {
     this.httpBasePath = builder.httpBasePath;
     this.longPollTimeout = builder.longPollTimeout;
     this.statusReportInterval = builder.statusReportInterval;
-    this.healthWindowSize = builder.healthWindowSize;
-    this.healthyThreshold = builder.healthyThreshold;
-    this.unhealthyThreshold = builder.unhealthyThreshold;
+    this.retryMaxAttempts = builder.retryMaxAttempts;
+    this.retryInitialBackoff = builder.retryInitialBackoff;
+    this.retryMaxBackoff = builder.retryMaxBackoff;
+    this.retryBackoffMultiplier = builder.retryBackoffMultiplier;
+    this.includeSystemResource = builder.includeSystemResource;
+    this.arthasEnabled = builder.arthasEnabled;
+    this.headers = builder.headers;
     this.storageDir = builder.storageDir;
     this.storageMaxFiles = builder.storageMaxFiles;
     this.storageMaxSize = builder.storageMaxSize;
@@ -158,13 +152,6 @@ public final class ControlPlaneConfig {
     this.chunkedThreshold = builder.chunkedThreshold;
     this.chunkSize = builder.chunkSize;
     this.maxSize = builder.maxSize;
-    this.retryMaxAttempts = builder.retryMaxAttempts;
-    this.retryInitialBackoff = builder.retryInitialBackoff;
-    this.retryMaxBackoff = builder.retryMaxBackoff;
-    this.retryBackoffMultiplier = builder.retryBackoffMultiplier;
-    this.includeSystemResource = builder.includeSystemResource;
-    this.arthasEnabled = builder.arthasEnabled;
-    this.headers = builder.headers;
 
     // 一次性解析 AuthToken
     AuthTokenResult result = resolveAuthToken(builder.resourceAttributes, builder.headers);
@@ -317,76 +304,6 @@ public final class ControlPlaneConfig {
     return statusReportInterval;
   }
 
-  public int getHealthWindowSize() {
-    return healthWindowSize;
-  }
-
-  /**
-   * 获取健康检查时间窗口（毫秒）
-   *
-   * @return 时间窗口毫秒数
-   */
-  public long getHealthWindowMillis() {
-    return DEFAULT_HEALTH_WINDOW_MILLIS;
-  }
-
-  /**
-   * 获取健康检查最小样本数
-   *
-   * @return 最小样本数
-   */
-  public int getHealthMinSamples() {
-    return DEFAULT_HEALTH_MIN_SAMPLES;
-  }
-
-  public double getHealthyThreshold() {
-    return healthyThreshold;
-  }
-
-  public double getUnhealthyThreshold() {
-    return unhealthyThreshold;
-  }
-
-  public String getStorageDir() {
-    return storageDir;
-  }
-
-  public int getStorageMaxFiles() {
-    return storageMaxFiles;
-  }
-
-  public long getStorageMaxSize() {
-    return storageMaxSize;
-  }
-
-  public int getTaskResultMaxRetry() {
-    return taskResultMaxRetry;
-  }
-
-  public Duration getTaskResultRetryInterval() {
-    return taskResultRetryInterval;
-  }
-
-  public Duration getTaskResultExpiration() {
-    return taskResultExpiration;
-  }
-
-  public long getCompressionThreshold() {
-    return compressionThreshold;
-  }
-
-  public long getChunkedThreshold() {
-    return chunkedThreshold;
-  }
-
-  public long getChunkSize() {
-    return chunkSize;
-  }
-
-  public long getMaxSize() {
-    return maxSize;
-  }
-
   public int getRetryMaxAttempts() {
     return retryMaxAttempts;
   }
@@ -469,6 +386,96 @@ public final class ControlPlaneConfig {
   }
 
   /**
+   * 获取存储目录
+   *
+   * @return 存储目录路径
+   */
+  public String getStorageDir() {
+    return storageDir;
+  }
+
+  /**
+   * 获取存储最大文件数
+   *
+   * @return 最大文件数
+   */
+  public int getStorageMaxFiles() {
+    return storageMaxFiles;
+  }
+
+  /**
+   * 获取存储最大大小
+   *
+   * @return 最大大小（字节）
+   */
+  public long getStorageMaxSize() {
+    return storageMaxSize;
+  }
+
+  /**
+   * 获取任务结果最大重试次数
+   *
+   * @return 最大重试次数
+   */
+  public int getTaskResultMaxRetry() {
+    return taskResultMaxRetry;
+  }
+
+  /**
+   * 获取任务结果重试间隔
+   *
+   * @return 重试间隔
+   */
+  public Duration getTaskResultRetryInterval() {
+    return taskResultRetryInterval;
+  }
+
+  /**
+   * 获取任务结果过期时间
+   *
+   * @return 过期时间
+   */
+  public Duration getTaskResultExpiration() {
+    return taskResultExpiration;
+  }
+
+  /**
+   * 获取压缩阈值
+   *
+   * @return 压缩阈值（字节）
+   */
+  public long getCompressionThreshold() {
+    return compressionThreshold;
+  }
+
+  /**
+   * 获取分片阈值
+   *
+   * @return 分片阈值（字节）
+   */
+  public long getChunkedThreshold() {
+    return chunkedThreshold;
+  }
+
+  /**
+   * 获取分片大小
+   *
+   * @return 分片大小（字节）
+   */
+  public long getChunkSize() {
+    return chunkSize;
+  }
+
+  /**
+   * 获取最大结果大小
+   *
+   * @return 最大大小（字节）
+   */
+  public long getMaxSize() {
+    return maxSize;
+  }
+
+  /**
    * 获取控制平面 URL
    *
    * @return 完整的控制平面 URL
@@ -492,19 +499,6 @@ public final class ControlPlaneConfig {
     private String httpBasePath = DEFAULT_HTTP_BASE_PATH;
     private Duration longPollTimeout = DEFAULT_LONG_POLL_TIMEOUT;
     private Duration statusReportInterval = DEFAULT_STATUS_REPORT_INTERVAL;
-    private int healthWindowSize = DEFAULT_HEALTH_WINDOW_SIZE;
-    private double healthyThreshold = DEFAULT_HEALTHY_THRESHOLD;
-    private double unhealthyThreshold = DEFAULT_UNHEALTHY_THRESHOLD;
-    private String storageDir = "/tmp/otel-agent/control";
-    private int storageMaxFiles = DEFAULT_STORAGE_MAX_FILES;
-    private long storageMaxSize = DEFAULT_STORAGE_MAX_SIZE;
-    private int taskResultMaxRetry = DEFAULT_TASK_RESULT_MAX_RETRY;
-    private Duration taskResultRetryInterval = DEFAULT_TASK_RESULT_RETRY_INTERVAL;
-    private Duration taskResultExpiration = DEFAULT_TASK_RESULT_EXPIRATION;
-    private long compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD;
-    private long chunkedThreshold = DEFAULT_CHUNKED_THRESHOLD;
-    private long chunkSize = DEFAULT_CHUNK_SIZE;
-    private long maxSize = DEFAULT_MAX_SIZE;
     private int retryMaxAttempts = DEFAULT_RETRY_MAX_ATTEMPTS;
     private Duration retryInitialBackoff = DEFAULT_RETRY_INITIAL_BACKOFF;
     private Duration retryMaxBackoff = DEFAULT_RETRY_MAX_BACKOFF;
@@ -513,6 +507,22 @@ public final class ControlPlaneConfig {
     private boolean arthasEnabled = DEFAULT_ARTHAS_ENABLED;
     @Nullable private String headers;
     @Nullable private String resourceAttributes;
+
+    // 存储配置字段
+    private String storageDir = DEFAULT_STORAGE_DIR;
+    private int storageMaxFiles = DEFAULT_STORAGE_MAX_FILES;
+    private long storageMaxSize = DEFAULT_STORAGE_MAX_SIZE;
+
+    // 任务结果配置字段
+    private int taskResultMaxRetry = DEFAULT_TASK_RESULT_MAX_RETRY;
+    private Duration taskResultRetryInterval = DEFAULT_TASK_RESULT_RETRY_INTERVAL;
+    private Duration taskResultExpiration = DEFAULT_TASK_RESULT_EXPIRATION;
+
+    // TaskResultSizePolicy 相关字段
+    private long compressionThreshold = 1024; // 1KB
+    private long chunkedThreshold = 50 * 1024 * 1024; // 50MB
+    private long chunkSize = 5 * 1024 * 1024; // 5MB
+    private long maxSize = 200 * 1024 * 1024; // 200MB
 
     private Builder() {}
 
@@ -555,21 +565,6 @@ public final class ControlPlaneConfig {
       Duration statusReport = properties.getDuration(STATUS_REPORT_INTERVAL);
       if (statusReport != null) {
         this.statusReportInterval = statusReport;
-      }
-
-      Integer windowSize = properties.getInt(HEALTH_WINDOW_SIZE);
-      if (windowSize != null) {
-        this.healthWindowSize = windowSize;
-      }
-
-      Double healthy = properties.getDouble(HEALTH_HEALTHY_THRESHOLD);
-      if (healthy != null) {
-        this.healthyThreshold = healthy;
-      }
-
-      Double unhealthy = properties.getDouble(HEALTH_UNHEALTHY_THRESHOLD);
-      if (unhealthy != null) {
-        this.unhealthyThreshold = unhealthy;
       }
 
       String storage = properties.getString(STORAGE_DIR);
@@ -771,10 +766,6 @@ public final class ControlPlaneConfig {
       if (chunkSize > chunkedThreshold) {
         throw new IllegalArgumentException(
             "chunkSize must be less than or equal to chunkedThreshold");
-      }
-      if (healthyThreshold <= unhealthyThreshold) {
-        throw new IllegalArgumentException(
-            "healthyThreshold must be greater than unhealthyThreshold");
       }
     }
   }

@@ -13,10 +13,7 @@ import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
-import io.opentelemetry.sdk.metrics.export.MetricExporter;
-import io.opentelemetry.sdk.trace.export.SpanExporter;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -25,12 +22,6 @@ import javax.annotation.Nullable;
  * 控制平面自动配置提供者
  *
  * <p>通过 SPI 机制自动集成到 OpenTelemetry SDK 自动配置中。
- *
- * <p>支持多信号源指标收集：
- * <ul>
- *   <li>SpanExporter - 收集 Span 导出指标</li>
- *   <li>MetricExporter - 收集 Metric 导出指标（更稳定，权重更高）</li>
- * </ul>
  */
 public final class ControlPlaneAutoConfigurationProvider
     implements AutoConfigurationCustomizerProvider {
@@ -40,7 +31,6 @@ public final class ControlPlaneAutoConfigurationProvider
 
   @Nullable private static volatile ControlPlaneManager controlPlaneManager;
   @Nullable private static volatile DynamicSampler dynamicSampler;
-  @Nullable private static volatile OtlpExportMetrics exportMetrics;
 
   @Override
   public void customize(AutoConfigurationCustomizer autoConfiguration) {
@@ -57,28 +47,6 @@ public final class ControlPlaneAutoConfigurationProvider
           dynamicSampler = new DynamicSampler(sampler);
           logger.log(Level.INFO, "Wrapped sampler with DynamicSampler for control plane");
           return dynamicSampler;
-        });
-
-    // 添加 SpanExporter 自定义 (用于监控 OTLP Span 导出健康状态)
-    autoConfiguration.addSpanExporterCustomizer(
-        (exporter, config) -> {
-          if (!isEnabled(config)) {
-            return exporter;
-          }
-
-          // 包装 exporter 以收集导出指标
-          return wrapSpanExporterWithExportMetrics(exporter, config);
-        });
-
-    // 添加 MetricExporter 自定义 (用于监控 OTLP Metric 导出健康状态)
-    autoConfiguration.addMetricExporterCustomizer(
-        (exporter, config) -> {
-          if (!isEnabled(config)) {
-            return exporter;
-          }
-
-          // 包装 exporter 以收集导出指标
-          return wrapMetricExporterWithExportMetrics(exporter, config);
         });
 
     // 添加 TracerProvider 自定义
@@ -124,61 +92,6 @@ public final class ControlPlaneAutoConfigurationProvider
     return config.getBoolean("otel.agent.control.enabled", true);
   }
 
-  /**
-   * 确保导出指标收集器已创建
-   */
-  private static OtlpExportMetrics ensureExportMetrics(ConfigProperties config) {
-    if (exportMetrics == null) {
-      synchronized (ControlPlaneAutoConfigurationProvider.class) {
-        if (exportMetrics == null) {
-          ControlPlaneConfig controlConfig = ControlPlaneConfig.create(config);
-          exportMetrics = OtlpExportMetrics.builder()
-              .windowMillis(controlConfig.getHealthWindowMillis())
-              .minSamples(controlConfig.getHealthMinSamples())
-              .build();
-          logger.log(
-              Level.INFO,
-              "Created OtlpExportMetrics with windowMillis={0}, minSamples={1}",
-              new Object[] {
-                controlConfig.getHealthWindowMillis(),
-                controlConfig.getHealthMinSamples()
-              });
-        }
-      }
-    }
-    return exportMetrics;
-  }
-
-  /**
-   * 包装 SpanExporter 以收集导出指标
-   */
-  private static SpanExporter wrapSpanExporterWithExportMetrics(
-      SpanExporter exporter, ConfigProperties config) {
-
-    logger.log(
-        Level.INFO,
-        "Wrapping SpanExporter with HealthMonitoringSpanExporter: {0}",
-        exporter.getClass().getName());
-
-    OtlpExportMetrics metrics = ensureExportMetrics(config);
-    return new HealthMonitoringSpanExporter(exporter, metrics);
-  }
-
-  /**
-   * 包装 MetricExporter 以收集导出指标
-   */
-  private static MetricExporter wrapMetricExporterWithExportMetrics(
-      MetricExporter exporter, ConfigProperties config) {
-
-    logger.log(
-        Level.INFO,
-        "Wrapping MetricExporter with HealthMonitoringMetricExporter: {0}",
-        exporter.getClass().getName());
-
-    OtlpExportMetrics metrics = ensureExportMetrics(config);
-    return new HealthMonitoringMetricExporter(exporter, metrics);
-  }
-
   private static void initializeControlPlane(ConfigProperties config) {
     if (controlPlaneManager != null) {
       return;
@@ -190,9 +103,6 @@ public final class ControlPlaneAutoConfigurationProvider
       }
 
       ControlPlaneConfig controlConfig = ControlPlaneConfig.create(config);
-
-      // 确保导出指标收集器已创建
-      OtlpExportMetrics metrics = ensureExportMetrics(config);
 
       // 确保动态采样器已创建
       if (dynamicSampler == null) {
@@ -206,7 +116,6 @@ public final class ControlPlaneAutoConfigurationProvider
       ControlPlaneManager.Builder managerBuilder =
           ControlPlaneManager.builder()
               .setConfig(controlConfig)
-              .setExportMetrics(metrics)
               .setConfigManager(configManager)
               .setDynamicSampler(dynamicSampler);
 
@@ -269,15 +178,5 @@ public final class ControlPlaneAutoConfigurationProvider
   @Nullable
   public static DynamicSampler getDynamicSampler() {
     return dynamicSampler;
-  }
-
-  /**
-   * 获取导出指标收集器实例
-   *
-   * @return 导出指标收集器，如果未初始化则返回 null
-   */
-  @Nullable
-  public static OtlpExportMetrics getExportMetrics() {
-    return exportMetrics;
   }
 }

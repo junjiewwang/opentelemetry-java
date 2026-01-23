@@ -10,7 +10,6 @@ import io.opentelemetry.sdk.extension.controlplane.client.transport.Transport;
 import io.opentelemetry.sdk.extension.controlplane.client.transport.Transport.Operation;
 import io.opentelemetry.sdk.extension.controlplane.client.transport.TransportException;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
@@ -38,7 +37,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <ul>
  *   <li>Protobuf 消息的编解码（委托 {@link ProtobufCodec}）
  *   <li>统一日志（委托 {@link ControlPlaneLogger}）
- *   <li>导出指标记录（委托 {@link OtlpExportMetrics}）
  *   <li>生命周期管理（closed 状态）
  *   <li>轮询计时和过快返回检测
  * </ul>
@@ -46,7 +44,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class DefaultControlPlaneService implements ControlPlaneService {
 
   private final Transport transport;
-  private final OtlpExportMetrics exportMetrics;
   private final ControlPlaneLogger logger;
   private final AtomicBoolean closed;
 
@@ -54,13 +51,10 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
    * 创建默认控制平面服务
    *
    * @param transport 传输实例
-   * @param exportMetrics OTLP 导出指标收集器
    * @param config 控制平面配置
    */
-  public DefaultControlPlaneService(
-      Transport transport, OtlpExportMetrics exportMetrics, ControlPlaneConfig config) {
+  public DefaultControlPlaneService(Transport transport, ControlPlaneConfig config) {
     this.transport = transport;
-    this.exportMetrics = exportMetrics;
     // 暂时使用 false 作为默认值，后续可添加 config.isDebugEnabled()
     this.logger = new ControlPlaneLogger(/* debugEnabled= */ false);
     this.closed = new AtomicBoolean(false);
@@ -74,7 +68,6 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
   @Override
   public CompletableFuture<UnifiedPollResponse> poll(UnifiedPollRequest request) {
     checkNotClosed();
-    checkOtlpExportMetrics();
 
     String agentId = request.getAgentId();
     String configVersion =
@@ -123,7 +116,6 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
   @Override
   public CompletableFuture<ConfigResponse> getConfig(ConfigRequest request) {
     checkNotClosed();
-    checkOtlpExportMetrics();
 
     byte[] requestBytes = ProtobufCodec.encode(request);
     long timeoutMillis = request.getLongPollTimeoutMillis();
@@ -158,7 +150,6 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
   @Override
   public CompletableFuture<TaskResponse> getTasks(TaskRequest request) {
     checkNotClosed();
-    checkOtlpExportMetrics();
 
     byte[] requestBytes = ProtobufCodec.encode(request);
     long timeoutMillis = request.getLongPollTimeoutMillis();
@@ -284,14 +275,6 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
   private void checkNotClosed() {
     if (closed.get()) {
       throw new IllegalStateException("Service is closed");
-    }
-  }
-
-  private void checkOtlpExportMetrics() {
-    // 导出指标仅用于记录，不再用于健康判断
-    double successRate = exportMetrics.getSuccessRate();
-    if (successRate < 0.5) {
-      logger.logExportMetricsWarning(successRate);
     }
   }
 

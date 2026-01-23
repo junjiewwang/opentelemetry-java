@@ -16,24 +16,18 @@ import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.C
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
 import io.opentelemetry.sdk.extension.controlplane.core.HealthCheckCoordinator;
 import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager;
-import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager.TaskConfig;
 import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollConfig;
 import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollCoordinator;
-import io.opentelemetry.sdk.extension.controlplane.core.tasks.CleanupTask;
-import io.opentelemetry.sdk.extension.controlplane.core.tasks.StatusReportTask;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
-import io.opentelemetry.sdk.extension.controlplane.health.OtlpExportMetrics;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.status.ControlPlaneStateCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.HeartbeatReporter;
-import io.opentelemetry.sdk.extension.controlplane.task.TaskResultPersistence;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
-import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -66,10 +60,6 @@ public final class ControlPlaneManager implements Closeable {
 
   private static final Logger logger = Logger.getLogger(ControlPlaneManager.class.getName());
 
-  // 任务名称常量
-  private static final String TASK_STATUS_REPORT = "status-report";
-  private static final String TASK_CLEANUP = "cleanup";
-
   // 配置
   private final ControlPlaneConfig config;
 
@@ -82,10 +72,8 @@ public final class ControlPlaneManager implements Closeable {
 
   // 业务组件（Phase 5: 使用 ControlPlaneService）
   private final ControlPlaneService service;
-  private final OtlpExportMetrics exportMetrics;
   private final DynamicConfigManager configManager;
   private final DynamicSampler dynamicSampler;
-  private final TaskResultPersistence resultPersistence;
   private final AgentIdentityProvider.AgentIdentity agentIdentity;
 
   // 状态收集和心跳上报
@@ -104,7 +92,6 @@ public final class ControlPlaneManager implements Closeable {
   private ControlPlaneManager(Builder builder) {
     // 验证必需参数
     this.config = Objects.requireNonNull(builder.config, "config is required");
-    this.exportMetrics = Objects.requireNonNull(builder.exportMetrics, "exportMetrics is required");
     this.configManager = Objects.requireNonNull(builder.configManager, "configManager is required");
     this.dynamicSampler =
         Objects.requireNonNull(builder.dynamicSampler, "dynamicSampler is required");
@@ -114,10 +101,9 @@ public final class ControlPlaneManager implements Closeable {
     this.taskManager = ScheduledTaskManager.createDefault();
 
     // 初始化业务组件
-    this.resultPersistence = TaskResultPersistence.create(this.config);
     this.agentIdentity = AgentIdentityProvider.get();
     // Phase 5: 直接使用 ControlPlaneService（Protobuf-only）
-    this.service = ControlPlaneService.create(this.config, this.exportMetrics);
+    this.service = ControlPlaneService.create(this.config);
 
     // 初始化状态收集器
     ControlPlaneStateCollector controlPlaneStateCollector = new ControlPlaneStateCollector();
@@ -290,22 +276,9 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   /** 调度所有任务（不包括配置和任务轮询） */
+  @SuppressWarnings("MethodCanBeStatic")
   private void scheduleTasks() {
-    // 状态上报任务
-    taskManager.scheduleTask(
-        TaskConfig.create(
-            TASK_STATUS_REPORT,
-            new StatusReportTask(resultPersistence, statistics),
-            Duration.ofSeconds(5),
-            config.getStatusReportInterval()));
-
-    // 清理任务（每小时）
-    taskManager.scheduleTask(
-        TaskConfig.create(
-            TASK_CLEANUP,
-            new CleanupTask(resultPersistence),
-            Duration.ofHours(1),
-            Duration.ofHours(1)));
+    // 目前无需额外调度任务
   }
 
   /** 停止控制平面管理器 */
@@ -372,15 +345,6 @@ public final class ControlPlaneManager implements Closeable {
    */
   public ConnectionState getConnectionState() {
     return connectionStateManager.getState();
-  }
-
-  /**
-   * 获取导出指标收集器
-   *
-   * @return 导出指标收集器
-   */
-  public OtlpExportMetrics getExportMetrics() {
-    return exportMetrics;
   }
 
   /**
@@ -475,7 +439,6 @@ public final class ControlPlaneManager implements Closeable {
   /** Builder for {@link ControlPlaneManager}. */
   public static final class Builder {
     @Nullable private ControlPlaneConfig config;
-    @Nullable private OtlpExportMetrics exportMetrics;
     @Nullable private DynamicConfigManager configManager;
     @Nullable private DynamicSampler dynamicSampler;
     @Nullable private ArthasIntegration arthasIntegration;
@@ -491,17 +454,6 @@ public final class ControlPlaneManager implements Closeable {
      */
     public Builder setConfig(ControlPlaneConfig config) {
       this.config = config;
-      return this;
-    }
-
-    /**
-     * 设置导出指标收集器
-     *
-     * @param exportMetrics 导出指标收集器
-     * @return this builder
-     */
-    public Builder setExportMetrics(OtlpExportMetrics exportMetrics) {
-      this.exportMetrics = exportMetrics;
       return this;
     }
 
@@ -635,12 +587,6 @@ public final class ControlPlaneManager implements Closeable {
     public ControlPlaneManager build() {
       if (config == null) {
         throw new IllegalStateException("config is required");
-      }
-      if (exportMetrics == null) {
-        exportMetrics = OtlpExportMetrics.builder()
-            .windowMillis(config.getHealthWindowMillis())
-            .minSamples(config.getHealthMinSamples())
-            .build();
       }
       if (configManager == null) {
         configManager = new DynamicConfigManager();
