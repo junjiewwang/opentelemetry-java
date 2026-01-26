@@ -59,7 +59,6 @@ public final class GrpcTransport implements Transport {
   private final ManagedChannel channel;
   private final ControlPlaneServiceFutureStub futureStub;
   private final AtomicBoolean closed;
-  @Nullable private final String authorizationHeader;
 
   /**
    * 创建 gRPC 传输
@@ -67,7 +66,7 @@ public final class GrpcTransport implements Transport {
    * @param config 传输配置
    */
   public GrpcTransport(TransportConfig config) {
-    this.authorizationHeader = config.getAuthorizationHeader();
+    String authorizationHeader = config.getAuthorizationHeader();
     this.closed = new AtomicBoolean(false);
 
     // 解析 baseUrl 获取 host 和 port
