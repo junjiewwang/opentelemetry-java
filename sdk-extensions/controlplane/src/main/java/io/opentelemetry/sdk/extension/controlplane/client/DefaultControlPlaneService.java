@@ -55,8 +55,7 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
    */
   public DefaultControlPlaneService(Transport transport, ControlPlaneConfig config) {
     this.transport = transport;
-    // 暂时使用 false 作为默认值，后续可添加 config.isDebugEnabled()
-    this.logger = new ControlPlaneLogger(/* debugEnabled= */ false);
+    this.logger = new ControlPlaneLogger(config.isDebugEnabled());
     this.closed = new AtomicBoolean(false);
 
     logger.logServiceInitialized(

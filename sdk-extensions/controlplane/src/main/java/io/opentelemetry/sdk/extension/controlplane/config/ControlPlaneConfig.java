@@ -54,6 +54,9 @@ public final class ControlPlaneConfig {
   private static final String STATUS_INCLUDE_SYSTEM_RESOURCE =
       "otel.agent.control.status.include.system.resource";
 
+  // 调试配置
+  private static final String OTEL_JAVAAGENT_DEBUG = "otel.javaagent.debug";
+
   // Arthas 配置
   private static final String ARTHAS_ENABLED = "otel.agent.control.arthas.enabled";
 
@@ -81,6 +84,7 @@ public final class ControlPlaneConfig {
   private static final Duration DEFAULT_RETRY_MAX_BACKOFF = Duration.ofSeconds(30);
   private static final double DEFAULT_RETRY_BACKOFF_MULTIPLIER = 2.0;
   private static final boolean DEFAULT_INCLUDE_SYSTEM_RESOURCE = true;
+  private static final boolean DEFAULT_DEBUG_ENABLED = false;
   private static final boolean DEFAULT_ARTHAS_ENABLED = true;
 
   // 存储默认值
@@ -105,6 +109,7 @@ public final class ControlPlaneConfig {
   private final Duration retryMaxBackoff;
   private final double retryBackoffMultiplier;
   private final boolean includeSystemResource;
+  private final boolean debugEnabled;
   private final boolean arthasEnabled;
   @Nullable private final String headers;
 
@@ -140,6 +145,7 @@ public final class ControlPlaneConfig {
     this.retryMaxBackoff = builder.retryMaxBackoff;
     this.retryBackoffMultiplier = builder.retryBackoffMultiplier;
     this.includeSystemResource = builder.includeSystemResource;
+    this.debugEnabled = builder.debugEnabled;
     this.arthasEnabled = builder.arthasEnabled;
     this.headers = builder.headers;
     this.storageDir = builder.storageDir;
@@ -377,6 +383,15 @@ public final class ControlPlaneConfig {
   }
 
   /**
+   * 是否启用调试模式
+   *
+   * @return 是否启用调试模式
+   */
+  public boolean isDebugEnabled() {
+    return debugEnabled;
+  }
+
+  /**
    * 是否启用 Arthas 功能
    *
    * @return 是否启用 Arthas
@@ -504,6 +519,7 @@ public final class ControlPlaneConfig {
     private Duration retryMaxBackoff = DEFAULT_RETRY_MAX_BACKOFF;
     private double retryBackoffMultiplier = DEFAULT_RETRY_BACKOFF_MULTIPLIER;
     private boolean includeSystemResource = DEFAULT_INCLUDE_SYSTEM_RESOURCE;
+    private boolean debugEnabled = DEFAULT_DEBUG_ENABLED;
     private boolean arthasEnabled = DEFAULT_ARTHAS_ENABLED;
     @Nullable private String headers;
     @Nullable private String resourceAttributes;
@@ -643,6 +659,9 @@ public final class ControlPlaneConfig {
       this.includeSystemResource =
           properties.getBoolean(STATUS_INCLUDE_SYSTEM_RESOURCE, DEFAULT_INCLUDE_SYSTEM_RESOURCE);
 
+      // 调试配置
+      this.debugEnabled = properties.getBoolean(OTEL_JAVAAGENT_DEBUG, DEFAULT_DEBUG_ENABLED);
+
       // Arthas 配置
       this.arthasEnabled = properties.getBoolean(ARTHAS_ENABLED, DEFAULT_ARTHAS_ENABLED);
 
@@ -737,6 +756,11 @@ public final class ControlPlaneConfig {
 
     public Builder setIncludeSystemResource(boolean includeSystemResource) {
       this.includeSystemResource = includeSystemResource;
+      return this;
+    }
+
+    public Builder setDebugEnabled(boolean debugEnabled) {
+      this.debugEnabled = debugEnabled;
       return this;
     }
 
