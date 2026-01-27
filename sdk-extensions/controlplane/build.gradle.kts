@@ -33,10 +33,7 @@ dependencies {
   // 3. 如果 classpath 中没有此依赖，会优雅降级（需要手动设置 Instrumentation）
   compileOnly("net.bytebuddy:byte-buddy-agent:1.14.18")
 
-  // gRPC 支持（可选）
-  compileOnly("io.grpc:grpc-api")
-  compileOnly("io.grpc:grpc-protobuf")
-  compileOnly("io.grpc:grpc-stub")
+  // gRPC 传输使用 OkHttp gRPC sender（不再依赖 grpc-java）
 
   // Protobuf
   implementation("com.google.protobuf:protobuf-java")
@@ -71,4 +68,17 @@ tasks {
     enabled = false
   }
   // ===== Custom Control Plane Extension: End =====
+}
+
+// Disable grpc-java stub generation for this module. We use OkHttp-based gRPC transport and
+// don't need grpc-java types on the classpath.
+protobuf {
+  generateProtoTasks {
+    all().configureEach {
+      // Do not generate grpc-java stubs for this module.
+      // Kotlin DSL note: the plugins container is a NamedDomainObjectContainer.
+      // We remove the grpc plugin by name if it was added by conventions.
+      plugins.removeIf { it.name == "grpc" }
+    }
+  }
 }

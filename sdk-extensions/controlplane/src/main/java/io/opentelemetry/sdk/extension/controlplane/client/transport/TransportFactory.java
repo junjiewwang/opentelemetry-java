@@ -46,14 +46,15 @@ public final class TransportFactory {
     if (config.isGrpc()) {
       if (!isGrpcAvailable()) {
         throw new IllegalStateException(
-            "gRPC transport requested but gRPC dependencies are not available. "
-                + "Please add io.grpc:grpc-api, io.grpc:grpc-protobuf, and io.grpc:grpc-stub "
-                + "to your classpath, or use HTTP transport instead.");
+            "gRPC transport requested but OkHttp gRPC sender dependencies are not available. "
+                + "Please add exporters common + okhttp sender modules to your classpath (e.g. "
+                + "io.opentelemetry:opentelemetry-exporter-common and "
+                + "io.opentelemetry:opentelemetry-exporter-sender-okhttp), "
+                + "or disable gRPC transport.");
       }
       return new GrpcTransport(transportConfig);
-    } else {
-      return new HttpTransport(transportConfig);
     }
+    return new HttpTransport(transportConfig);
   }
 
   /**
@@ -65,8 +66,9 @@ public final class TransportFactory {
    */
   public static boolean isGrpcAvailable() {
     try {
-      Class.forName("io.grpc.ManagedChannel");
-      Class.forName("io.grpc.stub.AbstractFutureStub");
+      Class.forName("okhttp3.OkHttpClient");
+      Class.forName("io.opentelemetry.exporter.sender.okhttp.internal.GrpcRequestBody");
+      Class.forName("io.opentelemetry.exporter.internal.marshal.Marshaler");
       return true;
     } catch (ClassNotFoundException e) {
       return false;

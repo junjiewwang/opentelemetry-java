@@ -137,9 +137,14 @@ public final class ControlPlaneAutoConfigurationProvider
         logger.log(Level.INFO, "Arthas integration enabled via configuration");
       }
 
-      controlPlaneManager = managerBuilder.build();
-
-      controlPlaneManager.start();
+      try {
+        controlPlaneManager = managerBuilder.build();
+        controlPlaneManager.start();
+      } catch (RuntimeException e) {
+        // AutoConfiguredOpenTelemetrySdkBuilder 会吞掉堆栈（只打印一行 INFO），这里补充根因日志
+        logger.log(Level.SEVERE, "Failed to initialize/start control plane manager", e);
+        throw e;
+      }
 
       // 注册关闭钩子
       Runtime.getRuntime()

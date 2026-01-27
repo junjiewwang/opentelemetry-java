@@ -5,118 +5,115 @@
 
 package io.opentelemetry.sdk.extension.controlplane.client.transport;
 
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.MoreExecutors;
-import com.google.protobuf.InvalidProtocolBufferException;
-import com.google.protobuf.MessageLite;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Metadata;
-import io.grpc.Status;
-import io.grpc.stub.MetadataUtils;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.ControlPlaneServiceGrpc;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.ControlPlaneServiceGrpc.ControlPlaneServiceFutureStub;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollRequest;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusRequest;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.ChunkedTaskResult;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
+import io.opentelemetry.exporter.internal.compression.Compressor;
+import io.opentelemetry.exporter.internal.compression.GzipCompressor;
+import io.opentelemetry.exporter.sender.okhttp.internal.GrpcRequestBody;
+import io.opentelemetry.exporter.internal.marshal.Marshaler;
+import io.opentelemetry.exporter.internal.marshal.Serializer;
+import java.io.IOException;
 import java.net.URI;
-import java.time.Duration;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.ConnectionSpec;
+import okhttp3.Headers;
+import okhttp3.OkHttpClient;
+import okhttp3.Protocol;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 /**
- * gRPC 传输实现
+ * gRPC 传输实现（OkHttp 路线，不依赖 grpc-java）
  *
- * <p>使用 gRPC stub 发送请求，支持所有控制平面操作。
+ * <p>使用 OkHttp 直接发送 gRPC wire format（HTTP/2 + gRPC framing），并解析响应得到 protobuf bytes。
  *
  * <p>特性：
  * <ul>
- *   <li>使用 FutureStub 进行异步调用
- *   <li>支持鉴权（通过 Metadata Header）
- *   <li>支持压缩
+ *   <li>支持鉴权（Authorization Header）
+ *   <li>支持 gzip（gRPC message-level 压缩）
+ *   <li>异步非阻塞请求
  *   <li>优雅关闭
  * </ul>
- *
- * <p><b>注意</b>：此类依赖 gRPC（compileOnly），如果 classpath 中没有 gRPC 依赖，
- * 请使用 {@link HttpTransport} 替代。
  */
 public final class GrpcTransport implements Transport {
 
   private static final Logger logger = Logger.getLogger(GrpcTransport.class.getName());
 
-  private static final Metadata.Key<String> AUTHORIZATION_KEY =
-      Metadata.Key.of("Authorization", Metadata.ASCII_STRING_MARSHALLER);
+  private static final String HEADER_AUTHORIZATION = "Authorization";
+  private static final String HEADER_TE = "te";
+  private static final String HEADER_GRPC_STATUS = "grpc-status";
+  private static final String HEADER_GRPC_MESSAGE = "grpc-message";
 
-  private final ManagedChannel channel;
-  private final ControlPlaneServiceFutureStub futureStub;
-  private final AtomicBoolean closed;
+  private static final String TE_TRAILERS = "trailers";
+
+  private static final int GRPC_FRAME_HEADER_LENGTH = 5;
 
   /**
-   * 创建 gRPC 传输
+   * Per-call 超时额外缓冲时间（毫秒）。
    *
-   * @param config 传输配置
+   * <p>对于长轮询场景，客户端 per-call 超时必须大于服务端 hold 超时 + 网络延迟，
+   * 否则会出现"服务端刚准备返回，客户端先超时"的问题。
+   *
+   * <p>此值与 TransportFactory 中 readTimeout 的缓冲时间保持一致（10秒）。
    */
+  private static final long CALL_TIMEOUT_BUFFER_MILLIS = 10_000L;
+
+  private static final String SERVICE_NAME =
+      "io.opentelemetry.extension.controlplane.proto.v1.ControlPlaneService";
+
+  private final OkHttpClient httpClient;
+  private final String baseUrl;
+  @Nullable private final String authorizationHeader;
+  @Nullable private final Compressor compressor;
+  private final AtomicBoolean closed;
+
   public GrpcTransport(TransportConfig config) {
-    String authorizationHeader = config.getAuthorizationHeader();
+    this.baseUrl = config.getBaseUrl();
+    this.authorizationHeader = config.getAuthorizationHeader();
     this.closed = new AtomicBoolean(false);
+    this.compressor = config.isCompressionEnabled() ? GzipCompressor.getInstance() : null;
 
-    // 解析 baseUrl 获取 host 和 port
-    URI uri = URI.create(config.getBaseUrl());
-    String host = uri.getHost();
-    int port = uri.getPort();
-    if (port == -1) {
-      // 默认端口
-      port = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 4317;
+    // 对齐 OTLP OkHttpGrpcSender 的协议选择：
+    // - http:// 走 h2c prior knowledge
+    // - https:// 走 HTTP_2 + HTTP_1_1
+    boolean isPlainHttp = baseUrl.startsWith("http://");
+
+    OkHttpClient.Builder builder =
+        new OkHttpClient.Builder()
+            .connectTimeout(config.getConnectTimeout())
+            .readTimeout(config.getReadTimeout())
+            .writeTimeout(config.getWriteTimeout())
+            // 单次调用总超时：避免长轮询被 callTimeout 意外打断，这里不设置 callTimeout
+            .retryOnConnectionFailure(true);
+
+    if (isPlainHttp) {
+      builder.connectionSpecs(java.util.Collections.singletonList(ConnectionSpec.CLEARTEXT));
+      builder.protocols(java.util.Collections.singletonList(Protocol.H2_PRIOR_KNOWLEDGE));
+    } else {
+      builder.protocols(java.util.Arrays.asList(Protocol.HTTP_2, Protocol.HTTP_1_1));
     }
 
-    // 创建 ManagedChannel
-    ManagedChannelBuilder<?> channelBuilder =
-        ManagedChannelBuilder.forAddress(host, port)
-            .keepAliveTime(30, TimeUnit.SECONDS)
-            .keepAliveTimeout(10, TimeUnit.SECONDS);
+    this.httpClient = builder.build();
 
-    // 根据 scheme 决定是否使用 TLS
-    if ("http".equalsIgnoreCase(uri.getScheme())) {
-      channelBuilder.usePlaintext();
-    }
-
-    this.channel = channelBuilder.build();
-
-    // 创建 FutureStub
-    ControlPlaneServiceFutureStub stub = ControlPlaneServiceGrpc.newFutureStub(channel);
-
-    // 添加鉴权 Header
-    if (authorizationHeader != null) {
-      Metadata metadata = new Metadata();
-      metadata.put(AUTHORIZATION_KEY, authorizationHeader);
-      stub = stub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata));
-    }
-
-    // 启用压缩
-    if (config.isCompressionEnabled()) {
-      stub = stub.withCompression("gzip");
-    }
-
-    this.futureStub = stub;
-
+    URI uri = URI.create(baseUrl);
     logger.log(
         Level.FINE,
-        "[GRPC-TRANSPORT] Initialized: target={0}:{1}, hasAuth={2}",
-        new Object[] {host, port, authorizationHeader != null});
+        "[GRPC-TRANSPORT] Initialized: baseUrl={0}, scheme={1}, hasAuth={2}, compression={3}",
+        new Object[] {baseUrl, uri.getScheme(), authorizationHeader != null, compressor != null});
   }
 
   @Override
-  public CompletableFuture<byte[]> sendUnary(
-      Operation operation, byte[] requestBody, long timeoutMillis) {
+  public CompletableFuture<byte[]> sendUnary(Operation operation, byte[] requestBody, long timeoutMillis) {
     if (closed.get()) {
       CompletableFuture<byte[]> future = new CompletableFuture<>();
       future.completeExceptionally(new TransportException("Transport is closed"));
@@ -125,102 +122,110 @@ public final class GrpcTransport implements Transport {
 
     CompletableFuture<byte[]> future = new CompletableFuture<>();
 
-    try {
-      // 设置超时
-      ControlPlaneServiceFutureStub stubWithDeadline = futureStub;
-      if (timeoutMillis > 0) {
-        stubWithDeadline = futureStub.withDeadlineAfter(Duration.ofMillis(timeoutMillis));
-      }
+    String url = baseUrl + grpcPath(operation);
 
-      // 根据操作类型调用对应的 gRPC 方法
-      ListenableFuture<? extends MessageLite> grpcFuture =
-          invokeGrpcMethod(stubWithDeadline, operation, requestBody);
+    RequestBody grpcBody = new GrpcRequestBody(new ByteArrayMarshaler(requestBody), compressor);
 
-      // 将 ListenableFuture 转换为 CompletableFuture
-      Futures.addCallback(
-          grpcFuture,
-          new FutureCallback<MessageLite>() {
-            @Override
-            public void onSuccess(@Nullable MessageLite result) {
-              if (result != null) {
-                future.complete(result.toByteArray());
-              } else {
-                future.complete(new byte[0]);
+    Request.Builder requestBuilder =
+        new Request.Builder()
+            .url(url)
+            .post(grpcBody)
+            .header(HEADER_TE, TE_TRAILERS);
+
+    // 如果启用了压缩，需要告知服务端使用的压缩算法
+    if (compressor != null) {
+      requestBuilder.header("grpc-encoding", compressor.getEncoding());
+    }
+
+    if (authorizationHeader != null) {
+      requestBuilder.header(HEADER_AUTHORIZATION, authorizationHeader);
+    }
+
+    // 每次请求都设置一次 per-call timeout，避免影响 OkHttpClient 全局设置
+    // 对于长轮询请求，需要添加 buffer 确保：客户端超时 > 服务端 hold 时间 + 网络延迟
+    Call call = httpClient.newCall(requestBuilder.build());
+    if (timeoutMillis > 0) {
+      long effectiveTimeout = timeoutMillis + CALL_TIMEOUT_BUFFER_MILLIS;
+      call.timeout().timeout(effectiveTimeout, TimeUnit.MILLISECONDS);
+      logger.log(
+          Level.FINE,
+          "[GRPC-TRANSPORT] Set per-call timeout: operation={0}, requestedTimeout={1}ms, effectiveTimeout={2}ms",
+          new Object[] {operation, timeoutMillis, effectiveTimeout});
+    }
+
+    call.enqueue(
+        new Callback() {
+          @Override
+          public void onFailure(Call call, IOException e) {
+            logger.log(
+                Level.WARNING,
+                "[GRPC-TRANSPORT] Request failed: operation={0}, error={1}",
+                new Object[] {operation, e.getMessage()});
+            future.completeExceptionally(new TransportException("gRPC request failed: " + e.getMessage(), e));
+          }
+
+          @Override
+          public void onResponse(Call call, Response response) {
+            try (ResponseBody body = response.body()) {
+              byte[] rawBody = body.bytes();
+
+              // 先解析 grpc-status / grpc-message
+              GrpcStatus grpcStatus = readGrpcStatus(response);
+
+              if (grpcStatus.statusCodeString == null) {
+                // grpc-status 取不到通常意味着 HTTP 层错误或 trailers 不可读
+                future.completeExceptionally(
+                    new TransportException(
+                        "gRPC status missing. HTTP " + response.code() + ": " + response.message(),
+                        response.code(),
+                        operation));
+                return;
               }
-            }
 
-            @Override
-            public void onFailure(Throwable t) {
+              int statusCodeInt;
+              try {
+                statusCodeInt = Integer.parseInt(grpcStatus.statusCodeString);
+              } catch (NumberFormatException ex) {
+                statusCodeInt = -1;
+              }
+
+              if (statusCodeInt != 0) {
+                String codeName = grpcCodeName(statusCodeInt);
+                future.completeExceptionally(
+                    new TransportException(
+                        "gRPC " + codeName + ": " + grpcStatus.message,
+                        codeName,
+                        operation));
+                return;
+              }
+
+              // 成功时解析 gRPC framing，提取 message bytes
+              byte[] messageBytes;
+              try {
+                messageBytes = decodeSingleMessage(rawBody);
+              } catch (IllegalArgumentException ex) {
+                future.completeExceptionally(
+                    new TransportException("Invalid gRPC response frame: " + ex.getMessage(), ex));
+                return;
+              }
+
+              future.complete(messageBytes);
+            } catch (IOException e) {
               logger.log(
                   Level.WARNING,
-                  "[GRPC-TRANSPORT] Request failed: operation={0}, error={1}",
-                  new Object[] {operation, t.getMessage()});
-              future.completeExceptionally(convertToTransportException(t, operation));
+                  "[GRPC-TRANSPORT] Failed to read response: operation={0}, error={1}",
+                  new Object[] {operation, e.getMessage()});
+              future.completeExceptionally(new TransportException("Failed to read response: " + e.getMessage(), e));
             }
-          },
-          MoreExecutors.directExecutor());
-
-    } catch (InvalidProtocolBufferException e) {
-      logger.log(
-          Level.WARNING,
-          "[GRPC-TRANSPORT] Failed to parse request: operation={0}, error={1}",
-          new Object[] {operation, e.getMessage()});
-      future.completeExceptionally(
-          new TransportException("Failed to parse request: " + e.getMessage(), e));
-    }
+          }
+        });
 
     return future;
   }
 
-  /**
-   * 根据操作类型调用对应的 gRPC 方法
-   */
-  private static ListenableFuture<? extends MessageLite> invokeGrpcMethod(
-      ControlPlaneServiceFutureStub stub, Operation operation, byte[] requestBody)
-      throws InvalidProtocolBufferException {
-    switch (operation) {
-      case UNIFIED_POLL:
-        return stub.unifiedPoll(UnifiedPollRequest.parseFrom(requestBody));
-      case GET_CONFIG:
-        return stub.getConfig(ConfigRequest.parseFrom(requestBody));
-      case GET_TASKS:
-        return stub.getTasks(TaskRequest.parseFrom(requestBody));
-      case REPORT_STATUS:
-        return stub.reportStatus(StatusRequest.parseFrom(requestBody));
-      case REPORT_TASK_RESULT:
-        return stub.reportTaskResult(TaskResultRequest.parseFrom(requestBody));
-      case UPLOAD_CHUNK:
-        return stub.uploadChunkedResult(ChunkedTaskResult.parseFrom(requestBody));
-    }
-    throw new IllegalArgumentException("Unsupported operation: " + operation);
-  }
-
-  /**
-   * 将 gRPC 异常转换为 TransportException
-   */
-  private static TransportException convertToTransportException(Throwable t, Operation operation) {
-    if (t instanceof io.grpc.StatusRuntimeException) {
-      io.grpc.StatusRuntimeException sre = (io.grpc.StatusRuntimeException) t;
-      Status status = sre.getStatus();
-      return new TransportException(
-          "gRPC " + status.getCode() + ": " + status.getDescription(),
-          status.getCode().name(),
-          operation);
-    } else if (t instanceof io.grpc.StatusException) {
-      io.grpc.StatusException se = (io.grpc.StatusException) t;
-      Status status = se.getStatus();
-      return new TransportException(
-          "gRPC " + status.getCode() + ": " + status.getDescription(),
-          status.getCode().name(),
-          operation);
-    } else {
-      return new TransportException("gRPC request failed: " + t.getMessage(), t);
-    }
-  }
-
   @Override
   public boolean isAvailable() {
-    return !closed.get() && !channel.isShutdown();
+    return !closed.get();
   }
 
   @Override
@@ -236,19 +241,223 @@ public final class GrpcTransport implements Transport {
   @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {
-      channel.shutdown();
+      httpClient.dispatcher().executorService().shutdown();
       try {
-        if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
-          channel.shutdownNow();
-          if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
-            logger.log(Level.WARNING, "[GRPC-TRANSPORT] Channel did not terminate");
-          }
+        if (!httpClient.dispatcher().executorService().awaitTermination(5, TimeUnit.SECONDS)) {
+          httpClient.dispatcher().executorService().shutdownNow();
         }
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        channel.shutdownNow();
+        httpClient.dispatcher().executorService().shutdownNow();
       }
+      httpClient.connectionPool().evictAll();
       logger.log(Level.FINE, "[GRPC-TRANSPORT] Closed");
+    }
+  }
+
+  private static String grpcPath(Operation operation) {
+    String method;
+    switch (operation) {
+      case UNIFIED_POLL:
+        method = "UnifiedPoll";
+        break;
+      case GET_CONFIG:
+        method = "GetConfig";
+        break;
+      case GET_TASKS:
+        method = "GetTasks";
+        break;
+      case REPORT_STATUS:
+        method = "ReportStatus";
+        break;
+      case REPORT_TASK_RESULT:
+        method = "ReportTaskResult";
+        break;
+      case UPLOAD_CHUNK:
+        method = "UploadChunkedResult";
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported operation: " + operation);
+    }
+    return "/" + SERVICE_NAME + "/" + method;
+  }
+
+  private static byte[] decodeSingleMessage(byte[] grpcResponseBody) {
+    if (grpcResponseBody.length < GRPC_FRAME_HEADER_LENGTH) {
+      throw new IllegalArgumentException("Body too small: " + grpcResponseBody.length);
+    }
+
+    ByteBuffer buffer = ByteBuffer.wrap(grpcResponseBody).order(ByteOrder.BIG_ENDIAN);
+    byte compressedFlag = buffer.get();
+    int messageLength = buffer.getInt();
+
+    if (messageLength < 0) {
+      throw new IllegalArgumentException("Negative message length: " + messageLength);
+    }
+
+    int remaining = buffer.remaining();
+    if (remaining < messageLength) {
+      throw new IllegalArgumentException(
+          "Not enough bytes. expected=" + messageLength + ", remaining=" + remaining);
+    }
+
+    byte[] message = new byte[messageLength];
+    buffer.get(message);
+
+    if (compressedFlag == 0) {
+      return message;
+    }
+
+    // 服务端如果返回 compressed flag=1，则需要解压。这里按 gzip 处理。
+    // 当前控制平面默认只启用 gzip，所以直接使用 GZIPInputStream。
+    try {
+      return HttpGzip.decompress(message);
+    } catch (IOException e) {
+      throw new IllegalArgumentException("Failed to decompress message", e);
+    }
+  }
+
+  private static GrpcStatus readGrpcStatus(Response response) {
+    String status = response.header(HEADER_GRPC_STATUS);
+    String message = response.header(HEADER_GRPC_MESSAGE);
+
+    if (status == null || message == null) {
+      // 尝试 trailers
+      try {
+        Headers trailers = response.trailers();
+        if (status == null) {
+          status = trailers.get(HEADER_GRPC_STATUS);
+        }
+        if (message == null) {
+          message = trailers.get(HEADER_GRPC_MESSAGE);
+        }
+      } catch (IOException e) {
+        // ignore; will be handled by caller
+      }
+    }
+
+    if (message != null) {
+      message = unescapeGrpcMessage(message);
+    } else {
+      message = response.message();
+    }
+
+    return new GrpcStatus(status, message);
+  }
+
+  private static String grpcCodeName(int grpcStatusCode) {
+    // 只需要满足 TransportException.isRetryable 的判断场景
+    switch (grpcStatusCode) {
+      case 1:
+        return "CANCELLED";
+      case 2:
+        return "UNKNOWN";
+      case 3:
+        return "INVALID_ARGUMENT";
+      case 4:
+        return "DEADLINE_EXCEEDED";
+      case 5:
+        return "NOT_FOUND";
+      case 6:
+        return "ALREADY_EXISTS";
+      case 7:
+        return "PERMISSION_DENIED";
+      case 8:
+        return "RESOURCE_EXHAUSTED";
+      case 9:
+        return "FAILED_PRECONDITION";
+      case 10:
+        return "ABORTED";
+      case 11:
+        return "OUT_OF_RANGE";
+      case 12:
+        return "UNIMPLEMENTED";
+      case 13:
+        return "INTERNAL";
+      case 14:
+        return "UNAVAILABLE";
+      case 15:
+        return "DATA_LOSS";
+      case 16:
+        return "UNAUTHENTICATED";
+      case 0:
+      default:
+        return "OK";
+    }
+  }
+
+  // From grpc-java / OkHttpGrpcSender
+  private static String unescapeGrpcMessage(String value) {
+    for (int i = 0; i < value.length(); i++) {
+      char c = value.charAt(i);
+      if (c < ' ' || c >= '~' || (c == '%' && i + 2 < value.length())) {
+        return doUnescape(value.getBytes(StandardCharsets.US_ASCII));
+      }
+    }
+    return value;
+  }
+
+  private static String doUnescape(byte[] value) {
+    ByteBuffer buf = ByteBuffer.allocate(value.length);
+    for (int i = 0; i < value.length; ) {
+      if (value[i] == '%' && i + 2 < value.length) {
+        try {
+          buf.put((byte) Integer.parseInt(new String(value, i + 1, 2, StandardCharsets.UTF_8), 16));
+          i += 3;
+          continue;
+        } catch (NumberFormatException e) {
+          // ignore
+        }
+      }
+      buf.put(value[i]);
+      i += 1;
+    }
+    return new String(buf.array(), 0, buf.position(), StandardCharsets.UTF_8);
+  }
+
+  private static final class GrpcStatus {
+    @Nullable private final String statusCodeString;
+    private final String message;
+
+    private GrpcStatus(@Nullable String statusCodeString, String message) {
+      this.statusCodeString = statusCodeString;
+      this.message = message;
+    }
+  }
+
+  private static final class ByteArrayMarshaler extends Marshaler {
+    private final byte[] bytes;
+
+    private ByteArrayMarshaler(byte[] bytes) {
+      this.bytes = bytes;
+    }
+
+    @Override
+    public int getBinarySerializedSize() {
+      return bytes.length;
+    }
+
+    @Override
+    protected void writeTo(Serializer output) throws IOException {
+      output.writeSerializedMessage(bytes, "");
+    }
+  }
+
+  /**
+   * 仅用于处理 gRPC response message-level gzip 解压（当 compressed flag=1）。
+   */
+  private static final class HttpGzip {
+    private static byte[] decompress(byte[] compressed) throws IOException {
+      try (java.util.zip.GZIPInputStream gis =
+              new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(compressed));
+          java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream()) {
+        byte[] buffer = new byte[1024];
+        int len;
+        while ((len = gis.read(buffer)) > 0) {
+          baos.write(buffer, 0, len);
+        }
+        return baos.toByteArray();
+      }
     }
   }
 }
