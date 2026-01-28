@@ -10,6 +10,7 @@ import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.TaskSta
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionResult;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -76,6 +77,13 @@ public final class TaskStatusReporter {
   /**
    * 上报任务执行状态
    *
+   * <p><b>协议约束</b>：
+   * <ul>
+   *   <li>{@code result_json} 必须是合法的 JSON 字符串，否则服务端解析会失败</li>
+   *   <li>RUNNING 状态不应携带 {@code result_json}（进度信息放在日志中）</li>
+   *   <li>只有终态（SUCCESS/FAILED/TIMEOUT/CANCELLED）才应携带业务结果</li>
+   * </ul>
+   *
    * @param report 状态报告
    * @return 上报结果 Future
    */
@@ -84,6 +92,9 @@ public final class TaskStatusReporter {
 
     String taskId = report.getTaskId();
     TaskStatus protoStatus = convertToProtoStatus(report.getStatus());
+
+    // 【协议守门员】对 resultJson 进行校验和修正
+    String safeResultJson = sanitizeResultJson(report.getResultJson(), report.getStatus());
 
     // 终态幂等检查
     if (isTerminalStatus(protoStatus)) {
@@ -102,14 +113,14 @@ public final class TaskStatusReporter {
       ref.set(protoStatus);
     }
 
-    // 构建 Protobuf 请求
+    // 构建 Protobuf 请求（使用校验后的 safeResultJson）
     TaskResultRequest request = TaskResultRequest.newBuilder()
         .setTaskId(taskId)
         .setAgentId(agentId)
         .setStatus(protoStatus)
         .setErrorCode(report.getErrorCode() != null ? report.getErrorCode() : "")
         .setErrorMessage(report.getErrorMessage() != null ? report.getErrorMessage() : "")
-        .setResultJson(report.getResultJson() != null ? report.getResultJson() : "")
+        .setResultJson(safeResultJson)
         .setStartedAtMillis(report.getStartedAtMillis())
         .setCompletedAtMillis(report.getCompletedAtMillis())
         .setExecutionTimeMillis(report.getExecutionTimeMillis())
@@ -135,15 +146,28 @@ public final class TaskStatusReporter {
   /**
    * 上报运行中状态
    *
+   * <p><b>注意</b>：RUNNING 状态不会将 message 放入 {@code result_json}，
+   * 因为服务端期望 {@code result_json} 是合法 JSON，而进度消息通常是自由文本。
+   * message 仅用于本地日志记录。
+   *
    * @param taskId 任务 ID
-   * @param message 状态信息
+   * @param message 状态信息（仅用于日志，不会上报到 result_json）
    * @return 上报结果 Future
    */
   public CompletableFuture<TaskStatusReportResponse> reportRunning(String taskId, @Nullable String message) {
+    // 记录进度日志（message 不放入 resultJson）
+    if (message != null && !message.isEmpty()) {
+      logger.log(
+          Level.FINE,
+          "[STATUS-REPORTER] Task running: taskId={0}, message={1}",
+          new Object[] {taskId, message});
+    }
+
     TaskStatusReport report = TaskStatusReport.builder()
         .taskId(taskId)
         .status(TaskExecutionResult.Status.RUNNING)
-        .resultJson(message)
+        // 【重构】RUNNING 状态不再携带 resultJson，避免服务端 JSON 解析失败
+        .resultJson(null)
         .startedAtMillis(System.currentTimeMillis())
         .build();
     return report(report);
@@ -401,6 +425,95 @@ public final class TaskStatusReporter {
         || status == TaskStatus.TASK_STATUS_FAILED
         || status == TaskStatus.TASK_STATUS_TIMEOUT
         || status == TaskStatus.TASK_STATUS_CANCELLED;
+  }
+
+  // ===== 协议守门员：resultJson 校验与修正 =====
+
+  /**
+   * 对 resultJson 进行校验和修正，确保满足协议约束
+   *
+   * <p><b>规则</b>：
+   * <ul>
+   *   <li>RUNNING 状态：不携带 resultJson（返回空字符串）</li>
+   *   <li>终态：如果 resultJson 是合法 JSON 则原样返回，否则自动封装</li>
+   *   <li>null 或空字符串：返回空字符串</li>
+   * </ul>
+   *
+   * @param resultJson 原始 resultJson
+   * @param status 任务状态
+   * @return 校验/修正后的 resultJson
+   */
+  private static String sanitizeResultJson(@Nullable String resultJson, TaskExecutionResult.Status status) {
+    // RUNNING 状态不携带 resultJson
+    if (status == TaskExecutionResult.Status.RUNNING) {
+      if (resultJson != null && !resultJson.isEmpty()) {
+        logger.log(
+            Level.FINE,
+            "[STATUS-REPORTER] Dropping resultJson for RUNNING status (protocol constraint): {0}",
+            truncateForLog(resultJson));
+      }
+      return "";
+    }
+
+    // null 或空字符串直接返回
+    if (resultJson == null || resultJson.isEmpty()) {
+      return "";
+    }
+
+    // 检查是否是合法 JSON
+    if (isValidJson(resultJson)) {
+      return resultJson;
+    }
+
+    // 非法 JSON：自动封装为合法 JSON
+    logger.log(
+        Level.WARNING,
+        "[STATUS-REPORTER] resultJson is not valid JSON, auto-wrapping: {0}",
+        truncateForLog(resultJson));
+    return wrapAsJson(resultJson);
+  }
+
+  /**
+   * 简单校验是否是合法 JSON
+   *
+   * <p>只做首字符检查，避免引入重量级 JSON 解析库。
+   * 合法 JSON 的首字符必须是：<code>{ [ " n t f</code> 或数字。
+   *
+   * @param str 待检查字符串
+   * @return 是否可能是合法 JSON
+   */
+  private static boolean isValidJson(@Nullable String str) {
+    if (str == null || str.isEmpty()) {
+      return false;
+    }
+    char first = str.trim().charAt(0);
+    // JSON 合法首字符：{ [ " n(ull) t(rue) f(alse) 或数字
+    return first == '{' || first == '[' || first == '"'
+        || first == 'n' || first == 't' || first == 'f'
+        || first == '-' || Character.isDigit(first);
+  }
+
+  /**
+   * 将非 JSON 文本封装为合法 JSON
+   *
+   * <p>【重构】使用 JsonUtils.escapeJson 替代手动转义，避免遗漏特殊字符
+   *
+   * @param text 原始文本
+   * @return 封装后的 JSON
+   */
+  private static String wrapAsJson(String text) {
+    // 使用 JsonUtils.toJsonObject 构建合法 JSON，自动处理转义
+    return JsonUtils.toJsonObject("message", text);
+  }
+
+  /**
+   * 截断日志输出（避免过长）
+   */
+  private static String truncateForLog(String str) {
+    if (str == null) {
+      return "null";
+    }
+    return str.length() > 100 ? str.substring(0, 100) + "..." : str;
   }
 
   // ===== 内部数据类 =====

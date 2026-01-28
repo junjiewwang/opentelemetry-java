@@ -115,9 +115,15 @@ public final class TaskExecutionResult {
   /**
    * 创建运行中结果
    *
+   * <p><b>已废弃</b>：TaskExecutionResult 应只用于表达终态（SUCCESS/FAILED/TIMEOUT/CANCELLED）。
+   * RUNNING 状态应通过 {@code TaskStatusReporter.reportRunning()} 或 {@code TaskStatusEmitter.running()} 上报，
+   * 而不是作为 Executor 的返回值。
+   *
    * @param message 状态信息
    * @return 运行中结果
+   * @deprecated 请使用 {@code TaskStatusReporter.reportRunning()} 或 {@code TaskStatusEmitter.running()} 上报进度
    */
+  @Deprecated
   public static TaskExecutionResult running(@Nullable String message) {
     return builder()
         .status(Status.RUNNING)

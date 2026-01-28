@@ -56,6 +56,14 @@ public final class ArthasBootstrap {
   /** SpyAPI 管理器（负责加载、诊断、自愈） */
   private final SpyApiManager spyApiManager;
 
+  /**
+   * 运行时有效的 Tunnel Endpoint（由 ArthasIntegration 注入）
+   *
+   * <p>优先级高于 {@link ArthasConfig#getTunnelEndpoint()}，包含服务端下发的动态端口修正。
+   * 如果为 null，则回退到 config 中的静态配置。
+   */
+  @Nullable private volatile String effectiveTunnelEndpoint;
+
   // 回调接口（预留给未来扩展使用）
   @SuppressWarnings("UnusedVariable")
   @Nullable private OutputCallback outputCallback;
@@ -178,6 +186,38 @@ public final class ArthasBootstrap {
    */
   public void setOutputCallback(OutputCallback callback) {
     this.outputCallback = callback;
+  }
+
+  /**
+   * 设置运行时有效的 Tunnel Endpoint
+   *
+   * <p>由 {@link ArthasIntegration} 在启动 Arthas 前调用，注入包含动态端口修正的最终 endpoint。
+   * 此设置优先于 {@link ArthasConfig#getTunnelEndpoint()} 中的静态配置。
+   *
+   * <p>设计背景：
+   * <ul>
+   *   <li>静态配置可能使用 gRPC 端口（4317），但 Arthas tunnel 需要使用 HTTP 端口（4318）</li>
+   *   <li>服务端通过 server_metadata 下发 http_port，由 Integration 动态计算最终 endpoint</li>
+   *   <li>此方法将动态计算结果注入到 Bootstrap，在下次启动时生效</li>
+   * </ul>
+   *
+   * @param endpoint 有效的 Tunnel Endpoint，或 null（使用 config 中的默认值）
+   */
+  public void setEffectiveTunnelEndpoint(@Nullable String endpoint) {
+    this.effectiveTunnelEndpoint = endpoint;
+    if (endpoint != null) {
+      logger.log(Level.INFO, "Effective tunnel endpoint set: {0}", endpoint);
+    }
+  }
+
+  /**
+   * 获取运行时有效的 Tunnel Endpoint
+   *
+   * @return 有效的 Tunnel Endpoint，如果未设置则返回 null
+   */
+  @Nullable
+  public String getEffectiveTunnelEndpoint() {
+    return effectiveTunnelEndpoint;
   }
 
   /**
@@ -636,10 +676,14 @@ public final class ArthasBootstrap {
 
     // ===== Tunnel 相关配置（模式2核心）=====
     // 【重要修复】配置键必须是 arthas.tunnelServer 而非 tunnel-server
-    String tunnelServer = config.getTunnelEndpoint();
+    // 【动态端口支持】优先使用 effectiveTunnelEndpoint（由 Integration 注入），其次使用 config 中的静态配置
+    String tunnelServer = effectiveTunnelEndpoint != null 
+        ? effectiveTunnelEndpoint 
+        : config.getTunnelEndpoint();
     if (tunnelServer != null && !tunnelServer.isEmpty()) {
       configMap.put("arthas.tunnelServer", tunnelServer);
-      logger.log(Level.INFO, "Tunnel server configured: {0}", tunnelServer);
+      logger.log(Level.INFO, "Tunnel server configured: {0} (effective={1})", 
+          new Object[] {tunnelServer, effectiveTunnelEndpoint != null});
     }
 
     // Agent ID（支持重连复用）

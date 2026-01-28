@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.task.executor;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
@@ -330,7 +331,14 @@ public final class ArthasDetachExecutor implements TaskExecutor {
   /**
    * 构建成功结果
    *
-   * @param message 消息
+   * <p><b>重构说明</b>：resultJson 只包含纯业务数据（arthas_state），
+   * 移除了冗余的 status 和 message 字段：
+   * <ul>
+   *   <li>status 由 TaskExecutionResult.Status 决定，不需要在 JSON 中重复</li>
+   *   <li>message 仅用于日志记录（通过参数传入），不放入 resultJson</li>
+   * </ul>
+   *
+   * @param message 描述信息（仅用于日志，不放入 resultJson）
    * @param manager 生命周期管理器
    * @return 执行结果
    */
@@ -338,11 +346,15 @@ public final class ArthasDetachExecutor implements TaskExecutor {
   private TaskExecutionResult buildSuccessResult(
       String message, ArthasLifecycleManager manager) {
 
-    String resultJson = String.format(
-        Locale.ROOT,
-        "{\"status\":\"success\",\"message\":\"%s\",\"arthas_state\":\"%s\"}",
-        message,
-        manager.getState());
+    // 【重构】使用 JsonUtils 构建 JSON，避免 String.format 的特殊字符问题
+    String resultJson = JsonUtils.toJsonObject(
+        "arthas_state", manager.getState().name());
+
+    // message 仅用于日志记录
+    logger.log(
+        Level.FINE,
+        "[ARTHAS-DETACH] Build success result: {0}, arthasState={1}",
+        new Object[] {message, manager.getState()});
 
     return TaskExecutionResult.success(resultJson);
   }

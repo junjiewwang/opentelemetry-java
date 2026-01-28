@@ -40,11 +40,22 @@ public final class TaskStatusEvent {
     this.timestampMillis = timestampMillis;
   }
 
+  /**
+   * 创建 RUNNING 状态事件
+   *
+   * <p><b>注意</b>：message 仅用于本地日志和事件追踪，不会上报到服务端的 {@code result_json}，
+   * 因为 {@link TaskStatusReporter} 会过滤掉 RUNNING 状态的 resultJson（协议约束）。
+   *
+   * @param taskId 任务 ID
+   * @param agentId Agent ID
+   * @param message 进度消息（仅用于日志）
+   * @return RUNNING 状态事件
+   */
   public static TaskStatusEvent running(String taskId, String agentId, String message) {
-    String json =
-        "{\"status\":\"running\",\"message\":" + escapeJsonString(message) + "}";
+    // 【重构】RUNNING 状态不再在 Event 层构造 JSON，由 Reporter 统一处理协议约束
+    // message 仍保留在 resultJson 字段中供本地日志使用，但 Reporter 会将其过滤掉
     long now = System.currentTimeMillis();
-    return new TaskStatusEvent(taskId, agentId, TaskExecutionResult.Status.RUNNING, null, null, json, now);
+    return new TaskStatusEvent(taskId, agentId, TaskExecutionResult.Status.RUNNING, null, null, message, now);
   }
 
   public static TaskStatusEvent success(String taskId, String agentId, @Nullable String resultJson) {
@@ -81,6 +92,11 @@ public final class TaskStatusEvent {
     return errorMessage;
   }
 
+  /**
+   * 获取 resultJson（仅用于本地日志和调试）
+   *
+   * <p><b>注意</b>：对于 RUNNING 状态，此值不会被上报到服务端。
+   */
   @Nullable
   public String getResultJson() {
     return resultJson;
@@ -95,10 +111,9 @@ public final class TaskStatusEvent {
 
     if (status == TaskExecutionResult.Status.RUNNING) {
       // RUNNING：没有完成时间，保持 startedAt 为事件时间，completedAt = startedAt
+      // 【重构】RUNNING 不再携带 resultJson 到 ExecutionResult（协议约束由 Reporter 保证）
       b.startedAtMillis(timestampMillis).completedAtMillis(timestampMillis).executionTimeMillis(0);
-      if (resultJson != null) {
-        b.resultJson(resultJson);
-      }
+      // 注意：这里不再设置 resultJson，由 Reporter 负责协议校验
       return b.build();
     }
 
@@ -116,8 +131,5 @@ public final class TaskStatusEvent {
     return b.build();
   }
 
-  private static String escapeJsonString(String s) {
-    String escaped = s.replace("\\", "\\\\").replace("\"", "\\\"");
-    return "\"" + escaped + "\"";
-  }
+  // escapeJsonString 方法已不再需要（RUNNING 状态不再构造 JSON）
 }

@@ -189,29 +189,4 @@ public final class TunnelUrlGenerator {
   public boolean hasEndpointChanged(@Nullable String oldEndpoint, @Nullable String newEndpoint) {
     return !Objects.equals(oldEndpoint, newEndpoint);
   }
-
-  /**
-   * 从服务端元数据中解析 HTTP 端口
-   *
-   * @param httpPortStr 端口字符串
-   * @return 解析后的端口，或 null（解析失败时）
-   */
-  @Nullable
-  public Integer parseHttpPort(@Nullable String httpPortStr) {
-    if (httpPortStr == null || httpPortStr.isEmpty()) {
-      return null;
-    }
-
-    try {
-      int port = Integer.parseInt(httpPortStr);
-      if (port > 0 && port <= 65535) {
-        return port;
-      }
-      logger.log(Level.WARNING, "Invalid port number: {0}", port);
-      return null;
-    } catch (NumberFormatException e) {
-      logger.log(Level.WARNING, "Invalid http_port format: {0}", httpPortStr);
-      return null;
-    }
-  }
 }

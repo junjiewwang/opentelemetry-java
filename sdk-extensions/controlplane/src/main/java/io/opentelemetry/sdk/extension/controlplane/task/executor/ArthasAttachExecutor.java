@@ -7,6 +7,7 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasReadinessGate;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasStateEventBus;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -449,10 +450,16 @@ public final class ArthasAttachExecutor implements TaskExecutor {
    *
    * <p>只负责发起启动请求，不等待启动完成
    *
+   * <p><b>返回值语义</b>：
+   * <ul>
+   *   <li>SUCCESS：启动请求已接受/Arthas 已在运行，可以继续等待 tunnel 注册</li>
+   *   <li>FAILED：启动请求被拒绝（如：状态不允许），任务应立即失败</li>
+   * </ul>
+   *
    * @param taskId 任务 ID（用于日志）
    * @param manager 生命周期管理器
    * @param scheduler 调度器
-   * @return 启动请求结果（SUCCESS 表示请求已接受，不代表启动完成）
+   * @return 启动请求结果
    */
   private static TaskExecutionResult tryStartArthas(
       String taskId,
@@ -465,17 +472,19 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         "[ARTHAS-ATTACH] Current Arthas state: {0}, taskId={1}",
         new Object[] {currentState, taskId});
 
-    // 已在运行：不需要启动
+    // 已在运行：直接返回成功（SUCCESS 表示"可以继续等待 tunnel 注册"）
     if (currentState == ArthasLifecycleManager.State.RUNNING
         || currentState == ArthasLifecycleManager.State.IDLE) {
       logger.log(Level.INFO, "[ARTHAS-ATTACH] Arthas already running, taskId={0}", taskId);
-      return TaskExecutionResult.success("{\"status\":\"running\",\"message\":\"Arthas already running\"}");
+      // 【重构】不再用 success("{\"status\":\"running\"}") 这种反模式
+      // SUCCESS 在这里表示"启动条件满足，可以继续后续流程"
+      return TaskExecutionResult.success();
     }
 
     // 正在启动：等待即可
     if (currentState == ArthasLifecycleManager.State.STARTING) {
       logger.log(Level.INFO, "[ARTHAS-ATTACH] Arthas is starting, taskId={0}", taskId);
-      return TaskExecutionResult.success("{\"status\":\"starting\",\"message\":\"Arthas is starting\"}");
+      return TaskExecutionResult.success();
     }
 
     // 发起启动请求
@@ -492,7 +501,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
           "Failed to start Arthas: " + startResult.getErrorMessage());
     }
 
-    return TaskExecutionResult.success("{\"status\":\"starting\",\"message\":\"Arthas start requested\"}");
+    // 启动请求已发出，返回成功
+    return TaskExecutionResult.success();
   }
 
   /**
@@ -677,17 +687,32 @@ public final class ArthasAttachExecutor implements TaskExecutor {
 
   /**
    * 构建成功结果
+   *
+   * <p><b>重构说明</b>：resultJson 只包含纯业务数据（arthas_state, tunnel_ready），
+   * 移除了冗余的 status 和 message 字段：
+   * <ul>
+   *   <li>status 由 TaskExecutionResult.Status 决定，不需要在 JSON 中重复</li>
+   *   <li>message 仅用于日志记录（通过参数传入），不放入 resultJson</li>
+   * </ul>
+   *
+   * @param message 描述信息（仅用于日志，不放入 resultJson）
+   * @param manager 生命周期管理器
+   * @return 执行结果
    */
   private TaskExecutionResult buildSuccessResult(
       String message, ArthasLifecycleManager manager) {
     boolean tunnelReady = arthasIntegration != null && arthasIntegration.isTunnelReady();
-    
-    String resultJson = String.format(
-        Locale.ROOT,
-        "{\"status\":\"success\",\"message\":\"%s\",\"arthas_state\":\"%s\",\"tunnel_ready\":%s}",
-        message,
-        manager.getState(),
-        tunnelReady);
+
+    // 【重构】使用 JsonUtils 构建 JSON，避免 String.format 的特殊字符问题
+    String resultJson = JsonUtils.toJsonObject(
+        "arthas_state", manager.getState().name(),
+        "tunnel_ready", tunnelReady);
+
+    // message 仅用于日志记录
+    logger.log(
+        Level.FINE,
+        "[ARTHAS-ATTACH] Build success result: {0}, arthasState={1}, tunnelReady={2}",
+        new Object[] {message, manager.getState(), tunnelReady});
 
     return TaskExecutionResult.success(resultJson);
   }

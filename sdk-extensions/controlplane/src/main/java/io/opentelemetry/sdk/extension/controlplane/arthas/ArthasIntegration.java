@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneComponent;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.core.TaskExecutorProvider;
+import io.opentelemetry.sdk.extension.controlplane.core.model.ServerMetadata;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager.ServerMetadataListener;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
@@ -186,6 +187,9 @@ public final class ArthasIntegration
     this.currentEffectiveTunnelEndpoint = urlGenerator.resolveEffectiveEndpoint(config, null);
     logger.log(Level.FINE, "Initial tunnel endpoint: {0}", currentEffectiveTunnelEndpoint);
 
+    // 【方案2A核心】将初始 endpoint 注入到 Bootstrap
+    lifecycleManager.getArthasBootstrap().setEffectiveTunnelEndpoint(currentEffectiveTunnelEndpoint);
+
     // 【模式2核心】启动 Tunnel 状态桥接器
     // 从 Arthas 内部获取 tunnel 状态，桥接到 OTel 状态事件总线
     tunnelStatusBridge.start(scheduler, 1000); // 每秒轮询一次
@@ -266,15 +270,15 @@ public final class ArthasIntegration
    * @param metadata 服务端元数据
    */
   @Override
-  public void onServerMetadataChanged(Map<String, String> metadata) {
+  public void onServerMetadataChanged(ServerMetadata metadata) {
     logger.log(Level.FINE, "Received server metadata update: {0}", metadata);
 
-    if (metadata == null || metadata.isEmpty()) {
+    if (metadata == null) {
       return;
     }
 
     // 1. 解析新端口
-    Integer newPort = urlGenerator.parseHttpPort(metadata.get("http_port"));
+    Integer newPort = metadata.getHttpPort();
 
     // 2. 如果端口未变，直接返回
     if (Objects.equals(currentServerHttpPort, newPort)) {
@@ -289,15 +293,59 @@ public final class ArthasIntegration
 
     // 5. 判断是否发生变更
     if (urlGenerator.hasEndpointChanged(currentEffectiveTunnelEndpoint, newEndpoint)) {
+      String oldEndpoint = currentEffectiveTunnelEndpoint;
       logger.log(Level.INFO,
           "Arthas tunnel endpoint updated from server metadata: {0} -> {1}",
-          new Object[] {currentEffectiveTunnelEndpoint, newEndpoint});
+          new Object[] {oldEndpoint, newEndpoint});
 
       this.currentEffectiveTunnelEndpoint = newEndpoint;
 
-      // 注意：Arthas Tunnel 重连由 Arthas 内部 TunnelClient 自动处理
-      // 如果需要强制重连，可以在这里添加逻辑
+      // 【方案2A核心】将新 endpoint 注入到 Bootstrap，下次启动时生效
+      lifecycleManager.getArthasBootstrap().setEffectiveTunnelEndpoint(newEndpoint);
+
+      // 【运行时更新】如果 Arthas 已经在运行，需要重启以应用新的 tunnel endpoint
+      // Arthas 官方 TunnelClient 不支持运行时更换 server，必须重启
+      if (lifecycleManager.isRunning()) {
+        handleTunnelEndpointChangeWhileRunning(oldEndpoint, newEndpoint);
+      }
     }
+  }
+
+  /**
+   * 处理 Arthas 运行期间 tunnel endpoint 变更
+   *
+   * <p>Arthas 官方 TunnelClient 不支持运行时更换 server，因此需要：
+   * <ol>
+   *   <li>停止当前 Arthas 实例</li>
+   *   <li>新的 endpoint 已注入到 Bootstrap，下次 attach 任务会自动启动新实例</li>
+   * </ol>
+   *
+   * <p>设计原则：
+   * <ul>
+   *   <li>最小侵入：不主动重启，等待下次 attach 任务或用户操作</li>
+   *   <li>避免打断用户操作：如果有活跃终端会话，用户会感知到断连</li>
+   *   <li>日志清晰：记录变更原因，便于排查</li>
+   * </ul>
+   *
+   * @param oldEndpoint 旧的 tunnel endpoint
+   * @param newEndpoint 新的 tunnel endpoint
+   */
+  private void handleTunnelEndpointChangeWhileRunning(
+      @Nullable String oldEndpoint, @Nullable String newEndpoint) {
+    logger.log(Level.WARNING,
+        "[ENDPOINT-CHANGE] Tunnel endpoint changed while Arthas running. " +
+        "Stopping current instance to apply new endpoint on next attach. " +
+        "Old: {0}, New: {1}",
+        new Object[] {oldEndpoint, newEndpoint});
+
+    // 记录变更日志
+    lifecycleManager.getStartupLogCollector().addLog("WARN",
+        "Tunnel endpoint changed: " + oldEndpoint + " -> " + newEndpoint + ", stopping Arthas");
+
+    // 停止当前 Arthas 实例
+    // 下次 attach 任务会自动启动新实例，使用已注入的新 endpoint
+    lifecycleManager.syncStoppedFromExternalSignal(
+        "tunnel_endpoint_changed:" + oldEndpoint + "->" + newEndpoint);
   }
 
   // ===== Getters =====

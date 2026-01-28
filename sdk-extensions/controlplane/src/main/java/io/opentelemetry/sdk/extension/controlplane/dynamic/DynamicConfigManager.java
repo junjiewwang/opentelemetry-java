@@ -5,6 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.dynamic;
 
+import io.opentelemetry.sdk.extension.controlplane.core.model.ServerMetadata;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -265,10 +266,11 @@ public final class DynamicConfigManager {
   /**
    * 通知服务端元数据监听器
    *
-   * @param metadata 服务端元数据
+   * @param metadataMap 服务端元数据
    */
-  private void notifyServerMetadataListeners(Map<String, String> metadata) {
-    logger.log(Level.INFO, "Notifying server metadata listeners, metadata keys: {0}", metadata.keySet());
+  private void notifyServerMetadataListeners(Map<String, String> metadataMap) {
+    logger.log(Level.INFO, "Notifying server metadata listeners, metadata keys: {0}", metadataMap.keySet());
+    ServerMetadata metadata = ServerMetadata.fromMap(metadataMap);
     for (ServerMetadataListener listener : serverMetadataListeners) {
       try {
         listener.onServerMetadataChanged(metadata);
@@ -313,9 +315,9 @@ public final class DynamicConfigManager {
     /**
      * 服务端元数据变更回调
      *
-     * @param metadata 服务端元数据（key-value 映射）
+     * @param metadata 服务端元数据
      */
-    void onServerMetadataChanged(Map<String, String> metadata);
+    void onServerMetadataChanged(ServerMetadata metadata);
   }
 
   /** 配置应用结果 */
