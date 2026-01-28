@@ -30,6 +30,9 @@ public final class DynamicConfigManager {
   // 配置变更监听器
   private final List<ConfigChangeListener> listeners;
 
+  // 服务端元数据监听器（专用于 server_metadata 变更）
+  private final List<ServerMetadataListener> serverMetadataListeners;
+
   // 当前配置版本
   private volatile String currentConfigVersion;
 
@@ -39,6 +42,7 @@ public final class DynamicConfigManager {
   public DynamicConfigManager() {
     this.components = new ConcurrentHashMap<>();
     this.listeners = new CopyOnWriteArrayList<>();
+    this.serverMetadataListeners = new CopyOnWriteArrayList<>();
     this.currentConfigVersion = "";
   }
 
@@ -79,6 +83,24 @@ public final class DynamicConfigManager {
    */
   public void removeListener(ConfigChangeListener listener) {
     listeners.remove(listener);
+  }
+
+  /**
+   * 添加服务端元数据监听器
+   *
+   * @param listener 监听器
+   */
+  public void addServerMetadataListener(ServerMetadataListener listener) {
+    serverMetadataListeners.add(listener);
+  }
+
+  /**
+   * 移除服务端元数据监听器
+   *
+   * @param listener 监听器
+   */
+  public void removeServerMetadataListener(ServerMetadataListener listener) {
+    serverMetadataListeners.remove(listener);
   }
 
   /**
@@ -128,6 +150,16 @@ public final class DynamicConfigManager {
       applyWithTracking(
           "extension",
           () -> applyExtensionConfig(config.getExtensionConfigJson()),
+          appliedFields,
+          failedFields);
+    }
+
+    // 5. 处理服务端元数据（通知专用监听器）
+    Map<String, String> serverMetadata = config.getServerMetadata();
+    if (serverMetadata != null && !serverMetadata.isEmpty()) {
+      applyWithTracking(
+          "server_metadata",
+          () -> notifyServerMetadataListeners(serverMetadata),
           appliedFields,
           failedFields);
     }
@@ -230,6 +262,22 @@ public final class DynamicConfigManager {
     }
   }
 
+  /**
+   * 通知服务端元数据监听器
+   *
+   * @param metadata 服务端元数据
+   */
+  private void notifyServerMetadataListeners(Map<String, String> metadata) {
+    logger.log(Level.INFO, "Notifying server metadata listeners, metadata keys: {0}", metadata.keySet());
+    for (ServerMetadataListener listener : serverMetadataListeners) {
+      try {
+        listener.onServerMetadataChanged(metadata);
+      } catch (RuntimeException e) {
+        logger.log(Level.WARNING, "Server metadata listener failed", e);
+      }
+    }
+  }
+
   /** 可热更新组件接口 */
   public interface HotUpdatableComponent {
     /**
@@ -252,6 +300,22 @@ public final class DynamicConfigManager {
      */
     void onConfigChanged(
         AgentConfigData config, List<String> appliedFields, List<String> failedFields);
+  }
+
+  /**
+   * 服务端元数据变更监听器
+   *
+   * <p>用于监听服务端下发的 server_metadata 变更，如 http_port 等。
+   * 这些元数据通常用于引导客户端组件（如 Arthas Tunnel）正确连接服务端。
+   */
+  @FunctionalInterface
+  public interface ServerMetadataListener {
+    /**
+     * 服务端元数据变更回调
+     *
+     * @param metadata 服务端元数据（key-value 映射）
+     */
+    void onServerMetadataChanged(Map<String, String> metadata);
   }
 
   /** 配置应用结果 */
@@ -333,6 +397,8 @@ public final class DynamicConfigManager {
     boolean hasExtensionConfig();
 
     String getExtensionConfigJson();
+
+    Map<String, String> getServerMetadata();
   }
 
   /** 采样器配置数据 */

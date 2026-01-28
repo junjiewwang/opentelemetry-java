@@ -5,12 +5,21 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
+import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneComponent;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
+import io.opentelemetry.sdk.extension.controlplane.core.TaskExecutorProvider;
+import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager.ServerMetadataListener;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -32,7 +41,10 @@ import javax.annotation.Nullable;
  * </ul>
  */
 public final class ArthasIntegration
-    implements Closeable,
+    implements ControlPlaneComponent,
+        TaskExecutorProvider,
+        ServerMetadataListener,
+        Closeable,
         ArthasLifecycleManager.LifecycleEventListener,
         ArthasTunnelStatusBridge.TunnelStatusListener {
 
@@ -41,6 +53,9 @@ public final class ArthasIntegration
   private final ArthasConfig config;
   private final ArthasLifecycleManager lifecycleManager;
   private final ArthasEnvironmentDetector.Environment environment;
+
+  /** URL 生成器（纯函数式工具类） */
+  private final TunnelUrlGenerator urlGenerator = TunnelUrlGenerator.getInstance();
 
   /** 【模式2核心】Tunnel 状态桥接器，从 Arthas 内部获取 tunnel 状态 */
   private final ArthasTunnelStatusBridge tunnelStatusBridge;
@@ -54,6 +69,14 @@ public final class ArthasIntegration
   /** 就绪门闩：集中判定/等待 Terminal 可交互能力 */
   private final ArthasReadinessGate readinessGate;
 
+  // ===== 运行时状态（从 ArthasConfig 移出，由 Integration 管理） =====
+
+  /** 服务端下发的 HTTP 端口（用于修正 gRPC 场景下的 Tunnel 端口） */
+  @Nullable private volatile Integer currentServerHttpPort;
+
+  /** 当前生效的 Tunnel Endpoint（基于静态配置 + 动态端口计算） */
+  @Nullable private volatile String currentEffectiveTunnelEndpoint;
+
   @Nullable private ScheduledExecutorService scheduler;
 
   /** Tunnel 断开后的超时销毁任务 */
@@ -61,6 +84,9 @@ public final class ArthasIntegration
 
   /** Tunnel 断开后等待重连的超时时间（毫秒） */
   private static final long TUNNEL_RECONNECT_TIMEOUT_MILLIS = 300_000;
+
+  /** 组件是否已启动 */
+  private final AtomicBoolean started = new AtomicBoolean(false);
 
   /**
    * attach 健康检查的 grace 上限（毫秒）
@@ -127,11 +153,20 @@ public final class ArthasIntegration
   /**
    * 启动 Arthas 集成
    *
+   * <p>实现 {@link ControlPlaneComponent#start(ScheduledExecutorService)} 接口。
+   *
    * @param scheduler 调度器
    */
+  @Override
   public void start(ScheduledExecutorService scheduler) {
+    if (!started.compareAndSet(false, true)) {
+      logger.log(Level.WARNING, "Arthas integration already started");
+      return;
+    }
+
     if (!config.isEnabled()) {
       logger.log(Level.INFO, "Arthas integration is disabled");
+      started.set(false);
       return;
     }
 
@@ -141,11 +176,15 @@ public final class ArthasIntegration
           Level.WARNING,
           "Arthas not supported in current environment: {0}",
           environment.getUnsupportedReason());
+      started.set(false);
       return;
     }
 
     this.scheduler = scheduler;
 
+    // 初始化有效端点（基于静态配置，动态端口为 null）
+    this.currentEffectiveTunnelEndpoint = urlGenerator.resolveEffectiveEndpoint(config, null);
+    logger.log(Level.FINE, "Initial tunnel endpoint: {0}", currentEffectiveTunnelEndpoint);
 
     // 【模式2核心】启动 Tunnel 状态桥接器
     // 从 Arthas 内部获取 tunnel 状态，桥接到 OTel 状态事件总线
@@ -157,8 +196,17 @@ public final class ArthasIntegration
         environment);
   }
 
-  /** 停止 Arthas 集成 */
+  /**
+   * 停止 Arthas 集成
+   *
+   * <p>实现 {@link ControlPlaneComponent#stop()} 接口。
+   */
+  @Override
   public void stop() {
+    if (!started.get()) {
+      return;
+    }
+
     logger.log(Level.INFO, "Stopping Arthas integration");
 
     // 停止 Arthas
@@ -171,7 +219,85 @@ public final class ArthasIntegration
     cancelTunnelDisconnectTimeout();
     tunnelStatusBridge.stop();
     lifecycleManager.close();
+    started.set(false);
     logger.log(Level.INFO, "Arthas integration closed");
+  }
+
+  // ===== ControlPlaneComponent 接口实现 =====
+
+  @Override
+  public String getComponentName() {
+    return "ArthasIntegration";
+  }
+
+  @Override
+  public boolean isStarted() {
+    return started.get();
+  }
+
+  // ===== TaskExecutorProvider 接口实现 =====
+
+  /**
+   * 获取 Arthas 提供的任务执行器列表
+   *
+   * <p>返回 arthas_attach 和 arthas_detach 执行器，用于响应服务端下发的任务。
+   *
+   * @return 任务执行器列表
+   */
+  @Override
+  public List<TaskExecutor> getTaskExecutors() {
+    if (!config.isEnabled() || scheduler == null) {
+      return Collections.emptyList();
+    }
+
+    return Arrays.asList(
+        new ArthasAttachExecutor(this, scheduler),
+        new ArthasDetachExecutor(this));
+  }
+
+  // ===== ServerMetadataListener 接口实现 =====
+
+  /**
+   * 处理服务端元数据变更
+   *
+   * <p>当服务端下发 server_metadata 变更时，更新 Arthas Tunnel 端点等配置。
+   * 状态管理和 URL 计算逻辑集中在 Integration 中，保持 Config 的不可变性。
+   *
+   * @param metadata 服务端元数据
+   */
+  @Override
+  public void onServerMetadataChanged(Map<String, String> metadata) {
+    logger.log(Level.FINE, "Received server metadata update: {0}", metadata);
+
+    if (metadata == null || metadata.isEmpty()) {
+      return;
+    }
+
+    // 1. 解析新端口
+    Integer newPort = urlGenerator.parseHttpPort(metadata.get("http_port"));
+
+    // 2. 如果端口未变，直接返回
+    if (Objects.equals(currentServerHttpPort, newPort)) {
+      return;
+    }
+
+    // 3. 更新运行时状态
+    this.currentServerHttpPort = newPort;
+
+    // 4. 重新计算有效端点
+    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newPort);
+
+    // 5. 判断是否发生变更
+    if (urlGenerator.hasEndpointChanged(currentEffectiveTunnelEndpoint, newEndpoint)) {
+      logger.log(Level.INFO,
+          "Arthas tunnel endpoint updated from server metadata: {0} -> {1}",
+          new Object[] {currentEffectiveTunnelEndpoint, newEndpoint});
+
+      this.currentEffectiveTunnelEndpoint = newEndpoint;
+
+      // 注意：Arthas Tunnel 重连由 Arthas 内部 TunnelClient 自动处理
+      // 如果需要强制重连，可以在这里添加逻辑
+    }
   }
 
   // ===== Getters =====
@@ -179,6 +305,29 @@ public final class ArthasIntegration
   /** 获取配置 */
   public ArthasConfig getConfig() {
     return config;
+  }
+
+  /**
+   * 获取当前有效的 Tunnel Endpoint
+   *
+   * <p>此方法返回基于静态配置和动态服务端端口计算后的最终端点。
+   * 与 {@link ArthasConfig#getTunnelEndpoint()} 不同，此方法包含服务端下发的端口修正。
+   *
+   * @return 当前有效的 Tunnel Endpoint，可能为 null
+   */
+  @Nullable
+  public String getCurrentEffectiveTunnelEndpoint() {
+    return currentEffectiveTunnelEndpoint;
+  }
+
+  /**
+   * 获取服务端下发的 HTTP 端口
+   *
+   * @return HTTP 端口，或 null（未收到服务端元数据）
+   */
+  @Nullable
+  public Integer getCurrentServerHttpPort() {
+    return currentServerHttpPort;
   }
 
   /** 获取生命周期管理器 */
@@ -247,6 +396,9 @@ public final class ArthasIntegration
     status.put("terminalNotBindableReason", getTerminalNotBindableReason());
     status.put("uptimeMs", lifecycleManager.getUptimeMillis());
     status.put("tunnelDisconnectedDurationMs", tunnelStatusBridge.getDisconnectedDurationMillis());
+    // 动态端点信息
+    status.put("currentEffectiveTunnelEndpoint", currentEffectiveTunnelEndpoint);
+    status.put("currentServerHttpPort", currentServerHttpPort);
 
     // 环境信息
     Map<String, Object> env = new LinkedHashMap<>();

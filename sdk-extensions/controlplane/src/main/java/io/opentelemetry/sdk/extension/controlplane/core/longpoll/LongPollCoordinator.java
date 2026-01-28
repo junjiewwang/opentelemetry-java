@@ -6,6 +6,7 @@
 package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
+import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.ConfigPollResult;
@@ -134,8 +135,24 @@ public final class LongPollCoordinator implements Closeable {
 
     // 初始化 Handler 列表（默认注册配置和任务处理器）
     this.handlers = new ArrayList<>();
-    this.registerHandler(new ConfigLongPollHandler(service, statistics, config, agentId, running))
+    ConfigLongPollHandler configHandler = new ConfigLongPollHandler(service, statistics, config, agentId, running);
+    this.registerHandler(configHandler)
         .registerHandler(new TaskLongPollHandler(service, statistics, config, agentId, running));
+  }
+
+  /**
+   * 设置动态配置管理器
+   *
+   * <p>用于在收到配置更新时应用配置。
+   *
+   * @param configManager 动态配置管理器
+   */
+  public void setConfigManager(@Nullable DynamicConfigManager configManager) {
+    // 传递给 ConfigLongPollHandler
+    ConfigLongPollHandler configHandler = getHandler(LongPollType.CONFIG);
+    if (configHandler != null) {
+      configHandler.setConfigManager(configManager);
+    }
   }
 
   /**

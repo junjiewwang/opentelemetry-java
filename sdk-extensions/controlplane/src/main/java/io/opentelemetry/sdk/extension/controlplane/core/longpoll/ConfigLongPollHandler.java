@@ -7,12 +7,16 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
+import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
+import io.opentelemetry.sdk.extension.controlplane.dynamic.ProtobufAgentConfigAdapter;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.AgentConfig;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.ConfigPollResult;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
+import javax.annotation.Nullable;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -44,6 +48,9 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   private final String agentId;
   private final AtomicBoolean running;
   private final TaskExecutionLogger taskLogger;
+
+  // 动态配置管理器（可选，用于应用配置）
+  @Nullable private volatile DynamicConfigManager configManager;
 
   // 配置状态（用于增量更新）
   private volatile String currentConfigEtag = "";
@@ -188,7 +195,8 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
         this.currentConfigEtag = newEtag;
       }
 
-      // TODO: 处理配置数据（result.getConfigData()）
+      // 应用配置数据（通过 DynamicConfigManager）
+      applyConfigData(result.getConfigData(), newVersion);
       
       return true;
     } else {
@@ -256,6 +264,72 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
                 .build())
         .setLongPollTimeoutMillis(config.getTimeoutMillis())
         .build();
+  }
+
+  /**
+   * 应用配置数据
+   *
+   * <p>将 Protobuf AgentConfig 转换为 AgentConfigData 并通过 DynamicConfigManager 应用。
+   *
+   * @param configData 序列化的 AgentConfig 数据（ByteString）
+   * @param configVersion 配置版本
+   */
+  private void applyConfigData(com.google.protobuf.ByteString configData, String configVersion) {
+    if (configManager == null) {
+      logger.log(Level.FINE, "[CONFIG-APPLY] DynamicConfigManager not set, skipping config apply");
+      return;
+    }
+
+    if (configData == null || configData.isEmpty()) {
+      logger.log(Level.FINE, "[CONFIG-APPLY] No config data to apply");
+      return;
+    }
+
+    try {
+      // 解析 ByteString 为 AgentConfig
+      AgentConfig agentConfig = AgentConfig.parseFrom(configData);
+      
+      // 使用适配器将 Protobuf AgentConfig 转换为 AgentConfigData
+      ProtobufAgentConfigAdapter configDataAdapter = new ProtobufAgentConfigAdapter(agentConfig, configVersion);
+      
+      // 通过 DynamicConfigManager 应用配置
+      DynamicConfigManager.ConfigApplyResult result = configManager.applyConfig(configDataAdapter);
+      
+      logger.log(Level.INFO,
+          "[CONFIG-APPLY] Config applied, status={0}, appliedFields={1}, failedFields={2}",
+          new Object[] {result.getStatus(), result.getAppliedFields(), result.getFailedFields()});
+      
+      taskLogger.logTaskProgress(
+          currentTaskId,
+          "config_applied",
+          "Status: " + result.getStatus() + ", applied: " + result.getAppliedFields());
+          
+    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+      logger.log(Level.WARNING, "[CONFIG-APPLY] Failed to parse config data: {0}", e.getMessage());
+      taskLogger.logTaskProgress(
+          currentTaskId,
+          "config_parse_error",
+          "Failed to parse config data: " + e.getMessage());
+    } catch (RuntimeException e) {
+      logger.log(Level.WARNING, "[CONFIG-APPLY] Failed to apply config: {0}", e.getMessage());
+      taskLogger.logTaskProgress(
+          currentTaskId,
+          "config_apply_error",
+          "Failed to apply config: " + e.getMessage());
+    }
+  }
+
+  /**
+   * 设置动态配置管理器
+   *
+   * <p>用于在收到配置更新时应用配置。
+   *
+   * @param configManager 动态配置管理器
+   */
+  public void setConfigManager(@Nullable DynamicConfigManager configManager) {
+    this.configManager = configManager;
+    logger.log(Level.INFO, "[CONFIG-HANDLER] DynamicConfigManager set: {0}",
+        configManager != null ? "configured" : "null");
   }
 
   // ===== Getters =====

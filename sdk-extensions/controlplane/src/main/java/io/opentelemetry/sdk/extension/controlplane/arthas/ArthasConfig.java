@@ -100,8 +100,7 @@ public final class ArthasConfig {
       Collections.unmodifiableSet(
           new HashSet<>(Arrays.asList("stop", "reset", "shutdown", "quit")));
 
-  // Arthas WebSocket 路径常量
-  private static final String DEFAULT_ARTHAS_WS_PATH = "/v1/arthas/ws";
+  // 注意：URL 生成逻辑已移至 TunnelUrlGenerator，保持 Config 的不可变性
 
   // 日志隔离默认值
   private static final String DEFAULT_LOG_FILE_NAME = "arthas.log";
@@ -139,8 +138,12 @@ public final class ArthasConfig {
   private final String logLevel;
   private final boolean stdoutCaptureEnabled;
 
+  // 注意：serverHttpPort 等运行时状态已移至 ArthasIntegration 管理，
+  // ArthasConfig 保持为不可变的配置数据对象
+
   private ArthasConfig(Builder builder) {
     this.enabled = builder.enabled;
+
     this.version = builder.version;
     this.maxSessionsPerAgent = builder.maxSessionsPerAgent;
     this.sessionIdleTimeout = builder.sessionIdleTimeout;
@@ -231,25 +234,24 @@ public final class ArthasConfig {
   }
 
   /**
-   * 获取 Tunnel 端点地址
+   * 获取 Tunnel 端点地址（不包含动态端口）
    *
    * <p>优先级：
    * <ol>
    *   <li>显式配置的 tunnelEndpoint</li>
-   *   <li>基于 OTLP endpoint 自动生成的默认地址：ws:// + host + /v1/arthas/ws</li>
+   *   <li>基于 OTLP endpoint 自动生成的默认地址（不含动态端口）</li>
    * </ol>
    *
+   * <p>注意：如需获取包含服务端动态端口的完整地址，请使用
+   * {@link TunnelUrlGenerator#resolveEffectiveEndpoint(ArthasConfig, Integer)}。
+   *
    * @return Tunnel 端点地址，可能为 null
+   * @see TunnelUrlGenerator
    */
   @Nullable
   public String getTunnelEndpoint() {
-    // 如果显式配置了 tunnel endpoint，直接返回
-    if (tunnelEndpoint != null && !tunnelEndpoint.isEmpty()) {
-      return tunnelEndpoint;
-    }
-
-    // 否则基于 OTLP endpoint 生成默认地址
-    return generateDefaultTunnelEndpoint();
+    // 使用 TunnelUrlGenerator 生成（不传入动态端口）
+    return TunnelUrlGenerator.getInstance().resolveEffectiveEndpoint(this, null);
   }
 
   /**
@@ -260,48 +262,6 @@ public final class ArthasConfig {
   @Nullable
   public String getExplicitTunnelEndpoint() {
     return tunnelEndpoint;
-  }
-
-  /**
-   * 基于 OTLP endpoint 生成默认的 Arthas Tunnel 端点
-   *
-   * <p>转换规则：http(s)://host:port -> ws(s)://host:port/v1/arthas/ws
-   *
-   * @return 默认端点地址，或 null
-   */
-  @Nullable
-  private String generateDefaultTunnelEndpoint() {
-    if (baseOtlpEndpoint == null || baseOtlpEndpoint.isEmpty()) {
-      return null;
-    }
-
-    String endpoint = baseOtlpEndpoint;
-    String wsScheme;
-
-    // 根据 HTTP scheme 确定 WebSocket scheme
-    if (endpoint.toLowerCase(Locale.ROOT).startsWith("https://")) {
-      wsScheme = "wss://";
-      endpoint = endpoint.substring(8); // 移除 "https://"
-    } else if (endpoint.toLowerCase(Locale.ROOT).startsWith("http://")) {
-      wsScheme = "ws://";
-      endpoint = endpoint.substring(7); // 移除 "http://"
-    } else {
-      // 未知协议，默认使用 ws
-      wsScheme = "ws://";
-    }
-
-    // 移除末尾的斜杠
-    if (endpoint.endsWith("/")) {
-      endpoint = endpoint.substring(0, endpoint.length() - 1);
-    }
-
-    // 移除路径部分（只保留 host:port）
-    int pathIndex = endpoint.indexOf('/');
-    if (pathIndex > 0) {
-      endpoint = endpoint.substring(0, pathIndex);
-    }
-
-    return wsScheme + endpoint + DEFAULT_ARTHAS_WS_PATH;
   }
 
   /** 获取 Tunnel 重连间隔 */

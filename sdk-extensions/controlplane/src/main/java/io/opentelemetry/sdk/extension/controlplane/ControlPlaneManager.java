@@ -9,26 +9,31 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasConfig;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
-import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollType;
-import io.opentelemetry.sdk.extension.controlplane.core.longpoll.TaskLongPollHandler;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
+import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneComponent;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
 import io.opentelemetry.sdk.extension.controlplane.core.HealthCheckCoordinator;
 import io.opentelemetry.sdk.extension.controlplane.core.ScheduledTaskManager;
+import io.opentelemetry.sdk.extension.controlplane.core.TaskExecutorProvider;
 import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollConfig;
 import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollCoordinator;
+import io.opentelemetry.sdk.extension.controlplane.core.longpoll.LongPollType;
+import io.opentelemetry.sdk.extension.controlplane.core.longpoll.TaskLongPollHandler;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
+import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager.ServerMetadataListener;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.status.ControlPlaneStateCollector;
 import io.opentelemetry.sdk.extension.controlplane.status.HeartbeatReporter;
-import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
-import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -43,18 +48,18 @@ import javax.annotation.Nullable;
  *   <li>长轮询（配置和任务）
  *   <li>状态上报
  *   <li>健康监控
- *   <li>Arthas 集成
+ *   <li>可扩展组件（如 Arthas 集成）
  * </ul>
  *
- * <p>重构后的职责分配：
+ * <p>重构后的架构设计：
  *
  * <ul>
- *   <li>{@link ConnectionStateManager} - 连接状态管理
- *   <li>{@link ScheduledTaskManager} - 调度任务管理
- *   <li>{@link HealthCheckCoordinator} - 健康检查协调
- *   <li>{@link ControlPlaneStatistics} - 统计信息管理
- *   <li>{@link LongPollCoordinator} - 长轮询协调（配置和任务统一获取）
+ *   <li>{@link ControlPlaneComponent} - 统一的组件生命周期接口
+ *   <li>{@link TaskExecutorProvider} - 任务执行器提供者接口（解耦任务注册）
+ *   <li>{@link ServerMetadataListener} - 服务端元数据监听器接口
  * </ul>
+ *
+ * <p>遵循开闭原则（OCP）：新增组件或任务类型无需修改 Manager 代码，只需实现相应接口。
  */
 public final class ControlPlaneManager implements Closeable {
 
@@ -79,7 +84,10 @@ public final class ControlPlaneManager implements Closeable {
   // 状态收集和心跳上报
   private final HeartbeatReporter heartbeatReporter;
 
-  // Arthas 集成
+  // 可扩展组件列表（统一生命周期管理）
+  private final List<ControlPlaneComponent> components;
+
+  // Arthas 集成（保留直接引用以便 Getter 访问）
   @Nullable private final ArthasIntegration arthasIntegration;
 
   // 任务分发器
@@ -150,8 +158,17 @@ public final class ControlPlaneManager implements Closeable {
             this.statistics,
             this.agentIdentity.getAgentId());
 
-    // Arthas 集成
+    // 设置 DynamicConfigManager 以便 ConfigLongPollHandler 可以应用配置
+    this.longPollCoordinator.setConfigManager(this.configManager);
+
+    // 初始化可扩展组件列表
+    this.components = new CopyOnWriteArrayList<>();
+
+    // Arthas 集成（作为可扩展组件注册）
     this.arthasIntegration = builder.arthasIntegration;
+    if (this.arthasIntegration != null) {
+      this.components.add(this.arthasIntegration);
+    }
 
     // 生命周期状态
     this.started = new AtomicBoolean(false);
@@ -188,6 +205,9 @@ public final class ControlPlaneManager implements Closeable {
     configManager.registerComponent(
         "sampler", cfg -> dynamicSampler.update((io.opentelemetry.sdk.trace.samplers.Sampler) cfg));
 
+    // 自动注册服务端元数据监听器（遍历所有实现 ServerMetadataListener 的组件）
+    registerServerMetadataListeners();
+
     // 启动健康检查协调器
     healthCheckCoordinator.start();
 
@@ -200,12 +220,10 @@ public final class ControlPlaneManager implements Closeable {
     // 启动心跳上报
     heartbeatReporter.start();
 
-    // 启动 Arthas 集成
-    if (arthasIntegration != null) {
-      arthasIntegration.start(taskManager.getScheduler());
-    }
+    // 启动所有可扩展组件（统一生命周期管理）
+    startComponents();
 
-    // 初始化并配置任务分发器
+    // 初始化并配置任务分发器（在组件启动后，因为需要从组件获取执行器）
     initializeTaskDispatcher();
 
     connectionStateManager.markConnecting();
@@ -213,15 +231,80 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   /**
+   * 启动所有可扩展组件
+   *
+   * <p>遵循统一生命周期管理，遍历所有注册的 {@link ControlPlaneComponent} 并启动。
+   */
+  private void startComponents() {
+    for (ControlPlaneComponent component : components) {
+      try {
+        logger.log(Level.INFO, "Starting component: {0}", component.getComponentName());
+        component.start(taskManager.getScheduler());
+      } catch (RuntimeException e) {
+        logger.log(Level.WARNING, "Failed to start component: " + component.getComponentName(), e);
+      }
+    }
+  }
+
+  /**
+   * 停止所有可扩展组件
+   *
+   * <p>遵循统一生命周期管理，遍历所有注册的 {@link ControlPlaneComponent} 并停止。
+   */
+  private void stopComponents() {
+    for (ControlPlaneComponent component : components) {
+      try {
+        logger.log(Level.INFO, "Stopping component: {0}", component.getComponentName());
+        component.stop();
+      } catch (RuntimeException e) {
+        logger.log(Level.WARNING, "Failed to stop component: " + component.getComponentName(), e);
+      }
+    }
+  }
+
+  /**
+   * 关闭所有可扩展组件
+   *
+   * <p>遵循统一生命周期管理，遍历所有注册的 {@link ControlPlaneComponent} 并关闭。
+   */
+  private void closeComponents() {
+    for (ControlPlaneComponent component : components) {
+      try {
+        logger.log(Level.INFO, "Closing component: {0}", component.getComponentName());
+        component.close();
+      } catch (Exception e) {
+        logger.log(Level.WARNING, "Failed to close component: " + component.getComponentName(), e);
+      }
+    }
+  }
+
+  /**
+   * 自动注册服务端元数据监听器
+   *
+   * <p>遍历所有实现 {@link ServerMetadataListener} 的组件，自动注册到 {@link DynamicConfigManager}。
+   * 遵循开闭原则：新增需要监听服务端元数据的组件，只需实现 {@link ServerMetadataListener} 接口。
+   */
+  private void registerServerMetadataListeners() {
+    int registeredCount = 0;
+    for (ControlPlaneComponent component : components) {
+      if (component instanceof ServerMetadataListener) {
+        ServerMetadataListener listener = (ServerMetadataListener) component;
+        configManager.addServerMetadataListener(listener);
+        logger.log(Level.INFO, "Registered ServerMetadataListener: {0}", component.getComponentName());
+        registeredCount++;
+      }
+    }
+    logger.log(Level.INFO, "Registered {0} ServerMetadataListener(s)", registeredCount);
+  }
+
+  /**
    * 初始化任务分发器
    *
-   * <p>创建 TaskDispatcher，注册任务执行器，并配置到 TaskLongPollHandler
+   * <p>创建 TaskDispatcher，自动发现并注册所有组件提供的任务执行器，然后配置到 TaskLongPollHandler。
+   * 遵循开闭原则：新增任务类型只需让组件实现 {@link TaskExecutorProvider} 接口。
    */
   private void initializeTaskDispatcher() {
-    logger.log(
-        Level.INFO,
-        "[TASK-DISPATCHER-INIT] Initializing TaskDispatcher, arthasIntegration={0}",
-        arthasIntegration != null ? "configured" : "null");
+    logger.log(Level.INFO, "[TASK-DISPATCHER-INIT] Initializing TaskDispatcher");
 
     // 创建任务分发器（Phase 5: 使用 ControlPlaneService）
     taskDispatcher = new TaskDispatcher(
@@ -229,7 +312,7 @@ public final class ControlPlaneManager implements Closeable {
         agentIdentity.getAgentId(),
         taskManager.getScheduler());
 
-    // 注册任务执行器
+    // 自动注册任务执行器（遍历所有实现 TaskExecutorProvider 的组件）
     registerTaskExecutors();
 
     // 配置到 TaskLongPollHandler
@@ -246,33 +329,38 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   /**
-   * 注册任务执行器
+   * 自动注册任务执行器
    *
-   * <p>遵循开闭原则：新增任务类型只需在此方法中注册对应的执行器
+   * <p>遍历所有实现 {@link TaskExecutorProvider} 的组件，自动发现并注册其提供的任务执行器。
+   * 遵循开闭原则：新增任务类型只需让组件实现 {@link TaskExecutorProvider} 接口，无需修改 Manager 代码。
    */
   private void registerTaskExecutors() {
     if (taskDispatcher == null) {
       return;
     }
 
-    // 注册 Arthas 附加执行器
-    if (arthasIntegration != null) {
-      ArthasAttachExecutor arthasAttachExecutor = new ArthasAttachExecutor(
-          arthasIntegration,
-          taskManager.getScheduler());
-      taskDispatcher.registerExecutor(arthasAttachExecutor);
-      logger.log(Level.INFO, "Registered ArthasAttachExecutor for arthas_attach tasks");
+    List<String> registeredTypes = new ArrayList<>();
 
-      // 注册 Arthas 分离执行器
-      ArthasDetachExecutor arthasDetachExecutor = new ArthasDetachExecutor(arthasIntegration);
-      taskDispatcher.registerExecutor(arthasDetachExecutor);
-      logger.log(Level.INFO, "Registered ArthasDetachExecutor for arthas_detach tasks");
-    } else {
-      logger.log(Level.INFO, "Arthas integration not configured, arthas_attach/detach tasks will not be supported");
+    for (ControlPlaneComponent component : components) {
+      if (component instanceof TaskExecutorProvider) {
+        TaskExecutorProvider provider = (TaskExecutorProvider) component;
+        List<TaskExecutor> executors = provider.getTaskExecutors();
+
+        for (TaskExecutor executor : executors) {
+          taskDispatcher.registerExecutor(executor);
+          registeredTypes.add(executor.getTaskType());
+          logger.log(
+              Level.INFO,
+              "Registered TaskExecutor: type={0}, from={1}",
+              new Object[] {executor.getTaskType(), component.getComponentName()});
+        }
+      }
     }
 
-    // 未来可以在此添加其他任务执行器
-    // taskDispatcher.registerExecutor(new SomeOtherExecutor(...));
+    logger.log(
+        Level.INFO,
+        "[TASK-EXECUTOR-REGISTER] Registered {0} executor(s) from components: {1}",
+        new Object[] {registeredTypes.size(), registeredTypes});
   }
 
   /** 调度所有任务（不包括配置和任务轮询） */
@@ -301,10 +389,8 @@ public final class ControlPlaneManager implements Closeable {
     // 停止健康检查协调器
     healthCheckCoordinator.stop();
 
-    // 停止 Arthas 集成
-    if (arthasIntegration != null) {
-      arthasIntegration.stop();
-    }
+    // 停止所有可扩展组件（统一生命周期管理）
+    stopComponents();
 
     // 关闭任务分发器
     if (taskDispatcher != null) {
@@ -328,9 +414,8 @@ public final class ControlPlaneManager implements Closeable {
       heartbeatReporter.close();
       service.close();
 
-      if (arthasIntegration != null) {
-        arthasIntegration.close();
-      }
+      // 关闭所有可扩展组件（统一生命周期管理）
+      closeComponents();
 
       logger.log(Level.INFO, "Control plane manager closed");
     }
@@ -418,6 +503,15 @@ public final class ControlPlaneManager implements Closeable {
    */
   public LongPollCoordinator getLongPollCoordinator() {
     return longPollCoordinator;
+  }
+
+  /**
+   * 获取已注册的组件列表
+   *
+   * @return 组件列表（只读）
+   */
+  public List<ControlPlaneComponent> getComponents() {
+    return new ArrayList<>(components);
   }
 
   // ==================== 回调方法 ====================
