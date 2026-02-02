@@ -70,12 +70,6 @@ class ConnectionStateManagerTest {
   }
 
   @Test
-  void markWaitingForOtlpUpdatesState() {
-    manager.markWaitingForOtlp();
-    assertThat(manager.getState()).isEqualTo(ConnectionState.WAITING_FOR_OTLP);
-  }
-
-  @Test
   void markConnectingUpdatesState() {
     manager.markConnecting();
     assertThat(manager.getState()).isEqualTo(ConnectionState.CONNECTING);

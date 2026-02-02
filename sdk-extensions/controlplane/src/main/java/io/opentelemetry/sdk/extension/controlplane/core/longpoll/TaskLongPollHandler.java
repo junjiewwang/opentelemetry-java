@@ -7,8 +7,8 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
+import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskPollResult;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.AgentCapabilities;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
@@ -62,7 +62,6 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   private final ControlPlaneService service;
   private final ControlPlaneStatistics statistics;
   private final LongPollConfig config;
-  private final String agentId;
   private final AtomicBoolean running;
   private final TaskExecutionLogger taskLogger;
 
@@ -78,19 +77,16 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    * @param service 控制平面服务（Protobuf-only）
    * @param statistics 统计管理器
    * @param config 长轮询配置
-   * @param agentId Agent ID
    * @param running 运行状态标志
    */
   public TaskLongPollHandler(
       ControlPlaneService service,
       ControlPlaneStatistics statistics,
       LongPollConfig config,
-      String agentId,
       AtomicBoolean running) {
     this.service = service;
     this.statistics = statistics;
     this.config = config;
-    this.agentId = agentId;
     this.running = running;
     this.taskLogger = TaskExecutionLogger.getInstance();
   }
@@ -103,7 +99,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
   @Override
   public Map<String, Object> buildRequestParams() {
     Map<String, Object> params = new HashMap<>();
-    params.put("agentId", agentId);
+    params.put("agentId", AgentIdentityProvider.getAgentId());
     params.put("timeoutMillis", config.getTimeoutMillis());
     return params;
   }
@@ -167,31 +163,43 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    *
    * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 TASK 部分
    *
-   * <p><b>Phase 5</b>：直接使用 Protobuf TaskPollResult 和 Task。
+   * <p><b>Phase 5</b>：直接使用 Protobuf TaskResponse。
+   * <p><b>协议对齐</b>：复用 TaskResponse，避免字段漂移。
    *
-   * @param result 轮询结果（Protobuf）
+   * @param response 任务响应（Protobuf TaskResponse）
    * @return 是否成功处理
    */
-  public boolean processUnifiedResult(TaskPollResult result) {
-    if (result == null) {
+  public boolean processUnifiedResult(TaskResponse response) {
+    if (response == null) {
       // 使用 INFO 级别，确保日志可见
-      logger.log(Level.INFO, "[TASK-POLL] No task result in unified response (result is null)");
+      logger.log(Level.INFO, "[TASK-POLL] No task response in unified response (response is null)");
+      return false;
+    }
+
+    // 检查响应状态
+    boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
+        || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+    
+    if (!success) {
+      logger.log(
+          Level.WARNING,
+          "[TASK-ERROR] Task response error in unified poll: {0}",
+          response.getStatus().getMessage());
+      taskLogger.logTaskProgress(
+          currentTaskId, "task_error", "Task response error: " + response.getStatus().getMessage());
       return false;
     }
 
     // Phase 5: 直接使用 Protobuf 任务列表（永远不为 null）
-    List<Task> tasks = result.getTasksList();
+    List<Task> tasks = response.getTasksList();
     
     // 增强诊断日志：无论是否有任务都输出详细信息
     logger.log(
         Level.INFO,
-        "[TASK-POLL] Processing unified result: hasTasks={0}, taskCount={1}",
-        new Object[] {
-          result.getHasTasks(),
-          tasks.size()
-        });
+        "[TASK-POLL] Processing unified result: taskCount={0}",
+        tasks.size());
     
-    if (result.getHasTasks() && !tasks.isEmpty()) {
+    if (!tasks.isEmpty()) {
       int taskCount = tasks.size();
       
       // 记录任务列表摘要
@@ -219,21 +227,17 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       return true;
     } else {
       // 无任务时也输出 INFO 级别日志，便于确认轮询正常工作
-      // 增强诊断：输出更多细节
       logger.log(
           Level.INFO,
-          "[TASK-POLL] No pending tasks via unified poll: hasTasks={0}, taskCount={1}",
-          new Object[] {
-            result.getHasTasks(),
-            tasks.size()
-          });
+          "[TASK-POLL] No pending tasks via unified poll: taskCount={0}",
+          tasks.size());
       taskLogger.logTaskProgress(
           currentTaskId,
           "no_tasks",
           String.format(
               Locale.ROOT,
-              "No pending tasks (hasTasks=%s, taskCount=%d)",
-              result.getHasTasks(), tasks.size()));
+              "No pending tasks (taskCount=%d)",
+              tasks.size()));
       return true;
     }
   }
@@ -452,7 +456,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       dispatcher.getStatusReporter().fireFailed(taskId, errorCode, errorMessage);
     } else {
       // 无分发器时，创建临时上报器
-      TaskStatusReporter reporter = new TaskStatusReporter(service, agentId);
+      TaskStatusReporter reporter = new TaskStatusReporter(service, AgentIdentityProvider.getAgentId());
       reporter.fireFailed(taskId, errorCode, errorMessage);
     }
   }
@@ -469,7 +473,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
       // Fire-and-Forget 模式，非终态无需关心结果
       dispatcher.getStatusReporter().fireRunning(taskId, message);
     } else {
-      TaskStatusReporter reporter = new TaskStatusReporter(service, agentId);
+      TaskStatusReporter reporter = new TaskStatusReporter(service, AgentIdentityProvider.getAgentId());
       reporter.fireRunning(taskId, message);
     }
   }
@@ -564,7 +568,7 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
    */
   private TaskRequest createTaskRequest() {
     return TaskRequest.newBuilder()
-        .setAgentId(agentId)
+        .setAgentId(AgentIdentityProvider.getAgentId())
         .setLongPollTimeoutMillis(config.getTimeoutMillis())
         .setCapabilities(AgentCapabilities.newBuilder().build())
         .build();

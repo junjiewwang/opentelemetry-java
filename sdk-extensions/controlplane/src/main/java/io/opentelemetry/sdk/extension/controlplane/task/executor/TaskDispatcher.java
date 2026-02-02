@@ -6,6 +6,7 @@
 package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
+import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.Task;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
@@ -131,9 +132,6 @@ public final class TaskDispatcher implements Closeable {
   /** 控制平面服务（Phase 5: Protobuf-only） */
   private final ControlPlaneService service;
 
-  /** Agent ID */
-  private final String agentId;
-
   /** 任务日志记录器 */
   private final TaskExecutionLogger taskLogger;
 
@@ -150,25 +148,21 @@ public final class TaskDispatcher implements Closeable {
    * 创建任务分发器
    *
    * @param service 控制平面服务（Protobuf-only）
-   * @param agentId Agent ID
    */
-  public TaskDispatcher(ControlPlaneService service, String agentId) {
-    this(service, agentId, null);
+  public TaskDispatcher(ControlPlaneService service) {
+    this(service, null);
   }
 
   /**
    * 创建任务分发器（带自定义调度器）
    *
    * @param service 控制平面服务（Protobuf-only）
-   * @param agentId Agent ID
    * @param scheduler 调度器（可选，为 null 时内部创建）
    */
   public TaskDispatcher(
       ControlPlaneService service,
-      String agentId,
       @Nullable ScheduledExecutorService scheduler) {
     this.service = service;
-    this.agentId = agentId;
     this.executors = new ConcurrentHashMap<>();
     this.runningTasks = ConcurrentHashMap.newKeySet();
     this.taskLogger = TaskExecutionLogger.getInstance();
@@ -188,9 +182,9 @@ public final class TaskDispatcher implements Closeable {
     });
 
     // 初始化状态上报器
-    this.statusReporter = new TaskStatusReporter(service, agentId);
+    this.statusReporter = new TaskStatusReporter(service, AgentIdentityProvider.getAgentId());
 
-    logger.log(Level.INFO, "TaskDispatcher initialized for agent: {0}", agentId);
+    logger.log(Level.INFO, "TaskDispatcher initialized for agent: {0}", AgentIdentityProvider.getAgentId());
 
     // 将事件管理器的事件统一转发给状态上报器
     this.statusEventManager.addListener(this::onTaskStatusEvent);
@@ -324,7 +318,7 @@ public final class TaskDispatcher implements Closeable {
     TaskExecutionContext context = buildContext(task);
 
     // 为该任务创建 emitter：执行器可在关键事件发生时实时上报状态
-    TaskStatusEmitter emitter = statusEventManager.createEmitter(taskId, agentId);
+    TaskStatusEmitter emitter = statusEventManager.createEmitter(taskId, AgentIdentityProvider.getAgentId());
     context = TaskExecutionContext.builder()
         .taskId(context.getTaskId())
         .taskType(context.getTaskType())
@@ -499,7 +493,7 @@ public final class TaskDispatcher implements Closeable {
         .timeoutMillis(task.getTimeoutMillis())
         .createdAtMillis(task.getCreatedAtMillis())
         .expiresAtMillis(task.getExpiresAtMillis())
-        .agentId(agentId)
+        .agentId(AgentIdentityProvider.getAgentId())
         .parameters(params)
         .parametersJson(task.getParametersJson())
         .service(service)

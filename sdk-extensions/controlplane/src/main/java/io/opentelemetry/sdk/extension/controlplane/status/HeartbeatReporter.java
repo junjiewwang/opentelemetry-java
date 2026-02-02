@@ -13,8 +13,10 @@ import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.Respons
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.StatusProtos.StatusResponse;
 import java.time.Duration;
+import java.util.Deque;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -45,6 +47,9 @@ import javax.annotation.Nullable;
 public final class HeartbeatReporter {
 
   private static final Logger logger = Logger.getLogger(HeartbeatReporter.class.getName());
+  
+  // 滑动窗口时间（1分钟）
+  private static final long SLIDING_WINDOW_MS = 60_000L;
 
   private final ControlPlaneConfig config;
   private final ControlPlaneService service;
@@ -52,11 +57,25 @@ public final class HeartbeatReporter {
 
   private final AtomicBoolean started;
   private final AtomicBoolean closed;
+  // 保留总计数用于日志统计
   private final AtomicLong heartbeatCount;
   private final AtomicLong successCount;
   private final AtomicLong failureCount;
   private final AtomicLong lastHeartbeatTimeMs;
   private final AtomicLong lastSuccessTimeMs;
+  
+  // 滑动窗口记录
+  private final Deque<HeartbeatRecord> slidingWindow = new ConcurrentLinkedDeque<>();
+
+  private static final class HeartbeatRecord {
+    final long timestamp;
+    final boolean success;
+
+    HeartbeatRecord(long timestamp, boolean success) {
+      this.timestamp = timestamp;
+      this.success = success;
+    }
+  }
 
   @Nullable private ScheduledFuture<?> heartbeatTask;
   @Nullable private volatile String lastError;
@@ -155,6 +174,9 @@ public final class HeartbeatReporter {
         Thread.currentThread().interrupt();
         scheduler.shutdownNow();
       }
+      
+      // 清理滑动窗口，释放内存
+      slidingWindow.clear();
 
       logger.log(Level.INFO, "Heartbeat reporter closed");
     }
@@ -207,17 +229,80 @@ public final class HeartbeatReporter {
     return lastError;
   }
 
+  /**
+   * 获取最近一分钟内的心跳成功率
+   *
+   * @return 成功率 (0.0 - 1.0)
+   */
   public double getSuccessRate() {
-    long total = heartbeatCount.get();
-    if (total == 0) {
-      return 1.0;
+    long now = System.currentTimeMillis();
+    // 移除 cleanUpWindow(now) 调用，避免并发修改导致的误删风险
+    // 读操作只负责过滤过期数据，写操作（sendHeartbeat）负责清理
+
+    int total = 0;
+    int success = 0;
+    
+    // 遍历快照
+    for (HeartbeatRecord record : slidingWindow) {
+      if (record.timestamp > now - SLIDING_WINDOW_MS) {
+        total++;
+        if (record.success) {
+          success++;
+        }
+      }
     }
-    return (double) successCount.get() / total;
+
+    if (total == 0) {
+      return 1.0; // 无数据时默认健康
+    }
+    return (double) success / total;
   }
 
+  /**
+   * 判断当前是否健康
+   * 
+   * <p>健康标准：
+   * <ul>
+   *   <li>最近1分钟内成功率 >= 80%</li>
+   *   <li>且最近1分钟内至少有2次成功心跳（确保样本充足且稳定）</li>
+   * </ul>
+   */
   public boolean isHealthy() {
-    // 如果成功率大于 80% 认为健康
-    return getSuccessRate() >= 0.8;
+    long now = System.currentTimeMillis();
+    // 移除 cleanUpWindow(now) 调用，避免并发修改导致的误删风险
+
+    int total = 0;
+    int success = 0;
+
+    for (HeartbeatRecord record : slidingWindow) {
+      if (record.timestamp > now - SLIDING_WINDOW_MS) {
+        total++;
+        if (record.success) {
+          success++;
+        }
+      }
+    }
+
+    // 如果没有数据，默认健康（乐观策略）
+    if (total == 0) {
+      return true;
+    }
+
+    double rate = (double) success / total;
+    // 成功率 >= 80% 且 至少有2次成功记录（避免单次偶发成功即恢复）
+    return rate >= 0.8 && success >= 2;
+  }
+
+  private void cleanUpWindow(long now) {
+    long cutoff = now - SLIDING_WINDOW_MS;
+    while (!slidingWindow.isEmpty()) {
+      HeartbeatRecord first = slidingWindow.peekFirst();
+      if (first != null && first.timestamp < cutoff) {
+        slidingWindow.pollFirst();
+      } else {
+        break;
+      }
+    }
   }
 
   // ============ 内部实现 ============
@@ -250,6 +335,10 @@ public final class HeartbeatReporter {
       // Phase 5: 直接使用 Protobuf 字段判断成功
       boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
           || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+
+      // 记录到滑动窗口
+      slidingWindow.addLast(new HeartbeatRecord(now, success));
+      cleanUpWindow(now);
 
       if (success) {
         successCount.incrementAndGet();

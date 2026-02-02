@@ -9,6 +9,7 @@ import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.TaskStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskResultResponse;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskResult;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionResult;
 import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Objects;
@@ -113,10 +114,9 @@ public final class TaskStatusReporter {
       ref.set(protoStatus);
     }
 
-    // 构建 Protobuf 请求（使用校验后的 safeResultJson）
-    TaskResultRequest request = TaskResultRequest.newBuilder()
+    // 构建 Protobuf TaskResult（复用 task.proto 定义）
+    TaskResult taskResult = TaskResult.newBuilder()
         .setTaskId(taskId)
-        .setAgentId(agentId)
         .setStatus(protoStatus)
         .setErrorCode(report.getErrorCode() != null ? report.getErrorCode() : "")
         .setErrorMessage(report.getErrorMessage() != null ? report.getErrorMessage() : "")
@@ -124,6 +124,12 @@ public final class TaskStatusReporter {
         .setStartedAtMillis(report.getStartedAtMillis())
         .setCompletedAtMillis(report.getCompletedAtMillis())
         .setExecutionTimeMillis(report.getExecutionTimeMillis())
+        .build();
+
+    // 构建 Protobuf 请求（协议对齐：复用 TaskResult，避免字段漂移）
+    TaskResultRequest request = TaskResultRequest.newBuilder()
+        .setAgentId(agentId)
+        .setResult(taskResult)
         .build();
 
     return service.reportTaskResult(request)

@@ -58,40 +58,106 @@ public final class AgentIdentityProvider {
    *
    * @param serviceName 服务名称
    * @param serviceNamespace 服务命名空间
-   * @return Agent 身份标识
    */
-  public static AgentIdentity initialize(
+  public static void initialize(
       @Nullable String serviceName, @Nullable String serviceNamespace) {
     synchronized (lock) {
       if (instance == null) {
         instance = createIdentity(serviceName, serviceNamespace);
       }
-      return instance;
     }
+  }
+
+  // ===== 便捷静态方法（简化调用） =====
+
+  /**
+   * 获取 Agent ID
+   *
+   * <p>便捷方法，等价于 {@code get().getAgentId()}
+   *
+   * @return Agent ID
+   */
+  public static String getAgentId() {
+    return get().getAgentId();
+  }
+
+  /**
+   * 获取服务名称
+   *
+   * <p>便捷方法，等价于 {@code get().getServiceName()}
+   *
+   * @return 服务名称
+   */
+  public static String getServiceName() {
+    return get().getServiceName();
+  }
+
+  /**
+   * 获取服务命名空间
+   *
+   * <p>便捷方法，等价于 {@code get().getServiceNamespace()}
+   *
+   * @return 服务命名空间
+   */
+  public static String getServiceNamespace() {
+    return get().getServiceNamespace();
+  }
+
+  /**
+   * 获取主机名
+   *
+   * <p>便捷方法，等价于 {@code get().getHostName()}
+   *
+   * @return 主机名
+   */
+  public static String getHostName() {
+    return get().getHostName();
+  }
+
+  /**
+   * 获取 IP 地址
+   *
+   * <p>便捷方法，等价于 {@code get().getIp()}
+   *
+   * @return IP 地址
+   */
+  public static String getIp() {
+    return get().getIp();
+  }
+
+  /**
+   * 获取进程 ID
+   *
+   * <p>便捷方法，等价于 {@code get().getProcessId()}
+   *
+   * @return 进程 ID
+   */
+  public static String getProcessId() {
+    return get().getProcessId();
   }
 
   private static AgentIdentity createIdentity(
       @Nullable String serviceName, @Nullable String serviceNamespace) {
-    String hostname = getHostname();
-    long pid = getProcessId();
-    long startTime = getStartTime();
+    String hostname = detectHostname();
+    long pid = detectProcessId();
+    long startTime = detectStartTime();
 
     String agentId = String.format(Locale.ROOT, "%s-%d-%d", hostname, pid, startTime);
 
     return AgentIdentity.builder()
         .setAgentId(agentId)
         .setHostName(hostname)
-        .setIp(getIpAddress())
+        .setIp(detectIpAddress())
         .setProcessId(String.valueOf(pid))
         .setStartTimeMillis(startTime) // 毫秒时间戳
-        .setSdkVersion(getSdkVersion())
-        .setServiceName(serviceName != null ? serviceName : getServiceName())
-        .setServiceNamespace(serviceNamespace != null ? serviceNamespace : getServiceNamespace())
-        .setLabels(getLabels())
+        .setSdkVersion(detectSdkVersion())
+        .setServiceName(serviceName != null ? serviceName : detectServiceName())
+        .setServiceNamespace(serviceNamespace != null ? serviceNamespace : detectServiceNamespace())
+        .setLabels(detectLabels())
         .build();
   }
 
-  private static String getHostname() {
+  private static String detectHostname() {
     // 优先从环境变量获取
     String hostname = System.getenv("HOSTNAME");
     if (hostname != null && !hostname.isEmpty()) {
@@ -113,7 +179,7 @@ public final class AgentIdentityProvider {
     }
   }
 
-  private static long getProcessId() {
+  private static long detectProcessId() {
     // 首先尝试 Java 9+ 的 ProcessHandle API
     try {
       Class<?> processHandleClass = Class.forName("java.lang.ProcessHandle");
@@ -151,7 +217,7 @@ public final class AgentIdentityProvider {
     }
   }
 
-  private static long getStartTime() {
+  private static long detectStartTime() {
     // Use reflection to call ManagementFactory for Android compatibility (animalsniffer).
     try {
       Class<?> managementFactoryClass = Class.forName("java.lang.management.ManagementFactory");
@@ -167,7 +233,7 @@ public final class AgentIdentityProvider {
     }
   }
 
-  private static String getServiceName() {
+  private static String detectServiceName() {
     String serviceName = System.getProperty("otel.service.name");
     if (serviceName != null && !serviceName.isEmpty()) {
       return serviceName;
@@ -178,10 +244,10 @@ public final class AgentIdentityProvider {
       return serviceName;
     }
 
-    return "unknown-service";
+    return "";
   }
 
-  private static String getServiceNamespace() {
+  private static String detectServiceNamespace() {
     String namespace = System.getProperty("otel.service.namespace");
     if (namespace != null && !namespace.isEmpty()) {
       return namespace;
@@ -208,7 +274,7 @@ public final class AgentIdentityProvider {
    *
    * @return IP 地址，如果无法获取则返回 unknown
    */
-  private static String getIpAddress() {
+  private static String detectIpAddress() {
     // 1. 从环境变量 POD_IP 获取（K8s Downward API 注入）
     String ip = System.getenv("POD_IP");
     if (ip != null && !ip.isEmpty()) {
@@ -256,7 +322,7 @@ public final class AgentIdentityProvider {
    *
    * @return 标签 Map，如果没有配置则返回空 Map
    */
-  private static Map<String, String> getLabels() {
+  private static Map<String, String> detectLabels() {
     Map<String, String> labels = new LinkedHashMap<>();
 
     // 1. 从系统属性获取 (如 -Dotel.agent.labels=env=prod,region=cn-east)
@@ -296,7 +362,7 @@ public final class AgentIdentityProvider {
     return labels;
   }
 
-  private static String getSdkVersion() {
+  private static String detectSdkVersion() {
     // 尝试从 manifest 或 properties 读取版本
     Package pkg = AgentIdentityProvider.class.getPackage();
     if (pkg != null && pkg.getImplementationVersion() != null) {

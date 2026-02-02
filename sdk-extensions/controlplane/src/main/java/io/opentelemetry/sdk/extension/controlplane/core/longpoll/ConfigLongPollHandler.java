@@ -9,12 +9,12 @@ import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.ProtobufAgentConfigAdapter;
+import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.AgentConfig;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.ConfigPollResult;
 import io.opentelemetry.sdk.extension.controlplane.task.TaskExecutionLogger;
 import javax.annotation.Nullable;
 import java.util.HashMap;
@@ -45,7 +45,6 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   private final ControlPlaneService service;
   private final ControlPlaneStatistics statistics;
   private final LongPollConfig config;
-  private final String agentId;
   private final AtomicBoolean running;
   private final TaskExecutionLogger taskLogger;
 
@@ -65,19 +64,16 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    * @param service 控制平面服务（Protobuf-only）
    * @param statistics 统计管理器
    * @param config 长轮询配置
-   * @param agentId Agent ID
    * @param running 运行状态标志
    */
   public ConfigLongPollHandler(
       ControlPlaneService service,
       ControlPlaneStatistics statistics,
       LongPollConfig config,
-      String agentId,
       AtomicBoolean running) {
     this.service = service;
     this.statistics = statistics;
     this.config = config;
-    this.agentId = agentId;
     this.running = running;
     this.taskLogger = TaskExecutionLogger.getInstance();
   }
@@ -90,7 +86,7 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   @Override
   public Map<String, Object> buildRequestParams() {
     Map<String, Object> params = new HashMap<>();
-    params.put("agentId", agentId);
+    params.put("agentId", AgentIdentityProvider.getAgentId());
     params.put("currentConfigVersion", currentConfigVersion);
     params.put("currentEtag", currentConfigEtag);
     params.put("timeoutMillis", config.getTimeoutMillis());
@@ -160,21 +156,44 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    *
    * <p>这是推荐的方式，用于处理 /v1/control/poll 统一端点返回的 CONFIG 部分
    *
-   * <p><b>Phase 5</b>：直接使用 Protobuf ConfigPollResult。
+   * <p><b>Phase 5</b>：直接使用 Protobuf ConfigResponse。
+   * <p><b>协议对齐</b>：复用 ConfigResponse，避免字段漂移。
    *
-   * @param result 轮询结果（Protobuf）
+   * @param response 配置响应（Protobuf ConfigResponse）
    * @return 是否成功处理
    */
-  public boolean processUnifiedResult(ConfigPollResult result) {
-    if (result == null) {
-      logger.log(Level.FINE, "[CONFIG-POLL] No config result in unified response");
+  public boolean processUnifiedResult(ConfigResponse response) {
+    if (response == null) {
+      logger.log(Level.FINE, "[CONFIG-POLL] No config response in unified response");
       return false;
     }
 
-    if (result.getHasChanges()) {
-      // Phase 5: 直接从 Protobuf 获取版本和 ETag
-      String newVersion = result.getConfigVersion();
-      String newEtag = result.getConfigEtag();
+    // 检查响应状态
+    boolean success = response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
+        || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+    
+    if (!success) {
+      logger.log(
+          Level.WARNING,
+          "[CONFIG-ERROR] Config response error in unified poll: {0}",
+          response.getStatus().getMessage());
+      taskLogger.logTaskProgress(
+          currentTaskId,
+          "config_error",
+          "Config response error: " + response.getStatus().getMessage());
+      return false;
+    }
+
+    if (response.getHasChanges()) {
+      // 从 ConfigResponse 获取版本和 etag（优先使用 DTO 兼容字段）
+      String newVersion = !response.getConfigVersion().isEmpty()
+          ? response.getConfigVersion()
+          : (response.hasConfig() && response.getConfig().hasVersion()
+              ? response.getConfig().getVersion().getVersion() : "");
+      String newEtag = !response.getEtag().isEmpty()
+          ? response.getEtag()
+          : (response.hasConfig() && response.getConfig().hasVersion()
+              ? response.getConfig().getVersion().getEtag() : "");
 
       // 配置有更新
       logger.log(
@@ -196,7 +215,9 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
       }
 
       // 应用配置数据（通过 DynamicConfigManager）
-      applyConfigData(result.getConfigData(), newVersion);
+      if (response.hasConfig()) {
+        applyAgentConfig(response.getConfig(), newVersion);
+      }
       
       return true;
     } else {
@@ -255,8 +276,11 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
    * <p><b>Phase 5</b>：直接使用 Protobuf Builder。
    */
   private ConfigRequest createConfigRequest() {
+    String agentId = AgentIdentityProvider.getAgentId();
+    String serviceName = AgentIdentityProvider.getServiceName();
     return ConfigRequest.newBuilder()
         .setAgentId(agentId)
+        .setServiceName(serviceName != null ? serviceName : "")
         .setCurrentVersion(
             ConfigVersion.newBuilder()
                 .setVersion(currentConfigVersion != null ? currentConfigVersion : "")
@@ -267,28 +291,26 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
   }
 
   /**
-   * 应用配置数据
+   * 应用 AgentConfig 配置
    *
    * <p>将 Protobuf AgentConfig 转换为 AgentConfigData 并通过 DynamicConfigManager 应用。
+   * <p><b>协议对齐</b>：直接使用 AgentConfig 而不是 bytes。
    *
-   * @param configData 序列化的 AgentConfig 数据（ByteString）
+   * @param agentConfig AgentConfig Protobuf 对象
    * @param configVersion 配置版本
    */
-  private void applyConfigData(com.google.protobuf.ByteString configData, String configVersion) {
+  private void applyAgentConfig(AgentConfig agentConfig, String configVersion) {
     if (configManager == null) {
       logger.log(Level.FINE, "[CONFIG-APPLY] DynamicConfigManager not set, skipping config apply");
       return;
     }
 
-    if (configData == null || configData.isEmpty()) {
-      logger.log(Level.FINE, "[CONFIG-APPLY] No config data to apply");
+    if (agentConfig == null) {
+      logger.log(Level.FINE, "[CONFIG-APPLY] No AgentConfig to apply");
       return;
     }
 
     try {
-      // 解析 ByteString 为 AgentConfig
-      AgentConfig agentConfig = AgentConfig.parseFrom(configData);
-      
       // 使用适配器将 Protobuf AgentConfig 转换为 AgentConfigData
       ProtobufAgentConfigAdapter configDataAdapter = new ProtobufAgentConfigAdapter(agentConfig, configVersion);
       
@@ -304,12 +326,6 @@ public final class ConfigLongPollHandler implements LongPollHandler<ConfigRespon
           "config_applied",
           "Status: " + result.getStatus() + ", applied: " + result.getAppliedFields());
           
-    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-      logger.log(Level.WARNING, "[CONFIG-APPLY] Failed to parse config data: {0}", e.getMessage());
-      taskLogger.logTaskProgress(
-          currentTaskId,
-          "config_parse_error",
-          "Failed to parse config data: " + e.getMessage());
     } catch (RuntimeException e) {
       logger.log(Level.WARNING, "[CONFIG-APPLY] Failed to apply config: {0}", e.getMessage());
       taskLogger.logTaskProgress(

@@ -83,14 +83,14 @@ public final class HealthCheckCoordinator {
     lastGateDecision = decision;
 
     if (!decision.isAllowed()) {
-      ConnectionStateManager.ConnectionState currentState = connectionStateManager.getState();
-      if (currentState != ConnectionStateManager.ConnectionState.WAITING_FOR_OTLP) {
-        connectionStateManager.markWaitingForOtlp();
-        logger.log(
-            Level.INFO,
-            "Control plane connection gated (gate={0}), waiting for recovery before connecting",
-            decision);
+      // 如果被阻断，确保状态不是 CONNECTED
+      if (connectionStateManager.isConnected()) {
+        connectionStateManager.markDisconnected("Health check failed: " + decision.getReason());
       }
+      logger.log(
+          Level.INFO,
+          "Control plane connection gated (gate={0}), waiting for recovery",
+          decision);
       return false;
     }
     return true;

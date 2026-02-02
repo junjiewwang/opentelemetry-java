@@ -155,8 +155,7 @@ public final class ControlPlaneManager implements Closeable {
             this.service,
             this.connectionStateManager,
             this.healthCheckCoordinator,
-            this.statistics,
-            this.agentIdentity.getAgentId());
+            this.statistics);
 
     // 设置 DynamicConfigManager 以便 ConfigLongPollHandler 可以应用配置
     this.longPollCoordinator.setConfigManager(this.configManager);
@@ -309,7 +308,6 @@ public final class ControlPlaneManager implements Closeable {
     // 创建任务分发器（Phase 5: 使用 ControlPlaneService）
     taskDispatcher = new TaskDispatcher(
         service,
-        agentIdentity.getAgentId(),
         taskManager.getScheduler());
 
     // 自动注册任务执行器（遍历所有实现 TaskExecutorProvider 的组件）

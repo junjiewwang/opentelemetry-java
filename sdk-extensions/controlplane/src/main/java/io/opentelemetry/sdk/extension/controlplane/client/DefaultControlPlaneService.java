@@ -69,8 +69,11 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
     checkNotClosed();
 
     String agentId = request.getAgentId();
+    // 协议对齐：从嵌套的 config_request 获取配置版本
     String configVersion =
-        request.hasCurrentConfigVersion() ? request.getCurrentConfigVersion().getVersion() : "";
+        request.hasConfigRequest() && request.getConfigRequest().hasCurrentVersion()
+            ? request.getConfigRequest().getCurrentVersion().getVersion()
+            : "";
     long timeoutMillis = request.getTimeoutMillis();
 
     logger.logPollRequest(agentId, timeoutMillis, configVersion);
@@ -93,9 +96,10 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
               boolean success =
                   response.getStatus().getCode() == ResponseStatus.Code.CODE_OK
                       || response.getStatus().getCode() == ResponseStatus.Code.CODE_UNSPECIFIED;
+              // 协议对齐：从嵌套的 task_response 获取任务数量
               int taskCount =
-                  response.hasTaskResult()
-                      ? response.getTaskResult().getTasksCount()
+                  response.hasTaskResponse()
+                      ? response.getTaskResponse().getTasksCount()
                       : 0;
 
               logger.logPollResponse(
@@ -202,8 +206,11 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
   public CompletableFuture<TaskResultResponse> reportTaskResult(TaskResultRequest request) {
     checkNotClosed();
 
-    logger.logTaskResultReport(
-        request.getTaskId(), request.getStatus().name(), request.getErrorCode());
+    // 协议对齐：从嵌套的 result 中获取任务信息
+    String taskId = request.hasResult() ? request.getResult().getTaskId() : "";
+    String statusName = request.hasResult() ? request.getResult().getStatus().name() : "UNKNOWN";
+    String errorCode = request.hasResult() ? request.getResult().getErrorCode() : "";
+    logger.logTaskResultReport(taskId, statusName, errorCode);
 
     byte[] requestBytes = ProtobufCodec.encode(request);
 

@@ -7,13 +7,16 @@ package io.opentelemetry.sdk.extension.controlplane.core.longpoll;
 
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
+import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ConfigVersion;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.CommonProtos.ResponseStatus;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.ConfigPollResult;
-import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.TaskPollResult;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.ConfigProtos.ConfigResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollRequest;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.PollProtos.UnifiedPollResponse;
 import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.AgentCapabilities;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskRequest;
+import io.opentelemetry.sdk.extension.controlplane.proto.v1.TaskProtos.TaskResponse;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneStatistics;
@@ -81,7 +84,6 @@ public final class LongPollCoordinator implements Closeable {
   private final ConnectionStateManager connectionStateManager;
   private final HealthCheckCoordinator healthCheckCoordinator;
   private final ControlPlaneStatistics statistics;
-  private final String agentId;
 
   // Handler 列表（支持动态注册，遵循开闭原则）
   private final List<LongPollHandler<?>> handlers;
@@ -109,21 +111,18 @@ public final class LongPollCoordinator implements Closeable {
    * @param connectionStateManager 连接状态管理器
    * @param healthCheckCoordinator 健康检查协调器
    * @param statistics 统计管理器
-   * @param agentId Agent ID
    */
   public LongPollCoordinator(
       LongPollConfig config,
       ControlPlaneService service,
       ConnectionStateManager connectionStateManager,
       HealthCheckCoordinator healthCheckCoordinator,
-      ControlPlaneStatistics statistics,
-      String agentId) {
+      ControlPlaneStatistics statistics) {
     this.config = config;
     this.service = service;
     this.connectionStateManager = connectionStateManager;
     this.healthCheckCoordinator = healthCheckCoordinator;
     this.statistics = statistics;
-    this.agentId = agentId;
 
     this.state = new AtomicReference<>(State.IDLE);
     this.running = new AtomicBoolean(false);
@@ -135,9 +134,9 @@ public final class LongPollCoordinator implements Closeable {
 
     // 初始化 Handler 列表（默认注册配置和任务处理器）
     this.handlers = new ArrayList<>();
-    ConfigLongPollHandler configHandler = new ConfigLongPollHandler(service, statistics, config, agentId, running);
+    ConfigLongPollHandler configHandler = new ConfigLongPollHandler(service, statistics, config, running);
     this.registerHandler(configHandler)
-        .registerHandler(new TaskLongPollHandler(service, statistics, config, agentId, running));
+        .registerHandler(new TaskLongPollHandler(service, statistics, config, running));
   }
 
   /**
@@ -480,20 +479,20 @@ public final class LongPollCoordinator implements Closeable {
     int successCount = 0;
     int failureCount = 0;
 
-    // Phase 5: 直接处理 ConfigPollResult 和 TaskPollResult
+    // Phase 5: 直接处理 ConfigResponse 和 TaskResponse（复用子协议）
     for (LongPollHandler<?> handler : handlers) {
       LongPollType type = handler.getType();
       
       try {
         boolean processed = false;
-        if (type == LongPollType.CONFIG && response.hasConfigResult()) {
-          ConfigPollResult configResult = response.getConfigResult();
+        if (type == LongPollType.CONFIG && response.hasConfigResponse()) {
+          ConfigResponse configResponse = response.getConfigResponse();
           ConfigLongPollHandler configHandler = (ConfigLongPollHandler) handler;
-          processed = configHandler.processUnifiedResult(configResult);
-        } else if (type == LongPollType.TASK && response.hasTaskResult()) {
-          TaskPollResult taskResult = response.getTaskResult();
+          processed = configHandler.processUnifiedResult(configResponse);
+        } else if (type == LongPollType.TASK && response.hasTaskResponse()) {
+          TaskResponse taskResponse = response.getTaskResponse();
           TaskLongPollHandler taskHandler = (TaskLongPollHandler) handler;
-          processed = taskHandler.processUnifiedResult(taskResult);
+          processed = taskHandler.processUnifiedResult(taskResponse);
         }
         if (processed) {
           successCount++;
@@ -514,7 +513,7 @@ public final class LongPollCoordinator implements Closeable {
         new Object[] {count, successCount, failureCount, response.getHasAnyChanges()});
 
     // 记录成功统计
-    if (response.hasConfigResult()) {
+    if (response.hasConfigResponse()) {
       statistics.recordConfigFetchSuccess();
     }
 
@@ -543,6 +542,7 @@ public final class LongPollCoordinator implements Closeable {
    * 创建统一轮询请求
    *
    * <p><b>Phase 5</b>：直接构建 Protobuf 请求消息。
+   * <p><b>协议对齐</b>：复用 ConfigRequest 和 TaskRequest，避免字段漂移。
    *
    * @return 统一轮询请求（Protobuf）
    */
@@ -550,17 +550,39 @@ public final class LongPollCoordinator implements Closeable {
     // 从 ConfigHandler 获取当前配置版本和 ETag
     String configVersion = getCurrentConfigVersion();
     String configEtag = getCurrentConfigEtag();
+    long timeoutMillis = config.getTimeoutMillis();
 
-    // Phase 5: 直接使用 Protobuf Builder
-    return UnifiedPollRequest.newBuilder()
+    // 从 AgentIdentityProvider 获取身份信息
+    String agentId = AgentIdentityProvider.getAgentId();
+    String serviceName = AgentIdentityProvider.getServiceName();
+
+    // 构建 ConfigRequest（复用 config.proto 定义）
+    ConfigRequest configRequest = ConfigRequest.newBuilder()
         .setAgentId(agentId)
-        .setCurrentConfigVersion(
+        .setServiceName(serviceName != null ? serviceName : "")
+        .setCurrentVersion(
             ConfigVersion.newBuilder()
                 .setVersion(configVersion != null ? configVersion : "")
                 .setEtag(configEtag != null ? configEtag : "")
                 .build())
-        .setTimeoutMillis(config.getTimeoutMillis())
+        .setCurrentConfigVersion(configVersion != null ? configVersion : "")
+        .setCurrentEtag(configEtag != null ? configEtag : "")
+        .setLongPollTimeoutMillis(timeoutMillis)
+        .build();
+
+    // 构建 TaskRequest（复用 task.proto 定义）
+    TaskRequest taskRequest = TaskRequest.newBuilder()
+        .setAgentId(agentId)
+        .setLongPollTimeoutMillis(timeoutMillis)
         .setCapabilities(AgentCapabilities.newBuilder().build())
+        .build();
+
+    // 构建统一轮询请求（顶层 agent_id/timeout 优先级高于子请求）
+    return UnifiedPollRequest.newBuilder()
+        .setAgentId(agentId)
+        .setTimeoutMillis(timeoutMillis)
+        .setConfigRequest(configRequest)
+        .setTaskRequest(taskRequest)
         .build();
   }
 

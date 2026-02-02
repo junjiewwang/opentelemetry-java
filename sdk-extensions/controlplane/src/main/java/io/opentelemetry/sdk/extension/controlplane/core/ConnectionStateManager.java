@@ -35,8 +35,6 @@ public final class ConnectionStateManager {
     CONNECTING,
     /** Disconnected - connection failed or not started. */
     DISCONNECTED,
-    /** Waiting for OTLP recovery - paused due to OTLP health issues. */
-    WAITING_FOR_OTLP,
     /** Server unavailable - server endpoint exists but control plane API not available. */
     SERVER_UNAVAILABLE
   }
@@ -147,24 +145,6 @@ public final class ConnectionStateManager {
       logger.log(
           Level.WARNING,
           "Control plane server unavailable, state changed: {0} -> SERVER_UNAVAILABLE",
-          previous);
-    }
-    return previous;
-  }
-
-  /**
-   * 标记为等待 OTLP 恢复
-   *
-   * @return 变更前的状态
-   */
-  public ConnectionState markWaitingForOtlp() {
-    ConnectionState previousState = currentState.get();
-    ConnectionState previous = previousState != null ? previousState : ConnectionState.DISCONNECTED;
-    if (previous != ConnectionState.WAITING_FOR_OTLP) {
-      setState(ConnectionState.WAITING_FOR_OTLP);
-      logger.log(
-          Level.INFO,
-          "Waiting for OTLP recovery, state changed: {0} -> WAITING_FOR_OTLP",
           previous);
     }
     return previous;

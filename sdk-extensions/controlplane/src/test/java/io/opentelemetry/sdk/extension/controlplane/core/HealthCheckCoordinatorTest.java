@@ -53,7 +53,8 @@ class HealthCheckCoordinatorTest {
       when(heartbeatReporter.getLastHeartbeatTimeMs()).thenReturn(System.currentTimeMillis());
 
       assertThat(coordinator.shouldConnect()).isFalse();
-      assertThat(connectionStateManager.getState()).isEqualTo(ConnectionState.WAITING_FOR_OTLP);
+      // 协议对齐：WAITING_FOR_OTLP 已废弃，不健康时设置为 DISCONNECTED
+      assertThat(connectionStateManager.getState()).isEqualTo(ConnectionState.DISCONNECTED);
       assertThat(coordinator.getLastGateDecision().isAllowed()).isFalse();
       assertThat(coordinator.getLastGateDecision().getReason()).contains("heartbeat_unhealthy");
     }
