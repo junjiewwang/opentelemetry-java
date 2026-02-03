@@ -26,7 +26,7 @@ public final class DynamicConfigManager {
   private static final Logger logger = Logger.getLogger(DynamicConfigManager.class.getName());
 
   // 可热更新的组件注册表
-  private final Map<String, HotUpdatableComponent> components;
+  private final Map<HotConfigKey<?>, HotUpdatableComponent<?>> components;
 
   // 配置变更监听器
   private final List<ConfigChangeListener> listeners;
@@ -50,22 +50,22 @@ public final class DynamicConfigManager {
   /**
    * 注册可热更新组件
    *
-   * @param name 组件名称
+   * @param key 配置字段 key
    * @param component 组件实例
    */
-  public void registerComponent(String name, HotUpdatableComponent component) {
-    components.put(name, component);
-    logger.log(Level.INFO, "Registered hot-updatable component: {0}", name);
+  public <T> void registerComponent(HotConfigKey<T> key, HotUpdatableComponent<T> component) {
+    components.put(key, component);
+    logger.log(Level.INFO, "Registered hot-updatable component: {0}", key.getFieldName());
   }
 
   /**
    * 取消注册组件
    *
-   * @param name 组件名称
+   * @param key 配置字段 key
    */
-  public void unregisterComponent(String name) {
-    components.remove(name);
-    logger.log(Level.INFO, "Unregistered hot-updatable component: {0}", name);
+  public void unregisterComponent(HotConfigKey<?> key) {
+    components.remove(key);
+    logger.log(Level.INFO, "Unregistered hot-updatable component: {0}", key.getFieldName());
   }
 
   /**
@@ -225,32 +225,37 @@ public final class DynamicConfigManager {
   }
 
   private void applySamplerConfig(SamplerConfigData config) {
-    HotUpdatableComponent sampler = components.get("sampler");
+    HotUpdatableComponent<SamplerConfigData> sampler = getComponent(ConfigKeys.SAMPLER);
     if (sampler != null) {
-      // DynamicSampler 实现了 HotUpdatableComponent，直接调用 update 方法
       sampler.update(config);
     }
   }
 
   private void applyBatchConfig(BatchConfigData config) {
-    HotUpdatableComponent processor = components.get("batch_processor");
+    HotUpdatableComponent<BatchConfigData> processor = getComponent(ConfigKeys.BATCH);
     if (processor != null) {
       processor.update(config);
     }
   }
 
   private void applyResourceAttributes(Map<String, String> attributes) {
-    HotUpdatableComponent resource = components.get("resource");
+    HotUpdatableComponent<Map<String, String>> resource = getComponent(ConfigKeys.RESOURCE_ATTRIBUTES);
     if (resource != null) {
       resource.update(attributes);
     }
   }
 
   private void applyExtensionConfig(String json) {
-    HotUpdatableComponent extension = components.get("extension");
+    HotUpdatableComponent<String> extension = getComponent(ConfigKeys.EXTENSION);
     if (extension != null) {
       extension.update(json);
     }
+  }
+
+  @SuppressWarnings("unchecked")
+  @Nullable
+  private <T> HotUpdatableComponent<T> getComponent(HotConfigKey<T> key) {
+    return (HotUpdatableComponent<T>) components.get(key);
   }
 
   private void notifyListeners(AgentConfigData config, List<String> applied, List<String> failed) {
@@ -281,13 +286,54 @@ public final class DynamicConfigManager {
   }
 
   /** 可热更新组件接口 */
-  public interface HotUpdatableComponent {
+  public interface HotUpdatableComponent<T> {
     /**
      * 更新组件配置
      *
      * @param config 配置对象
      */
-    void update(Object config);
+    void update(T config);
+  }
+
+  /**
+   * 强类型配置字段 Key。
+   *
+   * <p>用于将配置字段名与其配置类型绑定，避免在注册/应用阶段出现不安全的强制类型转换。
+   */
+  public static final class HotConfigKey<T> {
+    private final String fieldName;
+    private final Class<T> type;
+
+    private HotConfigKey(String fieldName, Class<T> type) {
+      this.fieldName = fieldName;
+      this.type = type;
+    }
+
+    public String getFieldName() {
+      return fieldName;
+    }
+
+    public Class<T> getType() {
+      return type;
+    }
+
+    public static <T> HotConfigKey<T> of(String fieldName, Class<T> type) {
+      return new HotConfigKey<>(fieldName, type);
+    }
+  }
+
+  /** 内置配置字段 Key 常量（字段名用于 applied/failed 列表与日志） */
+  public static final class ConfigKeys {
+    private ConfigKeys() {}
+
+    public static final HotConfigKey<SamplerConfigData> SAMPLER =
+        HotConfigKey.of("sampler", SamplerConfigData.class);
+    public static final HotConfigKey<BatchConfigData> BATCH =
+        HotConfigKey.of("batch", BatchConfigData.class);
+    @SuppressWarnings("unchecked")
+    public static final HotConfigKey<Map<String, String>> RESOURCE_ATTRIBUTES =
+        (HotConfigKey<Map<String, String>>) (HotConfigKey<?>) HotConfigKey.of("resource_attributes", Map.class);
+    public static final HotConfigKey<String> EXTENSION = HotConfigKey.of("extension", String.class);
   }
 
   /** 配置变更监听器 */

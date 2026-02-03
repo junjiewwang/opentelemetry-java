@@ -21,7 +21,7 @@ import java.util.logging.Logger;
  *
  * <p>支持运行时动态更新采样策略，无需重启应用。
  */
-public final class DynamicSampler implements Sampler, DynamicConfigManager.HotUpdatableComponent {
+public final class DynamicSampler implements Sampler, DynamicConfigManager.HotUpdatableComponent<DynamicConfigManager.SamplerConfigData> {
 
   private static final Logger logger = Logger.getLogger(DynamicSampler.class.getName());
   private static final Sampler DEFAULT_SAMPLER = Sampler.alwaysOn();
@@ -74,36 +74,30 @@ public final class DynamicSampler implements Sampler, DynamicConfigManager.HotUp
   /**
    * 实现 HotUpdatableComponent 接口的 update 方法
    *
-   * @param config 配置对象，支持 Sampler 或 SamplerConfigData
+   * @param samplerConfig 采样器配置对象
    */
   @Override
-  public void update(Object config) {
-    if (config instanceof Sampler) {
-      update((Sampler) config);
-    } else if (config instanceof DynamicConfigManager.SamplerConfigData) {
-      DynamicConfigManager.SamplerConfigData samplerConfig =
-          (DynamicConfigManager.SamplerConfigData) config;
-      switch (samplerConfig.getType()) {
-        case ALWAYS_ON:
-          updateRatio(1.0);
-          break;
-        case ALWAYS_OFF:
-          updateRatio(0.0);
-          break;
-        case TRACE_ID_RATIO:
-          updateRatio(samplerConfig.getRatio());
-          break;
-        case PARENT_BASED:
-          updateParentBased(samplerConfig.getRatio());
-          break;
-        default:
-          logger.log(Level.WARNING, "Unknown sampler type: {0}", samplerConfig.getType());
-      }
-    } else {
-      logger.log(
-          Level.WARNING,
-          "Unsupported config type for DynamicSampler: {0}",
-          config != null ? config.getClass().getName() : "null");
+  public void update(DynamicConfigManager.SamplerConfigData samplerConfig) {
+    if (samplerConfig == null) {
+      logger.log(Level.WARNING, "Sampler config is null, skipping update");
+      return;
+    }
+
+    switch (samplerConfig.getType()) {
+      case ALWAYS_ON:
+        updateRatio(1.0);
+        break;
+      case ALWAYS_OFF:
+        updateRatio(0.0);
+        break;
+      case TRACE_ID_RATIO:
+        updateRatio(samplerConfig.getRatio());
+        break;
+      case PARENT_BASED:
+        updateParentBased(samplerConfig.getRatio());
+        break;
+      default:
+        logger.log(Level.WARNING, "Unknown sampler type: {0}", samplerConfig.getType());
     }
   }
 

@@ -201,8 +201,7 @@ public final class ControlPlaneManager implements Closeable {
         new Object[] {agentIdentity.getAgentId(), config.getEndpoint()});
 
     // 注册动态采样器
-    configManager.registerComponent(
-        "sampler", cfg -> dynamicSampler.update((io.opentelemetry.sdk.trace.samplers.Sampler) cfg));
+    configManager.registerComponent(DynamicConfigManager.ConfigKeys.SAMPLER, dynamicSampler);
 
     // 自动注册服务端元数据监听器（遍历所有实现 ServerMetadataListener 的组件）
     registerServerMetadataListeners();
