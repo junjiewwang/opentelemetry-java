@@ -362,7 +362,8 @@ public final class TaskDispatcher implements Closeable {
     long finalTimeout = timeout;
     @SuppressWarnings("FutureReturnValueIgnored")
     Object unused1 = timeoutFuture.whenCompleteAsync((result, error) -> {
-      long executionTime = System.currentTimeMillis() - startTime;
+      long endTime = System.currentTimeMillis();
+      long executionTime = endTime - startTime;
       runningTasks.remove(taskId);
       statusEventManager.closeEmitter(taskId);
 
@@ -391,9 +392,12 @@ public final class TaskDispatcher implements Closeable {
               new Object[] {taskId, error.getMessage()});
         }
       } else {
-        finalResult = result;
-        if (result.isSuccess()) {
-          if (result.getStatus() == TaskExecutionResult.Status.RUNNING) {
+        // 修正时间信息：使用调度层的准确时间覆盖执行器返回的时间
+        // 解决执行器可能返回 executionTime=0 或 started=completed 的问题
+        finalResult = result.withTimeInfo(startTime, endTime);
+        
+        if (finalResult.isSuccess()) {
+          if (finalResult.getStatus() == TaskExecutionResult.Status.RUNNING) {
             logger.log(
                 Level.INFO,
                 "[TASK-RUNNING] Task reported running: taskId={0}, executionTime={1}ms",

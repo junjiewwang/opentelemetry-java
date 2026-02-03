@@ -250,6 +250,32 @@ public final class TaskExecutionResult {
   }
 
   /**
+   * 创建包含更新时间信息的新实例（保持其他字段不变）
+   *
+   * <p>用于 TaskDispatcher 在任务完成后统一修正时间信息，确保：
+   * <ul>
+   *   <li>startedAtMillis 为任务调度开始时间</li>
+   *   <li>completedAtMillis 为任务调度结束时间</li>
+   *   <li>executionTimeMillis 为两者之差</li>
+   * </ul>
+   *
+   * @param startedAtMillis 开始时间
+   * @param completedAtMillis 结束时间
+   * @return 新的 TaskExecutionResult 实例
+   */
+  public TaskExecutionResult withTimeInfo(long startedAtMillis, long completedAtMillis) {
+    return builder()
+        .status(this.status)
+        .errorCode(this.errorCode)
+        .errorMessage(this.errorMessage)
+        .resultJson(this.resultJson)
+        .startedAtMillis(startedAtMillis)
+        .completedAtMillis(completedAtMillis)
+        .executionTimeMillis(Math.max(0, completedAtMillis - startedAtMillis))
+        .build();
+  }
+
+  /**
    * 是否成功
    *
    * @return 是否成功

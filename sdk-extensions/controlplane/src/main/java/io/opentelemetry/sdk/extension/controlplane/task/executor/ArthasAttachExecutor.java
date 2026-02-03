@@ -172,7 +172,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     if (isReadyNow()) {
       logger.log(Level.INFO, "[ARTHAS-ATTACH] Already ready, returning success immediately, taskId={0}", taskId);
       TaskExecutionResult immediate = buildSuccessResult("Arthas already ready (terminal-ready)", manager);
-      future.complete(TaskExecutionResult.success(immediate.getResultJson(), 0));
+      // 使用实际耗时而非硬编码 0，虽然 TaskDispatcher 会再次修正，但保持逻辑自洽
+      long executionTime = System.currentTimeMillis() - startTime;
+      future.complete(TaskExecutionResult.success(immediate.getResultJson(), executionTime));
       return future;
     }
 
@@ -250,12 +252,12 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                   if (future.isDone()) {
                     return;
                   }
-                  handleEventCompletion(future, manager, emitter, startTime);
+                  handleEventCompletion(future, manager, startTime);
                 })
             .exceptionally(
                 e -> {
                   if (!future.isDone()) {
-                    handleEventTimeout(future, manager, emitter, effectiveTimeout, startTime, e);
+                    handleEventTimeout(future, manager, effectiveTimeout, startTime, e);
                   }
                   return null;
                 });
@@ -273,7 +275,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                   long executionTime = System.currentTimeMillis() - startTime;
                   String errorCode = startResult.getErrorCode() != null ? startResult.getErrorCode() : "UNKNOWN_ERROR";
                   String errorMsg = startResult.getErrorMessage() != null ? startResult.getErrorMessage() : "Unknown error";
-                  emitter.failed(errorCode, errorMsg);
+                  // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+                  // emitter.failed(errorCode, errorMsg);
+                  logger.log(Level.WARNING, "[ARTHAS-ATTACH] Start request failed: {0} - {1}", new Object[] {errorCode, errorMsg});
                   future.complete(
                       TaskExecutionResult.builder()
                           .status(startResult.getStatus())
@@ -288,7 +292,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                 }
               } catch (RuntimeException e) {
                 long executionTime = System.currentTimeMillis() - startTime;
-                emitter.failed("ARTHAS_ATTACH_ERROR", "Arthas attach failed: " + e.getMessage());
+                // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+                // emitter.failed("ARTHAS_ATTACH_ERROR", "Arthas attach failed: " + e.getMessage());
+                logger.log(Level.WARNING, "[ARTHAS-ATTACH] Execution exception: {0}", e.getMessage());
                 future.complete(
                     TaskExecutionResult.failed(
                         "ARTHAS_ATTACH_ERROR",
@@ -306,7 +312,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   private void handleEventCompletion(
       CompletableFuture<TaskExecutionResult> future,
       ArthasLifecycleManager manager,
-      TaskStatusEmitter emitter,
       long startTime) {
 
     long executionTime = System.currentTimeMillis() - startTime;
@@ -320,7 +325,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
               ? ("Arthas start failed: " + lastError)
               : "Arthas start failed: lifecycle state STOPPED";
 
-      emitter.failed("ARTHAS_START_FAILED", msg);
+      // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+      // emitter.failed("ARTHAS_START_FAILED", msg);
+      logger.log(Level.WARNING, "[ARTHAS-ATTACH] Start failed: {0}", msg);
       future.complete(TaskExecutionResult.failed("ARTHAS_START_FAILED", msg, executionTime));
       return;
     }
@@ -328,7 +335,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // 检查是否已就绪（方式1：完整就绪检查）
     if (isReadyNow()) {
       TaskExecutionResult ok = buildSuccessResult("Tunnel registered (REGISTER_ACK)", manager);
-      emitter.success(ok.getResultJson());
+      // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+      // emitter.success(ok.getResultJson());
+      logger.log(Level.INFO, "[ARTHAS-ATTACH] Success: Tunnel registered (REGISTER_ACK)");
       future.complete(TaskExecutionResult.success(ok.getResultJson(), executionTime));
       return;
     }
@@ -340,7 +349,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         && (st == ArthasLifecycleManager.State.RUNNING || st == ArthasLifecycleManager.State.IDLE)
         && arthasIntegration.isTunnelReady()) {
       TaskExecutionResult ok = buildSuccessResult("Tunnel registered (direct check)", manager);
-      emitter.success(ok.getResultJson());
+      // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+      // emitter.success(ok.getResultJson());
+      logger.log(Level.INFO, "[ARTHAS-ATTACH] Success: Tunnel registered (direct check)");
       future.complete(TaskExecutionResult.success(ok.getResultJson(), executionTime));
       return;
     }
@@ -352,7 +363,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         Locale.ROOT,
         "Unexpected state while waiting for tunnel registration: arthasState=%s, tunnelReady=%s",
         manager.getState(), tunnelReady);
-    emitter.failed("ARTHAS_ATTACH_STATE_INVALID", msg);
+    // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+    // emitter.failed("ARTHAS_ATTACH_STATE_INVALID", msg);
+    logger.log(Level.WARNING, "[ARTHAS-ATTACH] Invalid state: {0}", msg);
     future.complete(TaskExecutionResult.failed("ARTHAS_ATTACH_STATE_INVALID", msg, executionTime));
   }
 
@@ -362,7 +375,6 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   private static void handleEventTimeout(
       CompletableFuture<TaskExecutionResult> future,
       ArthasLifecycleManager manager,
-      TaskStatusEmitter emitter,
       long effectiveTimeout,
       long startTime,
       Throwable e) {
@@ -382,7 +394,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
           (lastError != null && !lastError.isEmpty())
               ? ("Arthas start failed: " + lastError)
               : ("Arthas start failed: " + t.getMessage());
-      emitter.failed("ARTHAS_START_FAILED", msg);
+      // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+      // emitter.failed("ARTHAS_START_FAILED", msg);
+      logger.log(Level.WARNING, "[ARTHAS-ATTACH] Timeout with STOPPED state: {0}", msg);
       future.complete(TaskExecutionResult.failed("ARTHAS_START_FAILED", msg, executionTime));
     } else {
       String logSummary = getStartupLogSummary(manager);
@@ -392,7 +406,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
           effectiveTimeout,
           manager.getState(),
           logSummary);
-      emitter.failed("TUNNEL_REGISTER_TIMEOUT", timeoutMsg);
+      // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
+      // emitter.failed("TUNNEL_REGISTER_TIMEOUT", timeoutMsg);
+      logger.log(Level.WARNING, "[ARTHAS-ATTACH] Tunnel registration timeout: {0}", timeoutMsg);
       future.complete(TaskExecutionResult.timeout(timeoutMsg, executionTime));
     }
   }

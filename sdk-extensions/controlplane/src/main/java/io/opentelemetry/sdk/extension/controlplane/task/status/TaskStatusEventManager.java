@@ -18,6 +18,15 @@ import javax.annotation.Nullable;
  *
  * <p><b>Phase 5 重构</b>：使用 {@link TaskExecutionResult.Status} 替代旧的
  * {@code ControlPlaneClient.TaskStatus}。
+ *
+ * <p><b>设计约束（方案A）</b>：
+ * <ul>
+ *   <li>终态（SUCCESS/FAILED/TIMEOUT/CANCELLED）只由 {@code TaskDispatcher} 统一上报</li>
+ *   <li>{@code TaskStatusEmitter} 只负责 RUNNING 事件的实时广播</li>
+ *   <li>执行器调用 {@code emitter.success()/failed()} 只记录状态，不触发上报</li>
+ * </ul>
+ * 这样可以确保终态的时间信息（started_at_millis, completed_at_millis, execution_time_millis）
+ * 由调度层统一计算，避免执行器上报不准确的时间导致 started == completed 且 execution_time == 0 的问题。
  */
 public final class TaskStatusEventManager {
 
@@ -92,7 +101,13 @@ public final class TaskStatusEventManager {
 
   private void emitTerminal(TaskStatusEvent event) {
     terminalStatus.put(event.getTaskId(), event.getStatus());
-    emit(event);
+    // 【方案A】终态事件只记录状态，不广播给监听器
+    // 终态由 TaskDispatcher 在任务完成时统一上报，确保时间信息准确
+    // 这样可以避免 TaskStatusEvent.toExecutionResult() 产生的 started == completed 且 execution_time == 0 问题
+    logger.log(
+        Level.FINE,
+        "[STATUS-EVENT] Terminal status recorded (not broadcast): taskId={0}, status={1}",
+        new Object[] {event.getTaskId(), event.getStatus()});
   }
 
   private void emit(TaskStatusEvent event) {
