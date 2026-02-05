@@ -76,8 +76,6 @@ public final class ArthasConfig {
   private static final String ARTHAS_LOG_FILE_PATH = "otel.agent.arthas.log.file.path";
   private static final String ARTHAS_LOG_FILE_NAME = "otel.agent.arthas.log.file.name";
   private static final String ARTHAS_LOG_LEVEL = "otel.agent.arthas.log.level";
-  private static final String ARTHAS_STDOUT_CAPTURE_ENABLED =
-      "otel.agent.arthas.stdout.capture.enabled";
 
   // ===== 默认值 =====
   private static final boolean DEFAULT_ENABLED = false;
@@ -105,7 +103,6 @@ public final class ArthasConfig {
   // 日志隔离默认值
   private static final String DEFAULT_LOG_FILE_NAME = "arthas.log";
   private static final String DEFAULT_LOG_LEVEL = "WARN"; // 默认 WARN 级别，减少噪音
-  private static final boolean DEFAULT_STDOUT_CAPTURE_ENABLED = true; // 默认启用短窗口捕获
 
   // ===== 配置字段 =====
   private final boolean enabled;
@@ -136,7 +133,6 @@ public final class ArthasConfig {
   @Nullable private final String logFilePath;
   private final String logFileName;
   private final String logLevel;
-  private final boolean stdoutCaptureEnabled;
 
   // 注意：serverHttpPort 等运行时状态已移至 ArthasIntegration 管理，
   // ArthasConfig 保持为不可变的配置数据对象
@@ -166,7 +162,6 @@ public final class ArthasConfig {
     this.logFilePath = builder.logFilePath;
     this.logFileName = builder.logFileName;
     this.logLevel = builder.logLevel;
-    this.stdoutCaptureEnabled = builder.stdoutCaptureEnabled;
 
     if (this.enabled) {
       String effectiveTunnelEndpoint = getTunnelEndpoint();
@@ -352,17 +347,6 @@ public final class ArthasConfig {
     return logLevel;
   }
 
-  /**
-   * 是否启用 stdout/stderr 短窗口捕获
-   *
-   * <p>启用后，在 Arthas start/stop 期间会临时捕获 stdout/stderr，
-   * 将 Arthas 的 System.out 输出重定向到独立文件，避免污染服务日志。
-   *
-   * @return 是否启用
-   */
-  public boolean isStdoutCaptureEnabled() {
-    return stdoutCaptureEnabled;
-  }
 
   /** 是否配置了有效的 Tunnel 端点（包含显式配置和自动生成的） */
   public boolean hasTunnelEndpoint() {
@@ -455,7 +439,6 @@ public final class ArthasConfig {
     @Nullable private String logFilePath;
     private String logFileName = DEFAULT_LOG_FILE_NAME;
     private String logLevel = DEFAULT_LOG_LEVEL;
-    private boolean stdoutCaptureEnabled = DEFAULT_STDOUT_CAPTURE_ENABLED;
 
     private Builder() {}
 
@@ -575,9 +558,6 @@ public final class ArthasConfig {
       if (level != null && !level.isEmpty()) {
         this.logLevel = level.toUpperCase(Locale.ROOT);
       }
-
-      this.stdoutCaptureEnabled =
-          properties.getBoolean(ARTHAS_STDOUT_CAPTURE_ENABLED, DEFAULT_STDOUT_CAPTURE_ENABLED);
 
       return this;
     }
@@ -736,16 +716,6 @@ public final class ArthasConfig {
       return this;
     }
 
-    /**
-     * 设置是否启用 stdout/stderr 短窗口捕获
-     *
-     * @param stdoutCaptureEnabled 是否启用
-     * @return 构建器
-     */
-    public Builder setStdoutCaptureEnabled(boolean stdoutCaptureEnabled) {
-      this.stdoutCaptureEnabled = stdoutCaptureEnabled;
-      return this;
-    }
 
     /**
      * 构建配置实例

@@ -43,6 +43,46 @@ public final class ArthasResourceExtractor {
   private static final String ARTHAS_CLIENT_JAR_RESOURCE = "/arthas/arthas-client.jar";
   private static final String ARTHAS_SPY_JAR_RESOURCE = "/arthas/arthas-spy.jar";
 
+  /**
+   * Arthas 专用 logback.xml 模板
+   *
+   * <p>【关键设计】：
+   * <ul>
+   *   <li>只有 RollingFileAppender，不含 ConsoleAppender，防止污染应用 stdout</li>
+   *   <li>对齐 Arthas 官方 LogUtil：使用 ${ARTHAS_LOG_PATH} / ${ARTHAS_LOG_FILE} 变量
+   *       （由 LogUtil 从 arthas.logging.file.path/name 转写到 LoggerContext property）</li>
+   *   <li>root level 设置为 INFO，Netty 等底层组件降级为 WARN 减少噪音</li>
+   * </ul>
+   */
+  private static final String ARTHAS_LOGBACK_XML_CONTENT =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          + "<configuration>\n"
+          + "  <!-- Arthas 专用日志配置 - 仅文件输出，不含 ConsoleAppender -->\n"
+          + "  <property name=\"LOG_PATH\" value=\"${ARTHAS_LOG_PATH:-${java.io.tmpdir}}\"/>\n"
+          + "  <property name=\"LOG_FILE\" value=\"${ARTHAS_LOG_FILE:-arthas.log}\"/>\n"
+          + "\n"
+          + "  <appender name=\"ARTHAS\" class=\"com.alibaba.arthas.deps.ch.qos.logback.core.rolling.RollingFileAppender\">\n"
+          + "    <file>${LOG_PATH}/${LOG_FILE}</file>\n"
+          + "    <rollingPolicy class=\"com.alibaba.arthas.deps.ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy\">\n"
+          + "      <fileNamePattern>${LOG_PATH}/${LOG_FILE}.%d{yyyy-MM-dd}.%i</fileNamePattern>\n"
+          + "      <maxFileSize>10MB</maxFileSize>\n"
+          + "      <maxHistory>3</maxHistory>\n"
+          + "      <totalSizeCap>50MB</totalSizeCap>\n"
+          + "    </rollingPolicy>\n"
+          + "    <encoder>\n"
+          + "      <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>\n"
+          + "    </encoder>\n"
+          + "  </appender>\n"
+          + "\n"
+          + "  <!-- 底层组件降级为 WARN，减少日志噪音 -->\n"
+          + "  <logger name=\"com.alibaba.arthas.deps.io.netty\" level=\"WARN\"/>\n"
+          + "  <logger name=\"io.netty\" level=\"WARN\"/>\n"
+          + "\n"
+          + "  <root level=\"INFO\">\n"
+          + "    <appender-ref ref=\"ARTHAS\"/>\n"
+          + "  </root>\n"
+          + "</configuration>\n";
+
   private ArthasResourceExtractor() {
     // 工具类，禁止实例化
   }
@@ -112,6 +152,10 @@ public final class ArthasResourceExtractor {
 
       // 尝试解压 arthas-client.jar（可选）
       Path clientJar = extractResource(ARTHAS_CLIENT_JAR_RESOURCE, tempDir, "arthas-client.jar");
+
+      // 【关键】生成 Arthas 专用 logback.xml 到 arthas-home 目录
+      // 让 Arthas 的 SLF4J 日志只写文件，不污染应用控制台
+      generateArthasLogbackXml(tempDir);
 
       // 【关键】提取 async-profiler native library 到 arthas-home 目录
       // 使 Arthas profiler 命令能够找到 libasyncProfiler.so
@@ -266,6 +310,35 @@ public final class ArthasResourceExtractor {
       logger.log(
           Level.WARNING,
           "[ARTHAS] Error extracting JNI library: {0}. " + "Arthas vmtool command will not work.",
+          e.getMessage());
+    }
+  }
+
+  /**
+   * 生成 Arthas 专用 logback.xml 到 arthas-home 目录
+   *
+   * <p>Arthas 启动时会在 arthas-home 目录下查找 logback.xml。
+   * 通过生成仅含 RollingFileAppender 的配置，确保 Arthas 的 SLF4J 日志
+   * （如 TunnelClient、Netty 等）只写入文件，不污染应用控制台。
+   *
+   * <p>失败不阻塞 Arthas 启动，仅记录警告日志。
+   *
+   * @param arthasHome Arthas 运行时根目录
+   */
+  private static void generateArthasLogbackXml(Path arthasHome) {
+    Path logbackXml = arthasHome.resolve("logback.xml");
+    try {
+      Files.write(
+          logbackXml,
+          ARTHAS_LOGBACK_XML_CONTENT.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      logbackXml.toFile().deleteOnExit();
+      logger.log(Level.INFO, "[ARTHAS] Generated logback.xml: {0}", logbackXml);
+    } catch (IOException e) {
+      // 失败不阻塞 Arthas 启动，仅记录警告
+      logger.log(
+          Level.WARNING,
+          "[ARTHAS] Failed to generate logback.xml: {0}. "
+              + "Arthas SLF4J logs may leak to application console.",
           e.getMessage());
     }
   }

@@ -5,14 +5,14 @@
 
 package io.opentelemetry.sdk.extension.controlplane.arthas;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.Locale;
 import java.util.Map;
 import java.util.logging.Level;
@@ -24,11 +24,10 @@ import javax.annotation.Nullable;
  *
  * <p>负责统一管理 Arthas 的日志隔离，避免 Arthas 日志污染服务日志。
  *
- * <p>治理策略（三层防护）：
+ * <p>治理策略（两层防护）：
  * <ol>
  *   <li><b>主线</b>：通过 Arthas 官方配置（arthas.logging.*）让 Arthas logback 只写文件</li>
- *   <li><b>降噪</b>：反射提高 AnsiLog.LEVEL，减少 stdout 输出频率</li>
- *   <li><b>兜底</b>：在 start/stop 短窗口临时捕获 stdout/stderr</li>
+ *   <li><b>隔离+降噪</b>：反射重定向 AnsiLog.out 到独立文件，并提高 AnsiLog.LEVEL，避免污染服务 stdout</li>
  * </ol>
  *
  * <p>设计原则：
@@ -51,8 +50,18 @@ public final class ArthasLogIsolation {
   /** 临时目录（用于存放 Arthas 日志文件） */
   @Nullable private volatile Path tempLogDir;
 
-  /** stdout/stderr 捕获状态 */
-  private final StdoutCapture stdoutCapture = new StdoutCapture();
+  /**
+   * AnsiLog.out(PrintStream) 是静态全局开关，需要全局重入保护，避免并发 start/stop 互相覆盖。
+   */
+  private static final Object ANSI_LOG_OUT_LOCK = new Object();
+
+  /** AnsiLog.out 重定向引用计数（在 {@link #ANSI_LOG_OUT_LOCK} 下保护） */
+  private static final java.util.concurrent.atomic.AtomicInteger ansiLogOutRefCount =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+
+  /** 当前生效的 AnsiLog.out 重定向状态（在 {@link #ANSI_LOG_OUT_LOCK} 下保护） */
+  private static final java.util.concurrent.atomic.AtomicReference<AnsiLogOutRedirection>
+      ansiLogOutRedirection = new java.util.concurrent.atomic.AtomicReference<>();
 
   /**
    * 创建日志隔离组件
@@ -129,56 +138,177 @@ public final class ArthasLogIsolation {
     }
   }
 
-  // ===== 降噪：AnsiLog.LEVEL 反射调整 =====
+  // ===== 隔离+降噪：AnsiLog.out 重定向 + AnsiLog.LEVEL 调整 =====
 
   /**
-   * 通过反射提高 AnsiLog.LEVEL，减少 stdout 输出
+   * 开始隔离 AnsiLog 输出（重定向到独立文件）并提高其日志级别减少噪音。
    *
-   * <p>AnsiLog 直接使用 System.out.println 输出，无法通过 logback 配置控制。
-   * 通过反射提高其 LEVEL，可以减少输出频率。
+   * <p>注意：AnsiLog.out 是静态全局设置，必须与 {@link #endAnsiLogIsolation()} 配对使用。
    *
    * @param arthasLoader Arthas ClassLoader
    */
-  public void adjustAnsiLogLevel(@Nullable ClassLoader arthasLoader) {
+  public void beginAnsiLogIsolation(@Nullable ClassLoader arthasLoader) {
     if (arthasLoader == null) {
-      logger.log(Level.FINE, "[ArthasLogIsolation] Arthas ClassLoader is null, skip AnsiLog adjustment");
+      logger.log(Level.FINE, "[ArthasLogIsolation] Arthas ClassLoader is null, skip AnsiLog isolation");
       return;
     }
 
+    try {
+      Class<?> ansiLogClass = arthasLoader.loadClass(ANSI_LOG_CLASS);
+
+      synchronized (ANSI_LOG_OUT_LOCK) {
+        int refCount = ansiLogOutRefCount.incrementAndGet();
+        if (refCount > 1) {
+          // 重入场景：只增加引用计数，避免覆盖已有重定向。
+          logger.log(Level.FINE, "[ArthasLogIsolation] AnsiLog isolation re-entered, refCount={0}", refCount);
+          return;
+        }
+
+        Path dir = resolveAnsiLogDir();
+        Path filePath = dir.resolve("arthas-ansi-console.log");
+        OutputStream outStream =
+            Files.newOutputStream(
+                filePath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.APPEND);
+        PrintStream printStream =
+            new PrintStream(
+                new java.io.BufferedOutputStream(outStream),
+                true,
+                java.nio.charset.StandardCharsets.UTF_8.name());
+
+        Method getOutMethod = ansiLogClass.getMethod("out");
+        Method setOutMethod = ansiLogClass.getMethod("out", PrintStream.class);
+
+        PrintStream previousOut = (PrintStream) getOutMethod.invoke(null);
+        setOutMethod.invoke(null, printStream);
+
+        ansiLogOutRedirection.set(
+            new AnsiLogOutRedirection(setOutMethod, previousOut, printStream, outStream));
+
+        logger.log(Level.INFO, "[ArthasLogIsolation] AnsiLog output redirected to: {0}", filePath);
+      }
+
+      // 在 begin 时顺带调整日志级别
+      adjustAnsiLogLevelInternal(ansiLogClass);
+
+    } catch (ClassNotFoundException e) {
+      logger.log(Level.FINE, "[ArthasLogIsolation] AnsiLog class not found: {0}", e.getMessage());
+    } catch (NoSuchMethodException e) {
+      logger.log(Level.WARNING, "[ArthasLogIsolation] AnsiLog.out/level method not found: {0}", e.getMessage());
+    } catch (ReflectiveOperationException | IOException e) {
+      logger.log(Level.WARNING, "[ArthasLogIsolation] Failed to begin AnsiLog isolation: {0}", e.getMessage());
+      // begin 失败时，避免引用计数卡死
+      synchronized (ANSI_LOG_OUT_LOCK) {
+        if (ansiLogOutRefCount.get() > 0) {
+          ansiLogOutRefCount.decrementAndGet();
+        }
+      }
+    }
+  }
+
+  /**
+   * 结束 AnsiLog 输出隔离，恢复原始输出流。
+   */
+  public void endAnsiLogIsolation() {
+    synchronized (ANSI_LOG_OUT_LOCK) {
+      if (ansiLogOutRefCount.get() <= 0) {
+        return;
+      }
+
+      int refCount = ansiLogOutRefCount.decrementAndGet();
+      if (refCount > 0) {
+        logger.log(Level.FINE, "[ArthasLogIsolation] AnsiLog isolation exit (still referenced), refCount={0}", refCount);
+        return;
+      }
+
+      AnsiLogOutRedirection redirection = ansiLogOutRedirection.getAndSet(null);
+
+      if (redirection == null) {
+        return;
+      }
+
+      try {
+        // 恢复原始 out
+        redirection.setOutMethod.invoke(null, redirection.previousOut);
+
+      } catch (ReflectiveOperationException e) {
+        logger.log(Level.WARNING, "[ArthasLogIsolation] Failed to restore AnsiLog.out: {0}", e.getMessage());
+
+      } finally {
+        // 关闭我们创建的流
+        try {
+          redirection.printStream.flush();
+        } catch (RuntimeException ignored) {
+          // ignored
+        }
+        try {
+          redirection.printStream.close();
+        } catch (RuntimeException ignored) {
+          // ignored
+        }
+        try {
+          redirection.outStream.close();
+        } catch (IOException ignored) {
+          // ignored
+        }
+
+        logger.log(Level.INFO, "[ArthasLogIsolation] AnsiLog output restored");
+      }
+    }
+  }
+
+  private void adjustAnsiLogLevelInternal(Class<?> ansiLogClass) {
     String targetLevel = config.getLogLevel();
     if (targetLevel == null || targetLevel.isEmpty()) {
-      targetLevel = "WARNING"; // 默认降噪到 WARNING
+      targetLevel = "WARNING";
     }
 
     try {
-      // 加载 AnsiLog 类
-      Class<?> ansiLogClass = arthasLoader.loadClass(ANSI_LOG_CLASS);
-
-      // 获取 level(Level) 方法
-      java.lang.reflect.Method levelMethod = 
-          ansiLogClass.getMethod("level", java.util.logging.Level.class);
-
-      // 转换级别字符串到 Level 对象
+      Method levelMethod = ansiLogClass.getMethod("level", java.util.logging.Level.class);
       java.util.logging.Level level = parseLogLevel(targetLevel);
-
-      // 调用 level(Level) 设置级别
       Object oldLevel = levelMethod.invoke(null, level);
+      logger.log(
+          Level.INFO,
+          "[ArthasLogIsolation] AnsiLog level adjusted: {0} -> {1}",
+          new Object[] {oldLevel, level});
 
-      logger.log(Level.INFO, 
-          "[ArthasLogIsolation] AnsiLog level adjusted: {0} -> {1}", 
-          new Object[]{oldLevel, level});
-
-    } catch (ClassNotFoundException e) {
-      // AnsiLog 类不存在（可能是不同版本的 Arthas）
-      logger.log(Level.FINE, 
-          "[ArthasLogIsolation] AnsiLog class not found: {0}", e.getMessage());
     } catch (NoSuchMethodException e) {
-      // level(Level) 方法不存在
-      logger.log(Level.WARNING, 
-          "[ArthasLogIsolation] AnsiLog.level(Level) method not found: {0}", e.getMessage());
+      logger.log(Level.WARNING, "[ArthasLogIsolation] AnsiLog.level(Level) method not found: {0}", e.getMessage());
     } catch (ReflectiveOperationException e) {
-      logger.log(Level.WARNING, 
-          "[ArthasLogIsolation] Failed to adjust AnsiLog level: {0}", e.getMessage());
+      logger.log(Level.WARNING, "[ArthasLogIsolation] Failed to adjust AnsiLog level: {0}", e.getMessage());
+    }
+  }
+
+  private Path resolveAnsiLogDir() {
+    String logPath = config.getLogFilePath();
+    if (logPath == null || logPath.isEmpty()) {
+      logPath = getOrCreateTempLogDir();
+    }
+
+    if (logPath == null || logPath.isEmpty()) {
+      return Paths.get(System.getProperty("java.io.tmpdir"));
+    }
+
+    return Paths.get(logPath);
+  }
+
+  private static final class AnsiLogOutRedirection {
+    private final Method setOutMethod;
+    private final PrintStream previousOut;
+    private final PrintStream printStream;
+    private final OutputStream outStream;
+
+    private AnsiLogOutRedirection(
+        Method setOutMethod,
+        PrintStream previousOut,
+        PrintStream printStream,
+        OutputStream outStream) {
+      this.setOutMethod = setOutMethod;
+      this.previousOut = previousOut;
+      this.printStream = printStream;
+      this.outStream = outStream;
     }
   }
 
@@ -215,271 +345,4 @@ public final class ArthasLogIsolation {
     }
   }
 
-  // ===== 兜底：stdout/stderr 短窗口捕获 =====
-
-  /**
-   * 开始捕获 stdout/stderr
-   *
-   * <p>将 stdout/stderr 重定向到独立文件，用于捕获 Arthas 的 System.out 输出。
-   * 必须与 {@link #endStdoutCapture()} 配对使用（try/finally）。
-   *
-   * <p>注意：这是短窗口操作，应仅在 Arthas start/stop 期间使用。
-   */
-  public void beginStdoutCapture() {
-    if (!config.isStdoutCaptureEnabled()) {
-      logger.log(Level.FINE, "[ArthasLogIsolation] Stdout capture disabled by config");
-      return;
-    }
-
-    try {
-      stdoutCapture.begin(getOrCreateTempLogDir());
-    } catch (RuntimeException e) {
-      // 捕获失败不应阻塞 Arthas 启动
-      logger.log(Level.WARNING, 
-          "[ArthasLogIsolation] Failed to begin stdout capture: {0}", e.getMessage());
-    }
-  }
-
-  /**
-   * 结束 stdout/stderr 捕获，恢复原始流
-   */
-  public void endStdoutCapture() {
-    if (!config.isStdoutCaptureEnabled()) {
-      return;
-    }
-
-    try {
-      stdoutCapture.end();
-    } catch (RuntimeException e) {
-      logger.log(Level.WARNING, 
-          "[ArthasLogIsolation] Failed to end stdout capture: {0}", e.getMessage());
-    }
-  }
-
-  /**
-   * 获取 stdout 捕获文件路径（用于诊断）
-   *
-   * @return 捕获文件路径，未捕获时返回 null
-   */
-  @Nullable
-  public String getStdoutCaptureFilePath() {
-    return stdoutCapture.getCaptureFilePath();
-  }
-
-  /**
-   * stdout/stderr 捕获器
-   *
-   * <p>内部类，封装捕获逻辑，确保 try/finally 语义。
-   */
-  private static final class StdoutCapture {
-
-    /** 原始 stdout */
-    @Nullable private PrintStream originalOut;
-    /** 原始 stderr */
-    @Nullable private PrintStream originalErr;
-    /** 捕获文件输出流 */
-    @Nullable private FileOutputStream captureFileStream;
-    /** 捕获文件路径 */
-    @Nullable private String captureFilePath;
-    /** 是否正在捕获 */
-    private volatile boolean capturing = false;
-
-    /**
-     * 开始捕获
-     *
-     * @param logDir 日志目录
-     */
-    @SuppressWarnings("SystemOut") // 故意访问 System.out/err 进行捕获
-    synchronized void begin(@Nullable String logDir) {
-      if (capturing) {
-        logger.log(Level.WARNING, "[StdoutCapture] Already capturing, skip");
-        return;
-      }
-
-      try {
-        // 保存原始流
-        originalOut = System.out;
-        originalErr = System.err;
-
-        // 创建捕获文件
-        File captureFile;
-        if (logDir != null) {
-          captureFile = new File(logDir, "arthas-console-" + System.currentTimeMillis() + ".log");
-        } else {
-          captureFile = File.createTempFile("arthas-console-", ".log");
-        }
-        captureFile.deleteOnExit();
-        captureFilePath = captureFile.getAbsolutePath();
-
-        // 创建输出流
-        captureFileStream = new FileOutputStream(captureFile);
-
-        // 创建 Tee 流（同时输出到原始流和捕获文件）
-        // 注意：我们使用 Tee 模式而非完全替换，避免丢失业务输出
-        PrintStream teeOut = new TeePrintStream(originalOut, captureFileStream, "[ARTHAS-OUT] ");
-        PrintStream teeErr = new TeePrintStream(originalErr, captureFileStream, "[ARTHAS-ERR] ");
-
-        // 替换系统流
-        System.setOut(teeOut);
-        System.setErr(teeErr);
-
-        capturing = true;
-        logger.log(Level.INFO, 
-            "[StdoutCapture] Started capturing to: {0}", captureFilePath);
-
-      } catch (IOException e) {
-        // 失败时恢复
-        restoreOriginalStreams();
-        throw new IllegalStateException("Failed to begin stdout capture", e);
-      }
-    }
-
-    /**
-     * 结束捕获
-     */
-    synchronized void end() {
-      if (!capturing) {
-        return;
-      }
-
-      try {
-        // 恢复原始流
-        restoreOriginalStreams();
-
-        // 关闭捕获文件
-        if (captureFileStream != null) {
-          try {
-            captureFileStream.flush();
-            captureFileStream.close();
-          } catch (IOException e) {
-            logger.log(Level.WARNING, 
-                "[StdoutCapture] Failed to close capture file: {0}", e.getMessage());
-          }
-          captureFileStream = null;
-        }
-
-        logger.log(Level.INFO, 
-            "[StdoutCapture] Ended capturing, file: {0}", captureFilePath);
-
-      } finally {
-        capturing = false;
-      }
-    }
-
-    /**
-     * 恢复原始流
-     */
-    private void restoreOriginalStreams() {
-      if (originalOut != null) {
-        System.setOut(originalOut);
-        originalOut = null;
-      }
-      if (originalErr != null) {
-        System.setErr(originalErr);
-        originalErr = null;
-      }
-    }
-
-    /**
-     * 获取捕获文件路径
-     */
-    @Nullable
-    String getCaptureFilePath() {
-      return captureFilePath;
-    }
-  }
-
-  /**
-   * Tee PrintStream - 同时输出到两个流
-   *
-   * <p>用于在捕获 Arthas 输出的同时，保留原始 stdout/stderr 的输出。
-   * 对于 Arthas 相关输出添加前缀标记，便于后续分析。
-   */
-  private static final class TeePrintStream extends PrintStream {
-
-    private final PrintStream original;
-    private final OutputStream capture;
-    private final String prefix;
-
-    TeePrintStream(PrintStream original, OutputStream capture, String prefix) {
-      super(original, true);
-      this.original = original;
-      this.capture = capture;
-      this.prefix = prefix;
-    }
-
-    @Override
-    public void write(int b) {
-      original.write(b);
-      try {
-        capture.write(b);
-      } catch (IOException e) {
-        // 忽略捕获写入错误
-      }
-    }
-
-    @Override
-    public void write(byte[] buf, int off, int len) {
-      original.write(buf, off, len);
-      try {
-        capture.write(buf, off, len);
-      } catch (IOException e) {
-        // 忽略捕获写入错误
-      }
-    }
-
-    @Override
-    public void println(String x) {
-      // 检查是否是 Arthas 相关输出
-      if (isArthasOutput(x)) {
-        // 只写入捕获文件，不输出到原始流
-        try {
-          capture.write((prefix + x + System.lineSeparator()).getBytes(StandardCharsets.UTF_8));
-          capture.flush();
-        } catch (IOException e) {
-          // 忽略
-        }
-      } else {
-        // 非 Arthas 输出，正常处理
-        super.println(x);
-      }
-    }
-
-    /**
-     * 检查是否是 Arthas 相关输出
-     *
-     * <p>通过关键字匹配识别 Arthas 的 AnsiLog 输出。
-     */
-    private static boolean isArthasOutput(String line) {
-      if (line == null) {
-        return false;
-      }
-      // Arthas AnsiLog 输出特征
-      return line.contains("[arthas-")
-          || line.contains("arthas.core")
-          || line.contains("arthas.tunnel")
-          || line.contains("com.taobao.arthas")
-          || line.contains("ArthasBanner")
-          || line.contains("ArthasBootstrap")
-          || line.contains("[TRACE]")
-          || line.contains("[DEBUG]")
-          || line.contains("[INFO]")
-          || line.contains("[WARN]")
-          || line.contains("[ERROR]")
-          // Arthas Netty 日志
-          || line.contains("arthas-TunnelClient")
-          || line.contains("arthas-ForwardClient")
-          || line.contains("arthas-NettyWebsocket");
-    }
-
-    @Override
-    public void flush() {
-      super.flush();
-      try {
-        capture.flush();
-      } catch (IOException e) {
-        // 忽略
-      }
-    }
-  }
 }

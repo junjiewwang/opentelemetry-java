@@ -276,8 +276,8 @@ public final class ArthasBootstrap {
       return StartResult.failed("Arthas ClassLoader not available");
     }
 
-    // 【日志隔离】开始 stdout/stderr 短窗口捕获
-    logIsolation.beginStdoutCapture();
+    // 【日志隔离】启用 AnsiLog 输出隔离（重定向到独立文件）并降噪
+    logIsolation.beginAnsiLogIsolation(loader);
     try {
       // 使用反射启动 Arthas
       Object bootstrap = startArthasViaReflection(loader);
@@ -292,9 +292,6 @@ public final class ArthasBootstrap {
           spyApiManager.ensureInstalled(loader);
         }
 
-        // 【日志隔离】调整 AnsiLog.LEVEL，减少 stdout 输出
-        logIsolation.adjustAnsiLogLevel(loader);
-
         logger.log(Level.INFO, "Arthas started successfully");
         return StartResult.success("Arthas started");
       } else {
@@ -305,8 +302,8 @@ public final class ArthasBootstrap {
       logger.log(Level.SEVERE, "Failed to start Arthas", e);
       return StartResult.failed("Failed to start Arthas: " + e.getMessage());
     } finally {
-      // 【日志隔离】结束 stdout/stderr 捕获，恢复原始流
-      logIsolation.endStdoutCapture();
+      // 【日志隔离】恢复 AnsiLog 输出
+      logIsolation.endAnsiLogIsolation();
     }
   }
 
@@ -321,8 +318,10 @@ public final class ArthasBootstrap {
       return true;
     }
 
-    // 【日志隔离】开始 stdout/stderr 短窗口捕获
-    logIsolation.beginStdoutCapture();
+    ClassLoader loader = classLoaderManager.get();
+
+    // 【日志隔离】启用 AnsiLog 输出隔离（重定向到独立文件）并降噪
+    logIsolation.beginAnsiLogIsolation(loader);
     try {
       Object bootstrap = arthasBootstrapInstance.get();
       if (bootstrap != null) {
@@ -339,8 +338,8 @@ public final class ArthasBootstrap {
       running.set(false);
       return false;
     } finally {
-      // 【日志隔离】结束 stdout/stderr 捕获，恢复原始流
-      logIsolation.endStdoutCapture();
+      // 【日志隔离】恢复 AnsiLog 输出
+      logIsolation.endAnsiLogIsolation();
     }
   }
 
