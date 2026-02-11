@@ -29,7 +29,7 @@ import javax.annotation.Nullable;
  * <p><b>职责边界</b>：
  * <ul>
  *   <li>仅负责任务执行状态上报
- *   <li>不处理结果文件（由 {@code TaskResultLifecycleService} 处理）
+ *   <li>不处理结果文件（由 {@code FileStreamUploader} 处理）
  *   <li>不做重试与持久化（状态上报是轻量级操作，失败仅记录日志）
  * </ul>
  *

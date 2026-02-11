@@ -33,6 +33,11 @@ dependencies {
   // 3. 如果 classpath 中没有此依赖，会优雅降级（需要手动设置 Instrumentation）
   compileOnly("net.bytebuddy:byte-buddy-agent:1.14.18")
 
+  // Async Profiler Java API（进程内直接调用 async-profiler）
+  // 包含 one.profiler.AsyncProfiler 等 Java API 类（~50KB）
+  // native lib（.so/.dylib）仍由 AsyncProfilerResourceExtractor 从 classpath 提取
+  implementation("tools.profiler:async-profiler:3.0")
+
   // gRPC 传输使用 OkHttp gRPC sender（不再依赖 grpc-java）
 
   // Protobuf

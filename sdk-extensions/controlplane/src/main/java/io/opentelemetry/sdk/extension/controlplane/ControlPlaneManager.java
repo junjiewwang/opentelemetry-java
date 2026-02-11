@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasConfig;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.client.ControlPlaneService;
+import io.opentelemetry.sdk.extension.controlplane.profiler.AsyncProfilerIntegration;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager;
 import io.opentelemetry.sdk.extension.controlplane.core.ConnectionStateManager.ConnectionState;
@@ -167,6 +168,16 @@ public final class ControlPlaneManager implements Closeable {
     this.arthasIntegration = builder.arthasIntegration;
     if (this.arthasIntegration != null) {
       this.components.add(this.arthasIntegration);
+    }
+
+    // AsyncProfiler 集成（作为可扩展组件注册）
+    if (builder.asyncProfilerIntegration != null) {
+      this.components.add(builder.asyncProfilerIntegration);
+    } else if (config.isAsyncProfilerEnabled()) {
+      // 自动创建：如果配置启用了 async-profiler
+      AsyncProfilerIntegration autoProfiler =
+          AsyncProfilerIntegration.create(this.service, config.getStorageDir());
+      this.components.add(autoProfiler);
     }
 
     // 生命周期状态
@@ -533,6 +544,7 @@ public final class ControlPlaneManager implements Closeable {
     @Nullable private DynamicConfigManager configManager;
     @Nullable private DynamicSampler dynamicSampler;
     @Nullable private ArthasIntegration arthasIntegration;
+    @Nullable private AsyncProfilerIntegration asyncProfilerIntegration;
     @Nullable private Instrumentation instrumentation;
 
     private Builder() {}
@@ -570,16 +582,6 @@ public final class ControlPlaneManager implements Closeable {
       return this;
     }
 
-    /**
-     * 设置 Arthas 集成
-     *
-     * @param arthasIntegration Arthas 集成
-     * @return this builder
-     */
-    public Builder setArthasIntegration(ArthasIntegration arthasIntegration) {
-      this.arthasIntegration = arthasIntegration;
-      return this;
-    }
 
     /**
      * 设置 Arthas 配置并创建集成
@@ -638,6 +640,20 @@ public final class ControlPlaneManager implements Closeable {
           this.arthasIntegration.setInstrumentation(this.instrumentation);
         }
       }
+      return this;
+    }
+
+    /**
+     * 设置 AsyncProfiler 集成
+     *
+     * <p>如果不显式设置，且配置启用了 async-profiler，将自动创建。
+     *
+     * @param asyncProfilerIntegration AsyncProfiler 集成
+     * @return this builder
+     */
+    public Builder setAsyncProfilerIntegration(
+        @Nullable AsyncProfilerIntegration asyncProfilerIntegration) {
+      this.asyncProfilerIntegration = asyncProfilerIntegration;
       return this;
     }
 

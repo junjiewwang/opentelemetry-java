@@ -37,9 +37,6 @@ cd sdk-extensions/controlplane
 | `otel.agent.control.config.poll.interval` | `30s` | Config poll interval |
 | `otel.agent.control.task.poll.interval` | `10s` | Task poll interval |
 | `otel.agent.control.status.report.interval` | `60s` | Status report interval |
-| `otel.agent.control.task.result.compression.threshold` | `1KB` | Compression threshold |
-| `otel.agent.control.task.result.chunked.threshold` | `50MB` | Chunked upload threshold |
-| `otel.agent.control.task.result.max.size` | `200MB` | Max result size |
 
 ## Usage
 

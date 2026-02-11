@@ -59,20 +59,14 @@ public final class ControlPlaneConfig {
 
   // Arthas 配置
   private static final String ARTHAS_ENABLED = "otel.agent.control.arthas.enabled";
+  private static final String ASYNC_PROFILER_ENABLED = "otel.agent.control.async-profiler.enabled";
 
   // 存储配置
   private static final String STORAGE_DIR = "otel.agent.control.storage.dir";
   private static final String STORAGE_MAX_FILES = "otel.agent.control.storage.max.files";
   private static final String STORAGE_MAX_SIZE = "otel.agent.control.storage.max.size";
 
-  // 任务结果配置
-  private static final String TASK_RESULT_MAX_RETRY = "otel.agent.control.task.result.max.retry";
-  private static final String TASK_RESULT_RETRY_INTERVAL = "otel.agent.control.task.result.retry.interval";
-  private static final String TASK_RESULT_EXPIRATION = "otel.agent.control.task.result.expiration";
-  private static final String TASK_RESULT_COMPRESSION_THRESHOLD = "otel.agent.control.task.result.compression.threshold";
-  private static final String TASK_RESULT_CHUNKED_THRESHOLD = "otel.agent.control.task.result.chunked.threshold";
-  private static final String TASK_RESULT_CHUNK_SIZE = "otel.agent.control.task.result.chunk.size";
-  private static final String TASK_RESULT_MAX_SIZE = "otel.agent.control.task.result.max.size";
+
 
   // ===== 默认值常量 =====
   private static final String DEFAULT_PROTOCOL = "grpc";
@@ -86,16 +80,13 @@ public final class ControlPlaneConfig {
   private static final boolean DEFAULT_INCLUDE_SYSTEM_RESOURCE = true;
   private static final boolean DEFAULT_DEBUG_ENABLED = false;
   private static final boolean DEFAULT_ARTHAS_ENABLED = true;
+  private static final boolean DEFAULT_ASYNC_PROFILER_ENABLED = true;
 
   // 存储默认值
   private static final String DEFAULT_STORAGE_DIR = System.getProperty("java.io.tmpdir") + "/otel-controlplane";
   private static final int DEFAULT_STORAGE_MAX_FILES = 100;
   private static final long DEFAULT_STORAGE_MAX_SIZE = 100 * 1024 * 1024; // 100MB
 
-  // 任务结果默认值
-  private static final int DEFAULT_TASK_RESULT_MAX_RETRY = 3;
-  private static final Duration DEFAULT_TASK_RESULT_RETRY_INTERVAL = Duration.ofSeconds(5);
-  private static final Duration DEFAULT_TASK_RESULT_EXPIRATION = Duration.ofHours(24);
 
   // ===== 配置字段 =====
   private final boolean enabled;
@@ -111,23 +102,13 @@ public final class ControlPlaneConfig {
   private final boolean includeSystemResource;
   private final boolean debugEnabled;
   private final boolean arthasEnabled;
+  private final boolean asyncProfilerEnabled;
   @Nullable private final String headers;
 
   // 存储配置字段
   private final String storageDir;
   private final int storageMaxFiles;
   private final long storageMaxSize;
-
-  // 任务结果配置字段
-  private final int taskResultMaxRetry;
-  private final Duration taskResultRetryInterval;
-  private final Duration taskResultExpiration;
-
-  // TaskResultSizePolicy 相关字段
-  private final long compressionThreshold;
-  private final long chunkedThreshold;
-  private final long chunkSize;
-  private final long maxSize;
 
   // Auth Token (启动时一次性解析)
   @Nullable private final String authToken;
@@ -147,18 +128,11 @@ public final class ControlPlaneConfig {
     this.includeSystemResource = builder.includeSystemResource;
     this.debugEnabled = builder.debugEnabled;
     this.arthasEnabled = builder.arthasEnabled;
+    this.asyncProfilerEnabled = builder.asyncProfilerEnabled;
     this.headers = builder.headers;
     this.storageDir = builder.storageDir;
     this.storageMaxFiles = builder.storageMaxFiles;
     this.storageMaxSize = builder.storageMaxSize;
-    this.taskResultMaxRetry = builder.taskResultMaxRetry;
-    this.taskResultRetryInterval = builder.taskResultRetryInterval;
-    this.taskResultExpiration = builder.taskResultExpiration;
-    this.compressionThreshold = builder.compressionThreshold;
-    this.chunkedThreshold = builder.chunkedThreshold;
-    this.chunkSize = builder.chunkSize;
-    this.maxSize = builder.maxSize;
-
     // 一次性解析 AuthToken
     AuthTokenResult result = resolveAuthToken(builder.resourceAttributes, builder.headers);
     this.authToken = result.token;
@@ -401,6 +375,15 @@ public final class ControlPlaneConfig {
   }
 
   /**
+   * 是否启用 AsyncProfiler 功能
+   *
+   * @return 是否启用 AsyncProfiler
+   */
+  public boolean isAsyncProfilerEnabled() {
+    return asyncProfilerEnabled;
+  }
+
+  /**
    * 获取存储目录
    *
    * @return 存储目录路径
@@ -425,69 +408,6 @@ public final class ControlPlaneConfig {
    */
   public long getStorageMaxSize() {
     return storageMaxSize;
-  }
-
-  /**
-   * 获取任务结果最大重试次数
-   *
-   * @return 最大重试次数
-   */
-  public int getTaskResultMaxRetry() {
-    return taskResultMaxRetry;
-  }
-
-  /**
-   * 获取任务结果重试间隔
-   *
-   * @return 重试间隔
-   */
-  public Duration getTaskResultRetryInterval() {
-    return taskResultRetryInterval;
-  }
-
-  /**
-   * 获取任务结果过期时间
-   *
-   * @return 过期时间
-   */
-  public Duration getTaskResultExpiration() {
-    return taskResultExpiration;
-  }
-
-  /**
-   * 获取压缩阈值
-   *
-   * @return 压缩阈值（字节）
-   */
-  public long getCompressionThreshold() {
-    return compressionThreshold;
-  }
-
-  /**
-   * 获取分片阈值
-   *
-   * @return 分片阈值（字节）
-   */
-  public long getChunkedThreshold() {
-    return chunkedThreshold;
-  }
-
-  /**
-   * 获取分片大小
-   *
-   * @return 分片大小（字节）
-   */
-  public long getChunkSize() {
-    return chunkSize;
-  }
-
-  /**
-   * 获取最大结果大小
-   *
-   * @return 最大大小（字节）
-   */
-  public long getMaxSize() {
-    return maxSize;
   }
 
   /**
@@ -521,6 +441,7 @@ public final class ControlPlaneConfig {
     private boolean includeSystemResource = DEFAULT_INCLUDE_SYSTEM_RESOURCE;
     private boolean debugEnabled = DEFAULT_DEBUG_ENABLED;
     private boolean arthasEnabled = DEFAULT_ARTHAS_ENABLED;
+    private boolean asyncProfilerEnabled = DEFAULT_ASYNC_PROFILER_ENABLED;
     @Nullable private String headers;
     @Nullable private String resourceAttributes;
 
@@ -528,17 +449,6 @@ public final class ControlPlaneConfig {
     private String storageDir = DEFAULT_STORAGE_DIR;
     private int storageMaxFiles = DEFAULT_STORAGE_MAX_FILES;
     private long storageMaxSize = DEFAULT_STORAGE_MAX_SIZE;
-
-    // 任务结果配置字段
-    private int taskResultMaxRetry = DEFAULT_TASK_RESULT_MAX_RETRY;
-    private Duration taskResultRetryInterval = DEFAULT_TASK_RESULT_RETRY_INTERVAL;
-    private Duration taskResultExpiration = DEFAULT_TASK_RESULT_EXPIRATION;
-
-    // TaskResultSizePolicy 相关字段
-    private long compressionThreshold = 1024; // 1KB
-    private long chunkedThreshold = 50 * 1024 * 1024; // 50MB
-    private long chunkSize = 5 * 1024 * 1024; // 5MB
-    private long maxSize = 200 * 1024 * 1024; // 200MB
 
     private Builder() {}
 
@@ -598,43 +508,6 @@ public final class ControlPlaneConfig {
         this.storageMaxSize = maxSizeConfig;
       }
 
-      Integer maxRetry = properties.getInt(TASK_RESULT_MAX_RETRY);
-      if (maxRetry != null) {
-        this.taskResultMaxRetry = maxRetry;
-      }
-
-      Duration retryInterval = properties.getDuration(TASK_RESULT_RETRY_INTERVAL);
-      if (retryInterval != null) {
-        this.taskResultRetryInterval = retryInterval;
-      }
-
-      Duration expiration = properties.getDuration(TASK_RESULT_EXPIRATION);
-      if (expiration != null) {
-        this.taskResultExpiration = expiration;
-      }
-
-      Long compressionThresholdConfig =
-          parseSizeProperty(properties.getString(TASK_RESULT_COMPRESSION_THRESHOLD));
-      if (compressionThresholdConfig != null) {
-        this.compressionThreshold = compressionThresholdConfig;
-      }
-
-      Long chunkedThresholdConfig =
-          parseSizeProperty(properties.getString(TASK_RESULT_CHUNKED_THRESHOLD));
-      if (chunkedThresholdConfig != null) {
-        this.chunkedThreshold = chunkedThresholdConfig;
-      }
-
-      Long chunkSizeConfig = parseSizeProperty(properties.getString(TASK_RESULT_CHUNK_SIZE));
-      if (chunkSizeConfig != null) {
-        this.chunkSize = chunkSizeConfig;
-      }
-
-      Long maxSizeResultConfig = parseSizeProperty(properties.getString(TASK_RESULT_MAX_SIZE));
-      if (maxSizeResultConfig != null) {
-        this.maxSize = maxSizeResultConfig;
-      }
-
       Integer maxAttempts = properties.getInt(RETRY_MAX_ATTEMPTS);
       if (maxAttempts != null) {
         this.retryMaxAttempts = maxAttempts;
@@ -664,6 +537,10 @@ public final class ControlPlaneConfig {
 
       // Arthas 配置
       this.arthasEnabled = properties.getBoolean(ARTHAS_ENABLED, DEFAULT_ARTHAS_ENABLED);
+
+      // AsyncProfiler 配置
+      this.asyncProfilerEnabled =
+          properties.getBoolean(ASYNC_PROFILER_ENABLED, DEFAULT_ASYNC_PROFILER_ENABLED);
 
       return this;
     }
@@ -734,26 +611,6 @@ public final class ControlPlaneConfig {
       return this;
     }
 
-    public Builder setCompressionThreshold(long compressionThreshold) {
-      this.compressionThreshold = compressionThreshold;
-      return this;
-    }
-
-    public Builder setChunkedThreshold(long chunkedThreshold) {
-      this.chunkedThreshold = chunkedThreshold;
-      return this;
-    }
-
-    public Builder setChunkSize(long chunkSize) {
-      this.chunkSize = chunkSize;
-      return this;
-    }
-
-    public Builder setMaxSize(long maxSize) {
-      this.maxSize = maxSize;
-      return this;
-    }
-
     public Builder setIncludeSystemResource(boolean includeSystemResource) {
       this.includeSystemResource = includeSystemResource;
       return this;
@@ -769,6 +626,11 @@ public final class ControlPlaneConfig {
       return this;
     }
 
+    public Builder setAsyncProfilerEnabled(boolean asyncProfilerEnabled) {
+      this.asyncProfilerEnabled = asyncProfilerEnabled;
+      return this;
+    }
+
     /**
      * 构建配置实例
      *
@@ -779,18 +641,8 @@ public final class ControlPlaneConfig {
       return new ControlPlaneConfig(this);
     }
 
-    private void validate() {
-      if (compressionThreshold >= chunkedThreshold) {
-        throw new IllegalArgumentException(
-            "compressionThreshold must be less than chunkedThreshold");
-      }
-      if (chunkedThreshold >= maxSize) {
-        throw new IllegalArgumentException("chunkedThreshold must be less than maxSize");
-      }
-      if (chunkSize > chunkedThreshold) {
-        throw new IllegalArgumentException(
-            "chunkSize must be less than or equal to chunkedThreshold");
-      }
+    private static void validate() {
+      // 预留校验扩展点
     }
   }
 }
