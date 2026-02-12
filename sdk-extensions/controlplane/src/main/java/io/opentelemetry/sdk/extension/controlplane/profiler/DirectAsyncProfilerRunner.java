@@ -102,7 +102,7 @@ public final class DirectAsyncProfilerRunner implements AsyncProfilerRunner {
 
       ProfilerResult result =
           ProfilerResult.success(
-              outputPath, fileSize, durationMs, request.getEvent(), request.getFormat());
+              outputPath, fileSize, durationMs, request.getEventName(), request.getFormat());
       logger.log(Level.INFO, "[ASYNC-PROFILER] Profiling completed: {0}", result);
       return result;
 
@@ -189,8 +189,8 @@ public final class DirectAsyncProfilerRunner implements AsyncProfilerRunner {
       cmd.append(",jfr");
     }
 
-    cmd.append(",event=").append(request.getEvent());
-    cmd.append(",interval=").append(request.getIntervalNs());
+    cmd.append(",event=").append(request.getEventName());
+    cmd.append(",interval=").append(request.getInterval());
 
     if (request.isThreads()) {
       cmd.append(",threads");

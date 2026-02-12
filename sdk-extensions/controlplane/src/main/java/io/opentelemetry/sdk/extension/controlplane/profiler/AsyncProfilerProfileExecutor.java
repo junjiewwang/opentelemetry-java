@@ -202,9 +202,11 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
           emitter,
           String.format(
               Locale.ROOT,
-              "Profiling: event=%s, duration=%dms, format=%s",
-              request.getEvent(),
+              "Profiling: event=%s, duration=%dms, interval=%d %s, format=%s",
+              request.getEventName(),
               request.getDurationMs(),
+              request.getInterval(),
+              request.getEventType().getUnit(),
               request.getFormat()));
 
       ProfilerResult profilerResult = runner.profile(libPath, request, outputPath);
@@ -297,10 +299,11 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
   private static Map<String, String> buildMetadata(
       ProfileRequest request, ProfilerResult profilerResult) {
     java.util.HashMap<String, String> metadata = new java.util.HashMap<>();
-    metadata.put("event", request.getEvent());
+    metadata.put("event", request.getEventName());
     metadata.put("format", request.getFormat());
     metadata.put("duration_ms", String.valueOf(request.getDurationMs()));
-    metadata.put("interval_ns", String.valueOf(request.getIntervalNs()));
+    metadata.put("interval", String.valueOf(request.getInterval()));
+    metadata.put("interval_unit", request.getEventType().getUnit());
     metadata.put("threads", String.valueOf(request.isThreads()));
     metadata.put("file_size", String.valueOf(profilerResult.getFileSize()));
     metadata.put("actual_duration_ms", String.valueOf(profilerResult.getDurationMs()));
@@ -317,7 +320,7 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
     return String.format(
         Locale.ROOT,
         "{\"event\":\"%s\",\"format\":\"%s\",\"duration_ms\":%d,\"file_size\":%d,\"upload_id\":\"%s\"}",
-        request.getEvent(),
+        request.getEventName(),
         request.getFormat(),
         profilerResult.getDurationMs(),
         profilerResult.getFileSize(),
