@@ -50,7 +50,7 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
       Logger.getLogger(AsyncProfilerProfileExecutor.class.getName());
 
   /** 任务类型 */
-  public static final String TASK_TYPE = "async_profiler";
+  public static final String TASK_TYPE = "async-profiler";
 
   /** profiler 输出子目录名 */
   private static final String PROFILER_RESULTS_DIR = "profiler-results";
