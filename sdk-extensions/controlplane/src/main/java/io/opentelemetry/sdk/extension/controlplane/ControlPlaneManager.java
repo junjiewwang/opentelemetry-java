@@ -88,9 +88,6 @@ public final class ControlPlaneManager implements Closeable {
   // 可扩展组件列表（统一生命周期管理）
   private final List<ControlPlaneComponent> components;
 
-  // Arthas 集成（保留直接引用以便 Getter 访问）
-  @Nullable private final ArthasIntegration arthasIntegration;
-
   // 任务分发器
   @Nullable private TaskDispatcher taskDispatcher;
 
@@ -164,17 +161,11 @@ public final class ControlPlaneManager implements Closeable {
     // 初始化可扩展组件列表
     this.components = new CopyOnWriteArrayList<>();
 
-    // Arthas 集成（作为可扩展组件注册）
-    this.arthasIntegration = builder.arthasIntegration;
-    if (this.arthasIntegration != null) {
-      this.components.add(this.arthasIntegration);
-    }
+    // 添加用户显式注册的组件（包括通过 setArthasConfig / enableArthas 注册的 Arthas 集成）
+    this.components.addAll(builder.additionalComponents);
 
-    // AsyncProfiler 集成（作为可扩展组件注册）
-    if (builder.asyncProfilerIntegration != null) {
-      this.components.add(builder.asyncProfilerIntegration);
-    } else if (config.isAsyncProfilerEnabled()) {
-      // 自动创建：如果配置启用了 async-profiler
+    // AsyncProfiler 自动创建：如果配置启用了 async-profiler 且未被显式注册
+    if (config.isAsyncProfilerEnabled() && !hasComponentOfType(AsyncProfilerIntegration.class)) {
       AsyncProfilerIntegration autoProfiler =
           AsyncProfilerIntegration.create(this.service, config.getStorageDir());
       this.components.add(autoProfiler);
@@ -183,6 +174,21 @@ public final class ControlPlaneManager implements Closeable {
     // 生命周期状态
     this.started = new AtomicBoolean(false);
     this.closed = new AtomicBoolean(false);
+  }
+
+  /**
+   * 检查组件列表中是否已存在指定类型的组件
+   *
+   * @param type 组件类型
+   * @return 是否存在
+   */
+  private boolean hasComponentOfType(Class<? extends ControlPlaneComponent> type) {
+    for (ControlPlaneComponent component : components) {
+      if (type.isInstance(component)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -468,16 +474,6 @@ public final class ControlPlaneManager implements Closeable {
   }
 
   /**
-   * 获取 Arthas 集成
-   *
-   * @return Arthas 集成，如果未启用则返回 null
-   */
-  @Nullable
-  public ArthasIntegration getArthasIntegration() {
-    return arthasIntegration;
-  }
-
-  /**
    * 获取连接状态管理器
    *
    * @return 连接状态管理器
@@ -543,9 +539,8 @@ public final class ControlPlaneManager implements Closeable {
     @Nullable private ControlPlaneConfig config;
     @Nullable private DynamicConfigManager configManager;
     @Nullable private DynamicSampler dynamicSampler;
-    @Nullable private ArthasIntegration arthasIntegration;
-    @Nullable private AsyncProfilerIntegration asyncProfilerIntegration;
     @Nullable private Instrumentation instrumentation;
+    private final List<ControlPlaneComponent> additionalComponents = new ArrayList<>();
 
     private Builder() {}
 
@@ -634,26 +629,38 @@ public final class ControlPlaneManager implements Closeable {
 
           arthasConfig = builder.build();
         }
-        this.arthasIntegration = ArthasIntegration.create(arthasConfig);
+        ArthasIntegration arthasIntegration = ArthasIntegration.create(arthasConfig);
         // 如果已经设置了 Instrumentation，传递给 ArthasIntegration
         if (this.instrumentation != null) {
-          this.arthasIntegration.setInstrumentation(this.instrumentation);
+          arthasIntegration.setInstrumentation(this.instrumentation);
         }
+        // 通过通用的 addComponent 注册，与其他组件保持一致
+        addComponent(arthasIntegration);
       }
       return this;
     }
 
     /**
-     * 设置 AsyncProfiler 集成
+     * 添加可扩展组件
      *
-     * <p>如果不显式设置，且配置启用了 async-profiler，将自动创建。
+     * <p>通过此方法注册自定义的 {@link ControlPlaneComponent}，
+     * 支持 {@link TaskExecutorProvider}、{@link ServerMetadataListener} 等扩展接口。
+     * 遵循开闭原则：新增组件无需修改 Manager 代码。
      *
-     * @param asyncProfilerIntegration AsyncProfiler 集成
+     * <p>使用示例：
+     * <pre>{@code
+     * ControlPlaneManager.builder()
+     *     .setConfig(config)
+     *     .addComponent(AsyncProfilerIntegration.create(service, storageDir))
+     *     .addComponent(HeapDumpIntegration.create(service, storageDir))
+     *     .build();
+     * }</pre>
+     *
+     * @param component 可扩展组件
      * @return this builder
      */
-    public Builder setAsyncProfilerIntegration(
-        @Nullable AsyncProfilerIntegration asyncProfilerIntegration) {
-      this.asyncProfilerIntegration = asyncProfilerIntegration;
+    public Builder addComponent(ControlPlaneComponent component) {
+      this.additionalComponents.add(Objects.requireNonNull(component, "component is required"));
       return this;
     }
 
@@ -668,10 +675,6 @@ public final class ControlPlaneManager implements Closeable {
      */
     public Builder setInstrumentation(@Nullable Instrumentation instrumentation) {
       this.instrumentation = instrumentation;
-      // 如果 ArthasIntegration 已经创建，传递 Instrumentation
-      if (this.arthasIntegration != null && instrumentation != null) {
-        this.arthasIntegration.setInstrumentation(instrumentation);
-      }
       return this;
     }
 

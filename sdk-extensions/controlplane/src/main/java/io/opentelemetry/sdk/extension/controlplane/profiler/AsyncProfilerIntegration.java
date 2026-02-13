@@ -33,7 +33,7 @@ import java.util.logging.Logger;
  * <pre>{@code
  * ControlPlaneManager.builder()
  *     .setConfig(config)
- *     .setAsyncProfilerIntegration(
+ *     .addComponent(
  *         AsyncProfilerIntegration.create(service, config.getStorageDir()))
  *     .build();
  * }</pre>
