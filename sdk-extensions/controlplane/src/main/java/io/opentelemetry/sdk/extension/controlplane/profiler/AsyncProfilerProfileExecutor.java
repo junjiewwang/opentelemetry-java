@@ -15,7 +15,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -225,9 +224,8 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
               profilerResult.getFileSize(),
               request.getFormat()));
 
-      // 构建元数据
-      Map<String, String> metadata =
-          buildMetadata(request, profilerResult);
+      // 构建结果数据模型（上传前 uploadResult 为 null）
+      ProfilingResultData resultData = new ProfilingResultData(request, profilerResult, null);
 
       FileStreamUploader.UploadResult uploadResult =
           uploader
@@ -236,7 +234,7 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
                   TASK_TYPE,
                   outputPath,
                   request.getContentType(),
-                  metadata)
+                  resultData.toMetadata())
               .join(); // 同步等待（已在独立线程中）
 
       if (!uploadResult.isSuccess()) {
@@ -253,8 +251,10 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
       // 6. 上传成功，删除本地文件
       cleanupFile(outputPath, taskId);
 
-      // 7. 构建成功结果
-      String resultJson = buildResultJson(request, profilerResult, uploadResult);
+      // 7. 构建成功结果（补充 uploadId）
+      ProfilingResultData finalResultData =
+          new ProfilingResultData(request, profilerResult, uploadResult);
+      String resultJson = finalResultData.toJson();
       logger.log(
           Level.INFO,
           "[ASYNC-PROFILER] Profiling task completed successfully: taskId={0}",
@@ -291,40 +291,6 @@ public final class AsyncProfilerProfileExecutor implements TaskExecutor {
     return workDir
         .resolve(PROFILER_RESULTS_DIR)
         .resolve(taskId + "." + request.getFileExtension());
-  }
-
-  /**
-   * 构建上传元数据
-   */
-  private static Map<String, String> buildMetadata(
-      ProfileRequest request, ProfilerResult profilerResult) {
-    java.util.HashMap<String, String> metadata = new java.util.HashMap<>();
-    metadata.put("event", request.getEventName());
-    metadata.put("format", request.getFormat());
-    metadata.put("duration_ms", String.valueOf(request.getDurationMs()));
-    metadata.put("interval", String.valueOf(request.getInterval()));
-    metadata.put("interval_unit", request.getEventType().getUnit());
-    metadata.put("threads", String.valueOf(request.isThreads()));
-    metadata.put("file_size", String.valueOf(profilerResult.getFileSize()));
-    metadata.put("actual_duration_ms", String.valueOf(profilerResult.getDurationMs()));
-    return metadata;
-  }
-
-  /**
-   * 构建成功结果 JSON
-   */
-  private static String buildResultJson(
-      ProfileRequest request,
-      ProfilerResult profilerResult,
-      FileStreamUploader.UploadResult uploadResult) {
-    return String.format(
-        Locale.ROOT,
-        "{\"event\":\"%s\",\"format\":\"%s\",\"duration_ms\":%d,\"file_size\":%d,\"upload_id\":\"%s\"}",
-        request.getEventName(),
-        request.getFormat(),
-        profilerResult.getDurationMs(),
-        profilerResult.getFileSize(),
-        uploadResult.getUploadId() != null ? uploadResult.getUploadId() : "");
   }
 
   /**

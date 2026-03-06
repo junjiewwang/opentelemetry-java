@@ -175,18 +175,19 @@ public final class DirectAsyncProfilerRunner implements AsyncProfilerRunner {
   /**
    * 构建 start 命令
    *
-   * <p>JFR 格式需要在 start 时指定输出文件：
-   * {@code start,jfr,event=cpu,interval=10000000,file=/path/to/output.jfr}
-   *
-   * <p>Collapsed 格式在 start 时不指定文件（在 stop 时指定）：
-   * {@code start,event=cpu,interval=10000000}
+   * <p>行为取决于 {@link OutputFormat#isSpecifyFileOnStart()}：
+   * <ul>
+   *   <li>{@code true}（如 JFR）：start 时指定格式标记和文件路径</li>
+   *   <li>{@code false}（如 collapsed）：start 时不指定文件</li>
+   * </ul>
    */
   private static String buildStartCommand(ProfileRequest request, Path outputPath) {
     StringBuilder cmd = new StringBuilder("start");
+    OutputFormat format = request.getOutputFormat();
 
-    // JFR 格式需要在 start 时指定
-    if ("jfr".equals(request.getFormat())) {
-      cmd.append(",jfr");
+    // 需要在 start 时指定格式标记（如 jfr）
+    if (format.isSpecifyFileOnStart()) {
+      cmd.append(",").append(format.getValue());
     }
 
     cmd.append(",event=").append(request.getEventName());
@@ -196,8 +197,8 @@ public final class DirectAsyncProfilerRunner implements AsyncProfilerRunner {
       cmd.append(",threads");
     }
 
-    // JFR 格式在 start 时指定输出文件
-    if ("jfr".equals(request.getFormat())) {
+    // 需要在 start 时指定输出文件
+    if (format.isSpecifyFileOnStart()) {
       cmd.append(",file=").append(outputPath.toAbsolutePath());
     }
 
@@ -207,18 +208,19 @@ public final class DirectAsyncProfilerRunner implements AsyncProfilerRunner {
   /**
    * 构建 stop 命令
    *
-   * <p>Collapsed 格式在 stop 时指定输出文件和格式：
-   * {@code stop,collapsed,file=/path/to/output.collapsed}
-   *
-   * <p>JFR 格式只需 stop：
-   * {@code stop}
+   * <p>行为取决于 {@link OutputFormat#isSpecifyFileOnStart()}：
+   * <ul>
+   *   <li>{@code false}（如 collapsed）：stop 时指定格式标记和文件路径</li>
+   *   <li>{@code true}（如 JFR）：stop 时仅发送 stop</li>
+   * </ul>
    */
   private static String buildStopCommand(ProfileRequest request, Path outputPath) {
     StringBuilder cmd = new StringBuilder("stop");
+    OutputFormat format = request.getOutputFormat();
 
-    // Collapsed 格式在 stop 时指定
-    if ("collapsed".equals(request.getFormat())) {
-      cmd.append(",collapsed");
+    // 不在 start 时指定文件的格式，需要在 stop 时指定
+    if (!format.isSpecifyFileOnStart()) {
+      cmd.append(",").append(format.getValue());
       cmd.append(",file=").append(outputPath.toAbsolutePath());
     }
 

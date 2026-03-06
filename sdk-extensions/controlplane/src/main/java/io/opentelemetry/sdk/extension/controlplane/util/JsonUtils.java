@@ -101,6 +101,24 @@ public final class JsonUtils {
   }
 
   /**
+   * 将对象序列化为 JSON 字符串
+   *
+   * <p>推荐使用此方法将带有 {@code @JsonProperty} 注解的 DTO 对象序列化为 JSON 字符串，
+   * 提供类型安全和编译期检查。
+   *
+   * @param obj 要序列化的对象
+   * @return JSON 字符串
+   * @throws IllegalArgumentException 如果序列化失败
+   */
+  public static String toJsonString(Object obj) {
+    try {
+      return MAPPER.writeValueAsString(obj);
+    } catch (JsonProcessingException e) {
+      throw new IllegalArgumentException("JSON serialization failed", e);
+    }
+  }
+
+  /**
    * 序列化简单键值对为 JSON 对象
    *
    * <p>用于构建简单的请求体，如 {"agent_id":"xxx","timeout_millis":30000}
@@ -129,6 +147,32 @@ public final class JsonUtils {
       }
     }
     return toJsonString(map);
+  }
+
+  /**
+   * 将对象按 {@code @JsonProperty} 注解转为 {@code Map<String, String>}
+   *
+   * <p>利用 Jackson 两步转换：Object → Map&lt;String, Object&gt; → Map&lt;String, String&gt;，
+   * 确保 key 与 {@code @JsonProperty} 定义一致，消除手动维护魔法字符串的风险。
+   *
+   * @param obj 要转换的对象（通常是带有 {@code @JsonProperty} 注解的 DTO）
+   * @param excludeKeys 需要排除的 key（例如上传前尚未生成的字段）
+   * @return 不可变的 {@code Map<String, String>}
+   * @throws IllegalArgumentException 如果转换失败
+   */
+  public static Map<String, String> toStringMap(Object obj, String... excludeKeys) {
+    Map<String, Object> raw = MAPPER.convertValue(obj, MAP_TYPE_REF);
+    java.util.Set<String> excluded =
+        excludeKeys.length > 0
+            ? new java.util.HashSet<>(java.util.Arrays.asList(excludeKeys))
+            : java.util.Collections.emptySet();
+    Map<String, String> result = new LinkedHashMap<>();
+    for (Map.Entry<String, Object> entry : raw.entrySet()) {
+      if (!excluded.contains(entry.getKey())) {
+        result.put(entry.getKey(), String.valueOf(entry.getValue()));
+      }
+    }
+    return java.util.Collections.unmodifiableMap(result);
   }
 
   // ==================== 反序列化/解析方法 ====================

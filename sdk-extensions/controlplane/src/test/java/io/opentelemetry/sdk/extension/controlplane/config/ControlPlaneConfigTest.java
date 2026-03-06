@@ -6,7 +6,6 @@
 package io.opentelemetry.sdk.extension.controlplane.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
@@ -23,9 +22,6 @@ class ControlPlaneConfigTest {
     assertThat(config.getLongPollTimeout()).isEqualTo(Duration.ofSeconds(60));
     // configPollInterval 和 taskPollInterval 已由长轮询替代
     assertThat(config.getStatusReportInterval()).isEqualTo(Duration.ofSeconds(30));
-    assertThat(config.getCompressionThreshold()).isEqualTo(1024L);
-    assertThat(config.getChunkedThreshold()).isEqualTo(50 * 1024 * 1024L);
-    assertThat(config.getMaxSize()).isEqualTo(200 * 1024 * 1024L);
   }
 
   @Test
@@ -37,9 +33,6 @@ class ControlPlaneConfigTest {
             .setProtocol("http/protobuf")
             .setHttpBasePath("/custom/path")
             .setLongPollTimeout(Duration.ofMinutes(2))
-            .setCompressionThreshold(2048)
-            .setChunkedThreshold(100 * 1024 * 1024L)
-            .setMaxSize(500 * 1024 * 1024L)
             .build();
 
     assertThat(config.isEnabled()).isTrue();
@@ -49,9 +42,6 @@ class ControlPlaneConfigTest {
     assertThat(config.isGrpc()).isFalse();
     assertThat(config.getHttpBasePath()).isEqualTo("/custom/path");
     assertThat(config.getLongPollTimeout()).isEqualTo(Duration.ofMinutes(2));
-    assertThat(config.getCompressionThreshold()).isEqualTo(2048);
-    assertThat(config.getChunkedThreshold()).isEqualTo(100 * 1024 * 1024L);
-    assertThat(config.getMaxSize()).isEqualTo(500 * 1024 * 1024L);
   }
 
   @Test
@@ -89,29 +79,5 @@ class ControlPlaneConfigTest {
     assertThat(config.getControlPlaneUrl()).isEqualTo("http://localhost:4318/v1/control");
   }
 
-  @Test
-  void validationFailsWhenCompressionThresholdGreaterThanChunkedThreshold() {
-    assertThatThrownBy(
-            () ->
-                ControlPlaneConfig.builder()
-                    .setCompressionThreshold(100 * 1024 * 1024L)
-                    .setChunkedThreshold(50 * 1024 * 1024L)
-                    .setMaxSize(200 * 1024 * 1024L)
-                    .build())
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("compressionThreshold must be less than chunkedThreshold");
-  }
 
-  @Test
-  void validationFailsWhenChunkedThresholdGreaterThanMaxSize() {
-    assertThatThrownBy(
-            () ->
-                ControlPlaneConfig.builder()
-                    .setCompressionThreshold(1024L)
-                    .setChunkedThreshold(300 * 1024 * 1024L)
-                    .setMaxSize(200 * 1024 * 1024L)
-                    .build())
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("chunkedThreshold must be less than maxSize");
-  }
 }

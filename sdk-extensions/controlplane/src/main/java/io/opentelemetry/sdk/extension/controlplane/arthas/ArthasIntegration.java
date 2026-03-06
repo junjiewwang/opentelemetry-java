@@ -16,8 +16,8 @@ import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
 import java.util.Arrays;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -434,30 +434,29 @@ public final class ArthasIntegration
 
   /** 获取状态信息（用于状态上报） */
   public Map<String, Object> getStatusInfo() {
-    Map<String, Object> status = new LinkedHashMap<>();
-    status.put("enabled", config.isEnabled());
-    status.put("arthasState", lifecycleManager.getState().name());
-    status.put("tunnelStatus", tunnelStatusBridge.getCurrentStatus().name());
-    status.put("tunnelRegistered", tunnelRegistered.get());
-    status.put("tunnelReady", isTunnelReady());
-    status.put("terminalBindable", isTerminalBindable());
-    status.put("terminalNotBindableReason", getTerminalNotBindableReason());
-    status.put("uptimeMs", lifecycleManager.getUptimeMillis());
-    status.put("tunnelDisconnectedDurationMs", tunnelStatusBridge.getDisconnectedDurationMillis());
-    // 动态端点信息
-    status.put("currentEffectiveTunnelEndpoint", currentEffectiveTunnelEndpoint);
-    status.put("currentServerHttpPort", currentServerHttpPort);
+    ArthasStatusInfo.EnvironmentInfo envInfo = new ArthasStatusInfo.EnvironmentInfo(
+        environment.getOsType().name(),
+        environment.getCpuArch().name(),
+        environment.getLibcType().name(),
+        environment.isJdkAvailable(),
+        environment.isArthasSupported());
 
-    // 环境信息
-    Map<String, Object> env = new LinkedHashMap<>();
-    env.put("os", environment.getOsType().name());
-    env.put("arch", environment.getCpuArch().name());
-    env.put("libc", environment.getLibcType().name());
-    env.put("jdkAvailable", environment.isJdkAvailable());
-    env.put("arthasSupported", environment.isArthasSupported());
-    status.put("environment", env);
+    ArthasStatusInfo statusInfo = new ArthasStatusInfo(
+        config.isEnabled(),
+        lifecycleManager.getState().name(),
+        tunnelStatusBridge.getCurrentStatus().name(),
+        tunnelRegistered.get(),
+        isTunnelReady(),
+        isTerminalBindable(),
+        getTerminalNotBindableReason(),
+        lifecycleManager.getUptimeMillis(),
+        tunnelStatusBridge.getDisconnectedDurationMillis(),
+        currentEffectiveTunnelEndpoint,
+        currentServerHttpPort,
+        envInfo);
 
-    return Collections.unmodifiableMap(status);
+    // 通过 Jackson 将 Model 转为 Map，key 由 @JsonProperty 注解保证一致性
+    return Collections.unmodifiableMap(JsonUtils.parseSimpleObject(JsonUtils.toJsonString(statusInfo)));
   }
 
   // ===== Attach 健康检查（自愈机制） =====

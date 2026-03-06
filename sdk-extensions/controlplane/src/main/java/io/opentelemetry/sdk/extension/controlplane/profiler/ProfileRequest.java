@@ -5,11 +5,7 @@
 
 package io.opentelemetry.sdk.extension.controlplane.profiler;
 
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.Locale;
-import java.util.Set;
-import java.util.Arrays;
 import javax.annotation.Nullable;
 
 /**
@@ -17,20 +13,11 @@ import javax.annotation.Nullable;
  *
  * <p>封装一次性 profiling 的所有参数，包含参数校验逻辑。
  *
- * <p>支持的输出格式：
- * <ul>
- *   <li>{@code collapsed} — 折叠栈格式（文本，适合生成火焰图）
- *   <li>{@code jfr} — Java Flight Recorder 格式（二进制，信息更丰富）
- * </ul>
+ * <p>支持的输出格式详见 {@link OutputFormat}。
  *
  * <p>interval 参数的含义取决于事件类型，详见 {@link EventType}。
  */
 public final class ProfileRequest {
-
-  /** 支持的输出格式白名单 */
-  private static final Set<String> ALLOWED_FORMATS =
-      Collections.unmodifiableSet(
-          new HashSet<>(Arrays.asList("collapsed", "jfr")));
 
   /** 默认采样时长：30 秒 */
   private static final long DEFAULT_DURATION_MS = 30_000;
@@ -43,7 +30,7 @@ public final class ProfileRequest {
 
   private final long durationMs;
   private final EventType eventType;
-  private final String format;
+  private final OutputFormat format;
   private final long interval;
   private final boolean threads;
 
@@ -76,9 +63,18 @@ public final class ProfileRequest {
     return eventType.getValue();
   }
 
-  /** 获取输出格式 */
-  public String getFormat() {
+  /** 获取输出格式枚举 */
+  public OutputFormat getOutputFormat() {
     return format;
+  }
+
+  /**
+   * 获取输出格式名称字符串（便利方法，等价于 {@code getOutputFormat().getValue()}）
+   *
+   * @return 格式名称，如 "collapsed"、"jfr" 等
+   */
+  public String getFormat() {
+    return format.getValue();
   }
 
   /**
@@ -107,10 +103,7 @@ public final class ProfileRequest {
    * @return MIME 类型
    */
   public String getContentType() {
-    if ("jfr".equals(format)) {
-      return "application/x-jfr";
-    }
-    return "text/plain; charset=utf-8";
+    return format.getContentType();
   }
 
   /**
@@ -119,7 +112,7 @@ public final class ProfileRequest {
    * @return 文件扩展名（不含点号）
    */
   public String getFileExtension() {
-    return format;
+    return format.getFileExtension();
   }
 
   /**
@@ -135,9 +128,7 @@ public final class ProfileRequest {
           "duration_ms must be between %d and %d, got %d",
           MIN_DURATION_MS, MAX_DURATION_MS, durationMs);
     }
-    if (!ALLOWED_FORMATS.contains(format)) {
-      return "Unsupported format: " + format + ", allowed: " + ALLOWED_FORMATS;
-    }
+    // format 由枚举保证合法性，无需额外校验
     // 委托 EventType 校验 interval 范围
     return eventType.validateInterval(interval);
   }
@@ -154,10 +145,16 @@ public final class ProfileRequest {
     String eventStr = context.getStringParameter("event", "cpu");
     EventType eventType = EventType.fromString(eventStr);
     if (eventType == null) {
-      // 未知事件类型，使用 CPU 作为回退（validate() 会在后续校验中捕获问题）
-      // 但此处直接抛出更清晰的错误
       throw new IllegalArgumentException(
           "Unsupported event type: " + eventStr + ", supported: " + EventType.supportedValues());
+    }
+
+    // 解析输出格式
+    String formatStr = context.getStringParameter("format", OutputFormat.COLLAPSED.getValue());
+    OutputFormat outputFormat = OutputFormat.fromString(formatStr);
+    if (outputFormat == null) {
+      throw new IllegalArgumentException(
+          "Unsupported format: " + formatStr + ", supported: " + OutputFormat.supportedValues());
     }
 
     // interval 默认值由事件类型决定
@@ -166,7 +163,7 @@ public final class ProfileRequest {
     return builder()
         .durationMs(context.getLongParameter("duration_ms", DEFAULT_DURATION_MS))
         .eventType(eventType)
-        .format(context.getStringParameter("format", "collapsed"))
+        .format(outputFormat)
         .interval(interval)
         .threads(context.getBooleanParameter("threads", false))
         .build();
@@ -177,7 +174,7 @@ public final class ProfileRequest {
     return String.format(
         Locale.ROOT,
         "ProfileRequest{duration=%dms, event='%s', format='%s', interval=%d %s, threads=%s}",
-        durationMs, eventType.getValue(), format, interval, eventType.getUnit(), threads);
+        durationMs, eventType.getValue(), format.getValue(), interval, eventType.getUnit(), threads);
   }
 
   // ===== Builder =====
@@ -189,7 +186,7 @@ public final class ProfileRequest {
   public static final class Builder {
     private long durationMs = DEFAULT_DURATION_MS;
     private EventType eventType = EventType.CPU;
-    private String format = "collapsed";
+    private OutputFormat format = OutputFormat.COLLAPSED;
     private long interval = EventType.CPU.getDefaultInterval();
     private boolean threads = false;
 
@@ -206,8 +203,8 @@ public final class ProfileRequest {
       return this;
     }
 
-    public Builder format(String format) {
-      this.format = format != null ? format.toLowerCase(Locale.ROOT) : "collapsed";
+    public Builder format(OutputFormat format) {
+      this.format = format != null ? format : OutputFormat.COLLAPSED;
       return this;
     }
 
