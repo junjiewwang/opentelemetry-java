@@ -12,6 +12,7 @@ import java.lang.instrument.Instrumentation;
 import java.lang.instrument.UnmodifiableClassException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -49,7 +50,7 @@ public final class TransformerManager {
   /** 安全限制：最大同时活跃的增强数量 */
   private static final int MAX_ACTIVE_ENHANCEMENTS = 50;
 
-  /** Bootstrap CL 中 AdviceDispatcher 的 registerRule 方法缓存 */
+  /** Bootstrap CL 中 AdviceDispatcher 的 registerRule(InstrumentationRule, CaptureConfig) 方法缓存 */
   @Nullable private static volatile Method bootstrapRegisterRule;
 
   /** Bootstrap CL 中 AdviceDispatcher 的 unregisterRule 方法缓存 */
@@ -270,24 +271,34 @@ public final class TransformerManager {
       return EnhancementResult.failed(ruleId, "RETRANSFORM_ERROR", e.getMessage());
     }
 
-    // 12. 注册 Advice 规则到 Bootstrap CL 中的 AdviceDispatcher
+    // 12. 预解析 CaptureConfig（在增强阶段反射获取目标 Method，运行时零开销）
+    List<String> warnings = new ArrayList<>();
+    CaptureConfig captureConfig = resolveCaptureConfig(rule, targetClass, warnings);
+
+    // 13. 注册 Advice 规则到 Bootstrap CL 中的 AdviceDispatcher
     //     注意：必须通过反射调用 Bootstrap CL 中的类，因为 Agent CL 和 Bootstrap CL
     //     中的 AdviceDispatcher 是两个不同的类（注入发生在 Agent CL 加载之后）。
     //     Advice 内联代码在目标类中运行时，访问的是 Bootstrap CL 中的静态字段。
-    registerRuleToBootstrapCl(rule);
+    registerRuleToBootstrapCl(rule, captureConfig);
 
-    // 13. 记录映射关系
+    // 14. 记录映射关系
     ManagedTransformer managed = new ManagedTransformer(ruleId, rule, transformer, targetClass);
     transformers.put(ruleId, managed);
     targetMethodToRuleId.put(targetKey, ruleId);
 
-    // 14. 更新状态
+    // 15. 更新状态
     state.markActive(targetClass.getName());
 
     logger.log(Level.INFO,
         "[TRANSFORMER-MANAGER] Applied rule: {0}, target: {1}.{2}",
         new Object[] {ruleId, rule.getClassName(), rule.getMethodName()});
 
+    if (!warnings.isEmpty()) {
+      logger.log(Level.WARNING,
+          "[TRANSFORMER-MANAGER] Rule {0} applied with warnings: {1}",
+          new Object[] {ruleId, warnings});
+      return EnhancementResult.successWithWarnings(ruleId, warnings);
+    }
     return EnhancementResult.success(ruleId);
   }
 
@@ -417,6 +428,187 @@ public final class TransformerManager {
   }
 
   /**
+   * 在增强阶段反射获取目标 Method 并预解析 CaptureConfig
+   *
+   * <p>通过 targetClass 反射获取与规则匹配的 Method 对象，然后调用
+   * {@link CaptureConfig#resolve(java.util.Map, Method)} 做完整解析（含参数名→索引映射）。
+   * 这样运行时采集时直接使用缓存的 CaptureConfig，不需要再做反射，真正实现零开销。
+   *
+   * @param rule 增强规则
+   * @param targetClass 已加载的目标类
+   * @param warnings 收集警告信息的列表（调用方传入）
+   * @return 预解析的 CaptureConfig，无采集配置时返回 {@link CaptureConfig#NONE}
+   */
+  private static CaptureConfig resolveCaptureConfig(
+      InstrumentationRule rule, Class<?> targetClass, List<String> warnings) {
+    if (rule.getConfig() == null || rule.getConfig().isEmpty()) {
+      return CaptureConfig.NONE;
+    }
+
+    // 检查是否有采集配置（capture_return 非空且非 "false" 即表示需要采集）
+    String captureReturnVal = rule.getConfig().get(CaptureConfig.KEY_CAPTURE_RETURN);
+    boolean hasCaptureConfig = rule.getConfig().containsKey(CaptureConfig.KEY_CAPTURE_ARGS)
+        || (captureReturnVal != null
+            && !captureReturnVal.trim().isEmpty()
+            && !"false".equalsIgnoreCase(captureReturnVal.trim()));
+    if (!hasCaptureConfig) {
+      return CaptureConfig.NONE;
+    }
+
+    // 尝试反射获取目标 Method（带详细失败原因）
+    MethodMatchResult matchResult = findTargetMethodWithReason(targetClass, rule);
+    Method resolvedMethod = matchResult.getMethod();
+    if (matchResult.isSuccess() && resolvedMethod != null) {
+      logger.log(Level.FINE,
+          "[TRANSFORMER-MANAGER] Resolved target method for capture: {0}.{1}, params={2}",
+          new Object[] {targetClass.getName(), rule.getMethodName(),
+              resolvedMethod.getParameterCount()});
+    } else {
+      // 将详细的失败原因作为 warning 收集
+      String reason = matchResult.getFailureReason();
+      warnings.add(reason);
+      logger.log(Level.WARNING,
+          "[TRANSFORMER-MANAGER] Could not resolve target method for capture: {0}",
+          reason);
+    }
+
+    CaptureConfig captureConfig = CaptureConfig.resolve(rule.getConfig(), resolvedMethod);
+    logger.log(Level.FINE,
+        "[TRANSFORMER-MANAGER] Pre-resolved CaptureConfig for rule {0}: {1}",
+        new Object[] {rule.getRuleId(), captureConfig});
+    return captureConfig;
+  }
+
+  /**
+   * 通过反射查找目标类中与规则匹配的 Method（带详细失败原因）
+   *
+   * <p>匹配策略：
+   * <ol>
+   *   <li>如果指定了 parameterTypes，按参数类型精确匹配</li>
+   *   <li>否则查找所有同名方法，如果仅有一个则返回，多个则返回失败（无法确定）</li>
+   * </ol>
+   *
+   * @param targetClass 目标类
+   * @param rule 增强规则
+   * @return 包含匹配结果和失败原因的 MethodMatchResult
+   */
+  private static MethodMatchResult findTargetMethodWithReason(
+      Class<?> targetClass, InstrumentationRule rule) {
+    try {
+      Method[] allMethods = targetClass.getDeclaredMethods();
+      List<Method> candidates = new ArrayList<>();
+      List<Method> allSameNameMethods = new ArrayList<>();
+
+      for (Method m : allMethods) {
+        if (!m.getName().equals(rule.getMethodName())) {
+          continue;
+        }
+        allSameNameMethods.add(m);
+
+        // 如果指定了参数类型列表，按参数类型匹配
+        if (rule.getParameterTypes() != null) {
+          if (matchesParameterTypes(m, rule.getParameterTypes())) {
+            candidates.add(m);
+          }
+        } else {
+          candidates.add(m);
+        }
+      }
+
+      // 没有找到同名方法
+      if (allSameNameMethods.isEmpty()) {
+        return MethodMatchResult.methodNotFound(
+            targetClass.getSimpleName(), rule.getMethodName());
+      }
+
+      // 精确匹配成功
+      if (candidates.size() == 1) {
+        return MethodMatchResult.success(candidates.get(0));
+      }
+
+      // 有多个重载但未指定 parameter_types
+      if (candidates.size() > 1 && rule.getParameterTypes() == null) {
+        return MethodMatchResult.ambiguousOverloads(
+            targetClass.getSimpleName(), rule.getMethodName(),
+            candidates.size(), formatMethodSignatures(candidates));
+      }
+
+      // 指定了 parameter_types 但没有匹配到
+      if (candidates.isEmpty() && rule.getParameterTypes() != null) {
+        return MethodMatchResult.parameterTypesMismatch(
+            targetClass.getSimpleName(), rule.getMethodName(),
+            rule.getParameterTypes(), formatMethodSignatures(allSameNameMethods));
+      }
+
+      // 未指定 parameter_types 且没有同名方法（理论上不会到这，前面已覆盖）
+      return MethodMatchResult.methodNotFound(
+          targetClass.getSimpleName(), rule.getMethodName());
+    } catch (RuntimeException e) {
+      return MethodMatchResult.error(
+          targetClass.getSimpleName(), rule.getMethodName(), String.valueOf(e.getMessage()));
+    }
+  }
+
+  /**
+   * 格式化方法签名列表，用于 warning 消息
+   *
+   * @param methods 方法列表
+   * @return 格式化的签名字符串，如 "[setIfAbsent(Object,Object), setIfAbsent(Object,Object,long,TimeUnit)]"
+   */
+  private static String formatMethodSignatures(List<Method> methods) {
+    StringBuilder sb = new StringBuilder("[");
+    for (int i = 0; i < methods.size(); i++) {
+      if (i > 0) {
+        sb.append(", ");
+      }
+      Method m = methods.get(i);
+      sb.append(m.getName()).append('(');
+      Class<?>[] paramTypes = m.getParameterTypes();
+      for (int j = 0; j < paramTypes.length; j++) {
+        if (j > 0) {
+          sb.append(',');
+        }
+        sb.append(paramTypes[j].getSimpleName());
+      }
+      sb.append(')');
+    }
+    sb.append(']');
+    return sb.toString();
+  }
+
+  /**
+   * 检查 Method 的参数类型是否与指定的参数类型列表匹配
+   *
+   * <p>支持简单类名尾部匹配和全限定名精确匹配（与 ByteBuddy 匹配逻辑一致）。
+   *
+   * @param method 方法
+   * @param parameterTypes 参数类型列表
+   * @return 是否匹配
+   */
+  private static boolean matchesParameterTypes(Method method, java.util.List<String> parameterTypes) {
+    Class<?>[] params = method.getParameterTypes();
+    if (params.length != parameterTypes.size()) {
+      return false;
+    }
+    for (int i = 0; i < params.length; i++) {
+      String expected = parameterTypes.get(i);
+      String actual = params[i].getName();
+      if (expected.contains(".")) {
+        // 全限定名精确匹配
+        if (!actual.equals(expected)) {
+          return false;
+        }
+      } else {
+        // 简单类名：尾部匹配或基本类型精确匹配
+        if (!actual.endsWith("." + expected) && !actual.equals(expected)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
    * 通过反射将规则注册到 Bootstrap CL 中的 AdviceDispatcher
    *
    * <p>由于 Bootstrap 注入发生在 Agent CL 已加载这些类之后，Agent CL 中的
@@ -425,28 +617,36 @@ public final class TransformerManager {
    * 中的版本。因此规则必须注册到 Bootstrap CL 的 AdviceDispatcher 中。
    *
    * @param rule 增强规则
+   * @param captureConfig 预解析的采集配置
    */
-  private static void registerRuleToBootstrapCl(InstrumentationRule rule) {
+  private static void registerRuleToBootstrapCl(
+      InstrumentationRule rule, CaptureConfig captureConfig) {
     try {
-      // 缓存反射方法引用
+      Object bootstrapRule = rebuildRuleInBootstrapCl(rule);
+
+      // 统一走双参数注册，无采集配置时传 null
       if (bootstrapRegisterRule == null) {
         Class<?> bootstrapDispatcher = Class.forName(
             AdviceDispatcher.class.getName(), true, null);
         Class<?> bootstrapRuleClass = Class.forName(
             InstrumentationRule.class.getName(), true, null);
+        Class<?> bootstrapCaptureConfigClass = Class.forName(
+            CaptureConfig.class.getName(), true, null);
         bootstrapRegisterRule = bootstrapDispatcher.getDeclaredMethod(
-            "registerRule", bootstrapRuleClass);
+            "registerRule", bootstrapRuleClass, bootstrapCaptureConfigClass);
         bootstrapRegisterRule.setAccessible(true);
       }
 
-      // 将 Agent CL 中的 InstrumentationRule 序列化为 Bootstrap CL 中的版本
-      // 由于两者是不同的类，不能直接传递，需要通过 Builder 重建
-      Object bootstrapRule = rebuildRuleInBootstrapCl(rule);
-      bootstrapRegisterRule.invoke(null, bootstrapRule);
+      Object bootstrapCaptureConfig =
+          (captureConfig != null && captureConfig.hasCaptureConfig())
+              ? rebuildCaptureConfigInBootstrapCl(captureConfig)
+              : null;
+      bootstrapRegisterRule.invoke(null, bootstrapRule, bootstrapCaptureConfig);
 
       logger.log(Level.FINE,
-          "[TRANSFORMER-MANAGER] Registered rule to Bootstrap CL AdviceDispatcher: {0}",
-          rule.getRuleId());
+          "[TRANSFORMER-MANAGER] Registered rule to Bootstrap CL AdviceDispatcher: {0}, "
+              + "captureConfig: {1}",
+          new Object[] {rule.getRuleId(), captureConfig});
     } catch (Exception e) {
       logger.log(Level.SEVERE,
           "[TRANSFORMER-MANAGER] Failed to register rule to Bootstrap CL: "
@@ -532,6 +732,38 @@ public final class TransformerManager {
   }
 
   /**
+   * 在 Bootstrap CL 中重建 CaptureConfig 对象
+   *
+   * <p>Agent CL 中的 {@link CaptureConfig} 和 Bootstrap CL 中的同名类是不同的类，
+   * 不能直接传递。通过反射调用 Bootstrap CL 中的 {@code CaptureConfig.resolve()} 来重建。
+   *
+   * <p>由于 CaptureConfig 是不可变对象且已预解析完成，这里使用 config Map 和 resolve
+   * 方法重新构建 Bootstrap CL 版本，但此时不需要 Method 参数，因为预解析阶段已经将
+   * 参数名解析为索引。因此直接通过 create 静态工厂方法传入预解析的数据。
+   *
+   * @param captureConfig Agent CL 中已预解析的 CaptureConfig
+   * @return Bootstrap CL 中的 CaptureConfig 对象
+   */
+  private static Object rebuildCaptureConfigInBootstrapCl(CaptureConfig captureConfig)
+      throws Exception {
+    Class<?> bootstrapCaptureConfigClass = Class.forName(
+        CaptureConfig.class.getName(), true, null);
+
+    // 使用 createResolved 静态工厂方法重建
+    Method createResolved = bootstrapCaptureConfigClass.getDeclaredMethod(
+        "createResolved",
+        int[].class, String[].class, boolean.class, String[].class, int.class);
+    createResolved.setAccessible(true);
+
+    return createResolved.invoke(null,
+        captureConfig.getArgIndices(),
+        captureConfig.getArgNames(),
+        captureConfig.isCaptureReturn(),
+        captureConfig.getReturnFields(),
+        captureConfig.getMaxLength());
+  }
+
+  /**
    * 通过反射获取 Bootstrap CL 中的 InstrumentationType 枚举值
    *
    * @param typeValue 类型字符串值（如 "trace"）
@@ -585,22 +817,31 @@ public final class TransformerManager {
     private final boolean success;
     @Nullable private final String errorCode;
     @Nullable private final String errorMessage;
+    @Nullable private final List<String> warnings;
 
+    @SuppressWarnings("BooleanParameter")
     private EnhancementResult(String ruleId, boolean success,
-        @Nullable String errorCode, @Nullable String errorMessage) {
+        @Nullable String errorCode, @Nullable String errorMessage,
+        @Nullable List<String> warnings) {
       this.ruleId = ruleId;
       this.success = success;
       this.errorCode = errorCode;
       this.errorMessage = errorMessage;
+      this.warnings = warnings;
     }
 
     public static EnhancementResult success(String ruleId) {
-      return new EnhancementResult(ruleId, /* success= */ true, null, null);
+      return new EnhancementResult(ruleId, /* success= */ true, null, null, null);
+    }
+
+    public static EnhancementResult successWithWarnings(String ruleId, List<String> warnings) {
+      return new EnhancementResult(ruleId, /* success= */ true, null, null,
+          Collections.unmodifiableList(new ArrayList<>(warnings)));
     }
 
     public static EnhancementResult failed(
         String ruleId, String errorCode, @Nullable String errorMessage) {
-      return new EnhancementResult(ruleId, /* success= */ false, errorCode, errorMessage);
+      return new EnhancementResult(ruleId, /* success= */ false, errorCode, errorMessage, null);
     }
 
     public String getRuleId() {
@@ -621,13 +862,109 @@ public final class TransformerManager {
       return errorMessage;
     }
 
+    /**
+     * 获取警告列表（成功但存在注意事项时不为空）
+     *
+     * <p>典型场景：增强成功但无法解析目标方法用于 capture 通配符展开，
+     * 此时 ByteBuddy 层面的增强是成功的，但 capture_args/capture_return 的 '*' 通配符
+     * 无法展开为具体参数列表。
+     *
+     * @return 警告列表，无警告时返回 null
+     */
+    @Nullable
+    public List<String> getWarnings() {
+      return warnings;
+    }
+
+    /**
+     * 是否存在警告
+     */
+    public boolean hasWarnings() {
+      return warnings != null && !warnings.isEmpty();
+    }
+
     @Override
     public String toString() {
       if (success) {
+        if (hasWarnings()) {
+          return "EnhancementResult{ruleId='" + ruleId + "', success=true"
+              + ", warnings=" + warnings + "}";
+        }
         return "EnhancementResult{ruleId='" + ruleId + "', success=true}";
       }
       return "EnhancementResult{ruleId='" + ruleId + "', success=false"
           + ", errorCode='" + errorCode + "', errorMessage='" + errorMessage + "'}";
+    }
+  }
+
+  /**
+   * 方法匹配结果，包含匹配到的 Method 或详细的失败原因
+   *
+   * <p>用于 {@link #findTargetMethodWithReason} 返回，替代之前返回 {@code @Nullable Method}
+   * 的方式，提供对用户友好的失败诊断信息。
+   */
+  private static final class MethodMatchResult {
+    @Nullable private final Method method;
+    @Nullable private final String failureReason;
+
+    private MethodMatchResult(@Nullable Method method, @Nullable String failureReason) {
+      this.method = method;
+      this.failureReason = failureReason;
+    }
+
+    /** 匹配成功 */
+    static MethodMatchResult success(Method method) {
+      return new MethodMatchResult(method, null);
+    }
+
+    /** 方法名在目标类中不存在 */
+    static MethodMatchResult methodNotFound(String simpleClassName, String methodName) {
+      return new MethodMatchResult(null,
+          "No method named '" + methodName + "' found in class " + simpleClassName
+              + ". Wildcard '*' capture_args/capture_return cannot be resolved.");
+    }
+
+    /** 存在多个重载，未指定 parameter_types 无法确定唯一目标 */
+    static MethodMatchResult ambiguousOverloads(
+        String simpleClassName, String methodName, int count, String signatures) {
+      return new MethodMatchResult(null,
+          "Multiple overloads found for " + simpleClassName + "." + methodName
+              + " (" + count + " candidates: " + signatures
+              + "). Specify 'parameter_types' to disambiguate."
+              + " Wildcard '*' capture_args cannot be resolved to parameter names.");
+    }
+
+    /** 指定了 parameter_types 但没有匹配到 */
+    static MethodMatchResult parameterTypesMismatch(
+        String simpleClassName, String methodName,
+        List<String> parameterTypes, String availableSignatures) {
+      return new MethodMatchResult(null,
+          "No method matches parameter_types=" + parameterTypes
+              + " for " + simpleClassName + "." + methodName
+              + ". Available: " + availableSignatures
+              + ". Tip: generic types are erased at runtime, use actual types like 'Object'.");
+    }
+
+    /** 反射异常 */
+    static MethodMatchResult error(
+        String simpleClassName, String methodName, String errorMessage) {
+      return new MethodMatchResult(null,
+          "Error finding method '" + methodName + "' in class " + simpleClassName
+              + ": " + errorMessage);
+    }
+
+    boolean isSuccess() {
+      return method != null;
+    }
+
+    @Nullable
+    Method getMethod() {
+      return method;
+    }
+
+    @Nullable
+    String getFailureReason() {
+      return failureReason;
     }
   }
 }

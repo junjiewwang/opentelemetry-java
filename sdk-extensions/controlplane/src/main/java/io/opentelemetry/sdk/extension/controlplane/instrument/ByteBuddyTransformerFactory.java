@@ -129,19 +129,53 @@ final class ByteBuddyTransformerFactory {
         @Nullable JavaModule module,
         @Nullable java.security.ProtectionDomain protectionDomain) {
 
+      // 根据是否配置了参数/返回值采集，选择不同的 Advice 模板
+      // 注意：直接检查原始 config Map 而非 CaptureConfig.parse()，因为 parse() 在无
+      // targetMethod 时无法正确解析通配符 '*'，会误判为无采集配置
+      boolean captureEnabled = hasCaptureKeys(rule.getConfig());
+      Class<?> adviceClass = captureEnabled
+          ? DynamicByteBuddyCaptureAdvice.class
+          : DynamicByteBuddyAdvice.class;
+
       logger.log(Level.INFO,
-          "[BYTEBUDDY-FACTORY] Applying advice to: {0}, method: {1}, type: {2}",
+          "[BYTEBUDDY-FACTORY] Applying advice to: {0}, method: {1}, type: {2}, "
+              + "captureEnabled: {3}, adviceClass: {4}",
           new Object[] {
-            typeDescription.getName(), rule.getMethodName(), rule.getType().getValue()
+            typeDescription.getName(), rule.getMethodName(), rule.getType().getValue(),
+            captureEnabled, adviceClass.getSimpleName()
           });
 
       return builder.visit(
           Advice.withCustomMapping()
               .bind(RuleId.class, rule.getRuleId())
               .bind(TypeValue.class, rule.getType().getValue())
-              .to(DynamicByteBuddyAdvice.class)
+              .to(adviceClass)
               .on(methodMatcher));
     }
+  }
+
+  /**
+   * 检查配置 Map 中是否包含 capture_args 或 capture_return 配置项
+   *
+   * <p>直接检查原始配置字符串，避免依赖 CaptureConfig.parse() 的解析结果（
+   * 因为 parse() 在无 Method 时无法正确处理通配符 '*'）。
+   *
+   * <p>capture_return 的判断：非空且非 "false" 即表示需要采集（支持 "*"、"id,name" 等值）。
+   *
+   * @param config 规则配置 Map
+   * @return 是否配置了采集功能
+   */
+  private static boolean hasCaptureKeys(java.util.Map<String, String> config) {
+    if (config == null || config.isEmpty()) {
+      return false;
+    }
+    String captureArgs = config.get(CaptureConfig.KEY_CAPTURE_ARGS);
+    String captureReturn = config.get(CaptureConfig.KEY_CAPTURE_RETURN);
+    boolean hasArgs = captureArgs != null && !captureArgs.trim().isEmpty();
+    boolean hasReturn = captureReturn != null
+        && !captureReturn.trim().isEmpty()
+        && !"false".equalsIgnoreCase(captureReturn.trim());
+    return hasArgs || hasReturn;
   }
 
   /**

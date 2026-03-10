@@ -85,6 +85,12 @@ final class BootstrapClassInjector {
       // DynamicMetricAdvice 的 private 内部类（字符串方式引用避免编译限制）
       DynamicMetricAdvice.class.getName() + "$MetricInstruments",
       DynamicLogAdvice.class.getName(),
+      // 参数/返回值采集相关类（被 DynamicByteBuddyCaptureAdvice 引用）
+      DynamicByteBuddyCaptureAdvice.class.getName(),
+      CaptureConfig.class.getName(),
+      // CaptureConfig 的 private 内部类（字符串方式引用避免编译限制）
+      CaptureConfig.class.getName() + "$CaptureArgsResult",
+      CaptureProcessor.class.getName(),
       // 规则模型（被各 Advice 类引用）
       InstrumentationRule.class.getName(),
       InstrumentationRule.Builder.class.getName(),

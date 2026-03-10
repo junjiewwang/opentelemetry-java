@@ -86,6 +86,9 @@ sequenceDiagram
 | `method_descriptor` | ❌ | JVM 方法描述符（高级，优先级高于 `parameter_types`），如 `(Ljava/lang/String;I)V` |
 | `span_name` | ❌ | 自定义 Span 名称，仅 TRACE 类型有效 |
 | `config.force` | ❌ | 是否强制增强（忽略冲突检测） |
+| `config.capture_args` | ❌ | 要采集的方法参数。支持三种指定方式：按索引（`"0,2"`）、按参数名（`"userId,requestType"`）、全部参数（`"*"`）。按参数名需要目标类以 `-parameters` 编译。仅 TRACE 类型有效 |
+| `config.capture_return` | ❌ | 采集方法返回值。`"*"` 采集 toString()；`"id,name"` 仅提取指定字段（不采集 toString()）；不传或 `"false"` 不采集。仅 TRACE 类型有效 |
+| `config.capture_max_length` | ❌ | 值序列化最大字符数，超过则截断。默认 `256` |
 
 ---
 
@@ -139,10 +142,24 @@ sequenceDiagram
 | TC-06 | Service 层方法增强 | `dynamic_instrument` | `UserInfoService` | `mockBatched` | trace | ❌ 无 | Span 层级（Controller→Service→Redis/JDBC） | ✅ active |
 | TC-07 | 异常场景方法增强 | `dynamic_instrument` | `UserBusinessService` | `checkNotificationServiceHealth` | trace | ❌ 无 | 异常被 catch 时 Span 状态 | ✅ active |
 
-### 4.2 异常场景
+### 4.2 参数/返回值采集场景
+
+| # | 用例名称 | task_type_name | 目标类 | 目标方法 | 采集配置 | 验证重点 | 预期 |
+|---|---------|---------------|--------|---------|---------|---------|------|
+| TC-14 | 按索引采集参数 | `dynamic_instrument` | `UserController` | `getUser` | `capture_args: "0"` | Span 包含 `code.function.args.0` | ✅ active |
+| TC-15 | 按参数名采集参数 | `dynamic_instrument` | `UserController` | `getUser` | `capture_args: "id"` | Span 包含 `code.function.args.id` | ✅ active |
+| TC-16 | 全部参数采集 | `dynamic_instrument` | `UserController` | `updateUser` | `capture_args: "*"` | 所有参数都出现在 Span Attribute | ✅ active |
+| TC-17 | 仅返回值采集 | `dynamic_instrument` | `UserBusinessService` | `handleUserLogin` | `capture_return: "*"` | Span 包含 `code.function.return` | ✅ active |
+| TC-18 | 返回值字段提取 | `dynamic_instrument` | `UserInfoService` | `getById` | `capture_return: "id,name"` | Span 包含 `code.function.return.id` 和 `.name`（不含 `code.function.return`） | ✅ active |
+| TC-19 | 参数+返回值组合采集 | `dynamic_instrument` | `UserController` | `getUser` | `capture_args: "0"`, `capture_return: "*"` | 参数和返回值都出现在 Span Attribute | ✅ active |
+| TC-20 | 值截断（max_length） | `dynamic_instrument` | `UserBusinessService` | `handleUserLogin` | `capture_args: "*"`, `capture_max_length: "10"` | 超长值被截断并附加 `...(truncated)` | ✅ active |
+| TC-21 | 异常时参数采集不丢失 | `dynamic_instrument` | `UserBusinessService` | `checkNotificationServiceHealth` | `capture_args: "*"`, `capture_return: "*"` | 异常时参数 Attribute 仍存在，return 为空 | ✅ active |
+| TC-22 | 无采集配置走轻量 Advice | `dynamic_instrument` | `UserBusinessService` | `handleUserLogin` | 无 `capture_*` | 使用 `DynamicByteBuddyAdvice`（无 @AllArguments 开销） | ✅ active |
+
+### 4.3 异常场景
 
 | # | 用例名称 | task_type_name | 异常类型 | 验证重点 | 预期错误码 |
-|---|---------|---------------|---------|---------|-----------|
+|---|---------|---------------|---------|---------|----------|
 | TC-08 | 不存在的类 | `dynamic_instrument` | 类找不到 | 返回明确错误信息 | `CLASS_NOT_FOUND` |
 | TC-09 | 重复 ruleId | `dynamic_instrument` | 规则已存在 | 返回 ruleId 重复错误 | `ALREADY_APPLIED` |
 | TC-10 | 重复目标方法（不同 ruleId） | `dynamic_instrument` | 同一 class+method 被不同规则增强 | 返回目标重复错误 | `DUPLICATE_TARGET` |
@@ -517,6 +534,289 @@ sequenceDiagram
 
 ---
 
+### TC-14：按索引采集参数 — `UserController.getUser(Long id)`
+
+**为什么选这个方法**：`getUser` 有明确的参数（`@PathVariable Long id`），适合验证按索引采集。虽然 Controller 方法会被 Agent 增强产生 HTTP Span，但动态增强的 Span 是独立的子 Span，参数采集 Attribute 附着在动态 Span 上不冲突。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-idx-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-idx-getUser\",\"class_name\":\"com.tencent.cloudmonitor.userservice.interfaces.web.UserController\",\"method_name\":\"getUser\",\"type\":\"trace\",\"config.capture_args\":\"0\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功，日志输出 `captureEnabled: true, adviceClass: DynamicByteBuddyCaptureAdvice` |
+| 2 | 调用 `GET /user/42` | 方法正常返回 |
+| 3 | 检查动态 Span Attribute | `code.function.args.0 = "42"` |
+| 4 | 验证 Attribute key 格式 | key 是 `code.function.args.0`（用索引，非参数名） |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-idx-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-idx-getUser\"}"}
+```
+
+---
+
+### TC-15：按参数名采集参数 — `UserController.getUser(Long id)`
+
+**前置条件**：目标类需以 `-parameters` 编译（大部分 Spring Boot 项目默认启用）。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-name-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-name-getUser\",\"class_name\":\"com.tencent.cloudmonitor.userservice.interfaces.web.UserController\",\"method_name\":\"getUser\",\"type\":\"trace\",\"config.capture_args\":\"id\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功 |
+| 2 | 调用 `GET /user/42` | 方法正常返回 |
+| 3 | 检查动态 Span Attribute | `code.function.args.id = "42"` |
+| 4 | 验证 Attribute key 格式 | key 是 `code.function.args.id`（用参数名，非索引） |
+| 5 | **对比 TC-14** | TC-14 key 是 `.args.0`，TC-15 key 是 `.args.id`，值相同 |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-name-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-name-getUser\"}"}
+```
+
+---
+
+### TC-16：全部参数采集 — `UserController.updateUser(Long id, UserInfo userInfo)`
+
+**为什么选这个方法**：`updateUser` 有 2 个参数（id + UserInfo），适合验证 `*` 通配符能否采集全部。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-all-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-all-update\",\"class_name\":\"com.tencent.cloudmonitor.userservice.interfaces.web.UserController\",\"method_name\":\"updateUser\",\"type\":\"trace\",\"config.capture_args\":\"*\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功 |
+| 2 | 调用 `PUT /user/42` 并携带 JSON body | 方法正常返回 |
+| 3 | 检查动态 Span Attribute | 应包含所有参数：`code.function.args.id = "42"` 和 `code.function.args.userInfo = "UserInfo{...}"` 或 `code.function.args.0 = "42"`, `code.function.args.1 = "UserInfo{...}"` |
+| 4 | 验证参数数量 | Attribute 数量应与方法参数数量一致 |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-all-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-all-update\"}"}
+```
+
+---
+
+### TC-17：仅返回值采集 — `UserBusinessService.handleUserLogin()`
+
+**为什么选这个方法**：普通 Service 方法，无 Agent 冲突，且有返回值。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-ret-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-ret-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\",\"config.capture_return\":\"*\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功 |
+| 2 | 触发 `handleUserLogin` | 方法正常返回 |
+| 3 | 检查 Span Attribute | `code.function.return = "<返回值的 toString() 结果>"` |
+| 4 | 验证无参数 Attribute | 不应出现 `code.function.args.*` |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-ret-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-ret-login\"}"}
+```
+
+---
+
+### TC-18：返回值字段提取 — `UserInfoService.getById(Serializable id)`
+
+**为什么选这个方法**：`getById` 返回 `UserInfo` 对象，有 `id`、`name` 等字段，适合验证 `capture_return` 字段提取功能。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-fields-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-fields-getById\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"getById\",\"type\":\"trace\",\"config.capture_return\":\"id,name\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功 |
+| 2 | 调用 `GET /user/1`（触发 `getById`） | 方法正常返回 UserInfo |
+| 3 | 检查字段提取 | `code.function.return.id = "1"` |
+| 4 | 检查字段提取 | `code.function.return.name = "<用户名>"` |
+| 5 | 验证无 toString() | **不应**出现 `code.function.return` Attribute（指定字段时仅提取字段） |
+| 6 | 返回 null（如 id 不存在） | `code.function.return.*` 不应出现（returnValue 为 null 时不采集） |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-fields-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-fields-getById\"}"}
+```
+
+---
+
+### TC-19：参数+返回值组合采集 — `UserController.getUser(Long id)`
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-combo-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-combo-getUser\",\"class_name\":\"com.tencent.cloudmonitor.userservice.interfaces.web.UserController\",\"method_name\":\"getUser\",\"type\":\"trace\",\"config.capture_args\":\"0\",\"config.capture_return\":\"*\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功 |
+| 2 | 调用 `GET /user/42` | 方法正常返回 |
+| 3 | 检查参数 Attribute | `code.function.args.0 = "42"` |
+| 4 | 检查返回值 Attribute | `code.function.return = "<ResponseEntity 的 toString>"` |
+| 5 | 验证两者共存 | 参数和返回值 Attribute 同时存在于同一个 Span 中 |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-combo-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-combo-getUser\"}"}
+```
+
+---
+
+### TC-20：值截断（capture_max_length） — `UserBusinessService.handleUserLogin()`
+
+**验证目标**：当参数或返回值的 `toString()` 超过 `capture_max_length` 指定的长度时，应被截断并附加 `...(truncated)` 后缀。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-trunc-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-trunc-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\",\"config.capture_args\":\"*\",\"config.capture_return\":\"*\",\"config.capture_max_length\":\"10\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | 成功 |
+| 2 | 触发方法调用（确保参数/返回值 toString 超过 10 字符） | 方法正常返回 |
+| 3 | 检查 Span Attribute 值 | 值长度不超过 10 字符 + `...(truncated)` 后缀 |
+| 4 | 示例 | 如原始值为 `"UserInfo{id=1, name=John}"` → 应被截断为 `"UserInfo{i...(truncated)"` |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-trunc-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-trunc-login\"}"}
+```
+
+---
+
+### TC-21：异常时参数采集不丢失 — `UserBusinessService.checkNotificationServiceHealth()`
+
+**验证目标**：当目标方法抛出异常时，在 enter 阶段采集的参数 Attribute 应仍然存在于 Span 中，同时 Span 应正确记录异常信息。
+
+**前置条件**：确保 NotificationService 不可达，使方法抛出异常或内部 catch。
+
+**下发增强任务：**
+```json
+{
+  "task_id": "test-capture-err-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-capture-err-health\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"checkNotificationServiceHealth\",\"type\":\"trace\",\"config.capture_args\":\"*\",\"config.capture_return\":\"*\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 确保 NotificationService 不可达 | — |
+| 2 | 触发 `checkNotificationServiceHealth` | 方法内部 catch 异常或直接抛出 |
+| 3 | 检查参数 Attribute | 如果有参数，`code.function.args.*` **仍然存在**（enter 阶段已采集） |
+| 4 | 如果方法抛出异常 | `code.function.return` **不存在**（returnValue 为 null），但 Span `status=ERROR` + `exception` 事件已记录 |
+| 5 | 如果方法 catch 后正常返回 | `code.function.return = "false"`，Span `status=OK` |
+| 6 | 验证业务方法行为 | 异常原样传播给调用方（`@Advice.Thrown` 只读，不吞异常） |
+
+**还原任务：**
+```json
+{"task_id":"test-capture-err-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-capture-err-health\"}"}
+```
+
+---
+
+### TC-22：无采集配置走轻量 Advice — 对比验证
+
+**验证目标**：未配置 `capture_*` 参数时，系统应使用轻量级 `DynamicByteBuddyAdvice`（无 `@AllArguments` 参数数组创建开销）。这是「方案 B 零开销设计」的核心验证点。
+
+**下发增强任务（无 capture 配置）：**
+```json
+{
+  "task_id": "test-no-capture-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-no-capture-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发增强任务 | Agent 日志输出 `captureEnabled: false, adviceClass: DynamicByteBuddyAdvice` |
+| 2 | 触发 `handleUserLogin` | 正常产生动态 Span |
+| 3 | 检查 Span Attribute | **不应**出现 `code.function.args.*` 或 `code.function.return` |
+| 4 | 验证 Advice 选择 | 日志中 `adviceClass` 为 `DynamicByteBuddyAdvice`，而非 `DynamicByteBuddyCaptureAdvice` |
+
+**对比测试：下发带 capture 配置的任务（先还原上面的规则）：**
+```json
+{
+  "task_id": "test-with-capture-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-with-capture-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\",\"config.capture_args\":\"*\"}"
+}
+```
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 5 | 还原前一规则，下发带 capture 的任务 | 日志输出 `captureEnabled: true, adviceClass: DynamicByteBuddyCaptureAdvice` |
+| 6 | 触发 `handleUserLogin` | Span 包含 `code.function.args.*` Attribute |
+| 7 | 验证 Advice 选择 | 日志中 `adviceClass` 为 `DynamicByteBuddyCaptureAdvice` |
+
+**还原任务：**
+```json
+{"task_id":"test-no-capture-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-no-capture-login\"}"}
+{"task_id":"test-with-capture-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"rule-with-capture-login\"}"}
+```
+
+---
+
 ## 六、推荐测试执行顺序
 
 ```mermaid
@@ -546,6 +846,18 @@ graph LR
 
     subgraph "Phase 5: 重载匹配"
         TC12 --> TC13[TC-13 parameter_types]
+    end
+
+    subgraph "Phase 6: 参数/返回值采集"
+        TC13 --> TC14[TC-14 按索引采集]
+        TC14 --> TC15[TC-15 按参数名采集]
+        TC15 --> TC16[TC-16 全部参数]
+        TC16 --> TC17[TC-17 仅返回值]
+        TC17 --> TC18[TC-18 返回值字段提取]
+        TC18 --> TC19[TC-19 参数+返回值组合]
+        TC19 --> TC20[TC-20 值截断]
+        TC20 --> TC21[TC-21 异常时采集不丢失]
+        TC21 --> TC22[TC-22 零开销对比]
     end
 ```
 
@@ -615,9 +927,75 @@ TaskExecutionResult result = future.get(10, TimeUnit.SECONDS);
 assertTrue(result.isSuccess());
 ```
 
+**带参数/返回值采集的编程式测试示例：**
+
+```java
+Map<String, Object> params = new HashMap<>();
+params.put("rule_id", "rule-capture-getUser");
+params.put("class_name", "com.tencent.cloudmonitor.userservice.interfaces.web.UserController");
+params.put("method_name", "getUser");
+params.put("type", "trace");
+// 以 "config." 前缀的 key 会被解析到 InstrumentationRule.config Map 中
+params.put("config.capture_args", "0");            // 按索引采集第0个参数
+// params.put("config.capture_args", "id");         // 或按参数名采集（需 -parameters 编译）
+// params.put("config.capture_args", "*");           // 或采集全部参数
+params.put("config.capture_return", "id,name");     // 仅提取返回值的 id、name 字段（"*" 采集 toString()）
+params.put("config.capture_max_length", "256");     // 值序列化最大长度（可选，默认 256）
+
+TaskExecutionContext context = TaskExecutionContext.builder()
+    .taskId("task-capture-001")
+    .taskType("dynamic_instrument")
+    .parameters(params)
+    .parametersJson(JsonUtils.toJson(params))
+    .timeoutMillis(30000)
+    .build();
+
+CompletableFuture<TaskExecutionResult> future = executor.execute(context);
+TaskExecutionResult result = future.get(10, TimeUnit.SECONDS);
+assertTrue(result.isSuccess());
+
+// 调用目标方法后，检查 Span 应包含以下 Attribute：
+// code.function.args.0 = "42"              （或 code.function.args.id = "42"）
+// code.function.return.id = "42"            （指定字段名时仅提取字段，不含 toString()）
+// code.function.return.name = "John"
+```
+
 ---
 
-## 八、测试结果记录表
+## 八、`capture_*` 配置参数参考
+
+### 8.1 配置项一览
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `config.capture_args` | String | 不采集 | 要采集的参数。`"0,2"` 按索引、`"userId"` 按参数名、`"*"` 全部参数。可混合使用如 `"0,requestType"` |
+| `config.capture_return` | String | 不采集 | 采集返回值。`"*"` 采集 toString()；`"id,name"` 仅提取指定字段（不采集 toString()，通过反射：getter → isGetter → 同名方法 → public field → declared field）；不传或 `"false"` 不采集 |
+| `config.capture_max_length` | String | `"256"` | 值序列化最大字符数，超过截断并附加 `...(truncated)` |
+
+### 8.2 生成的 Span Attribute 命名规范
+
+| Attribute Key | 说明 | 示例 |
+|---------------|------|------|
+| `code.function.args.<索引>` | 按索引采集时 | `code.function.args.0 = "42"` |
+| `code.function.args.<参数名>` | 按参数名采集时 | `code.function.args.userId = "42"` |
+| `code.function.return` | 返回值的 toString() | `code.function.return = "UserInfo{id=42}"` |
+| `code.function.return.<字段名>` | 返回值指定字段 | `code.function.return.id = "42"` |
+
+### 8.3 安全保护机制
+
+| 场景 | 行为 |
+|------|------|
+| 参数为 null | Attribute 值为 `"null"` |
+| toString() 抛异常 | Attribute 值为 `"<error:ExceptionType>"` |
+| 值超过 max_length | 截断 + `"...(truncated)"` |
+| 返回值为 null | 不生成 `code.function.return` Attribute |
+| 字段不存在 | 跳过该字段，不影响其他采集 |
+| 参数名不可用（未以 -parameters 编译） | 日志警告，建议改用索引方式 |
+| Advice 自身异常 | `suppress = Throwable.class`，不影响目标方法 |
+
+---
+
+## 九、测试结果记录表
 
 | # | 用例 | 执行日期 | 测试人 | 结果 | 备注 |
 |---|------|---------|--------|------|------|
@@ -634,3 +1012,12 @@ assertTrue(result.isSuccess());
 | TC-11 | 无效增强类型 | | | ⬜ 待测 | |
 | TC-12 | 还原不存在规则 | | | ⬜ 待测 | |
 | TC-13 | 重载方法精确匹配 | | | ⬜ 待测 | |
+| TC-14 | 按索引采集参数 | | | ⬜ 待测 | |
+| TC-15 | 按参数名采集参数 | | | ⬜ 待测 | 需 `-parameters` 编译 |
+| TC-16 | 全部参数采集 | | | ⬜ 待测 | |
+| TC-17 | 仅返回值采集 | | | ⬜ 待测 | |
+| TC-18 | 返回值字段提取 | | | ⬜ 待测 | |
+| TC-19 | 参数+返回值组合采集 | | | ⬜ 待测 | |
+| TC-20 | 值截断（max_length） | | | ⬜ 待测 | |
+| TC-21 | 异常时参数采集不丢失 | | | ⬜ 待测 | |
+| TC-22 | 无采集配置走轻量 Advice | | | ⬜ 待测 | 零开销对比 |
