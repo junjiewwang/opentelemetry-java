@@ -6,6 +6,7 @@
 package io.opentelemetry.sdk.extension.controlplane.instrument;
 
 import java.lang.instrument.ClassFileTransformer;
+import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -76,10 +77,14 @@ final class ByteBuddyTransformerFactory {
     net.bytebuddy.matcher.ElementMatcher.Junction<MethodDescription> methodMatcher =
         ElementMatchers.named(rule.getMethodName());
 
-    // 如果指定了方法描述符，添加精确匹配
+    // 如果指定了方法描述符（JVM 格式），优先使用精确匹配
     if (rule.getMethodDescriptor() != null) {
       methodMatcher = methodMatcher.and(
           ElementMatchers.hasDescriptor(rule.getMethodDescriptor()));
+    } else if (rule.getParameterTypes() != null) {
+      // 使用参数类型列表匹配（Java 风格，用户友好）
+      methodMatcher = methodMatcher.and(
+          buildParameterTypesMatcher(rule.getParameterTypes()));
     }
 
     // 使用 AgentBuilder 创建 Transformer
@@ -136,6 +141,86 @@ final class ByteBuddyTransformerFactory {
               .bind(TypeValue.class, rule.getType().getValue())
               .to(DynamicByteBuddyAdvice.class)
               .on(methodMatcher));
+    }
+  }
+
+  /**
+   * 构建基于参数类型列表的方法匹配器
+   *
+   * <p>支持两种匹配模式：
+   * <ul>
+   *   <li><b>简单类名（尾部匹配）</b>：如 "String" 匹配 "java.lang.String"、"Wrapper" 匹配
+   *       "com.baomidou.mybatisplus.core.conditions.Wrapper"</li>
+   *   <li><b>全限定名（精确匹配）</b>：如 "java.lang.String" 精确匹配</li>
+   * </ul>
+   *
+   * <p>Java 基本类型名（int, long, boolean 等）自动转换为对应的全限定名。
+   *
+   * @param parameterTypes 参数类型列表，空列表匹配无参方法
+   * @return 方法匹配器
+   */
+  private static net.bytebuddy.matcher.ElementMatcher.Junction<MethodDescription>
+      buildParameterTypesMatcher(List<String> parameterTypes) {
+    // 先匹配参数个数
+    net.bytebuddy.matcher.ElementMatcher.Junction<MethodDescription> matcher =
+        ElementMatchers.takesArguments(parameterTypes.size());
+
+    // 逐个参数位置匹配类型名
+    for (int i = 0; i < parameterTypes.size(); i++) {
+      String typeName = parameterTypes.get(i);
+      int index = i;
+
+      if (typeName.contains(".")) {
+        // 全限定名 → 精确匹配
+        matcher = matcher.and(
+            ElementMatchers.takesArgument(index,
+                ElementMatchers.named(typeName)));
+      } else {
+        // 简单类名 → 尾部匹配（支持基本类型和简短类名）
+        String resolvedName = resolvePrimitiveType(typeName);
+        if (resolvedName != null) {
+          // 基本类型精确匹配
+          matcher = matcher.and(
+              ElementMatchers.takesArgument(index,
+                  ElementMatchers.named(resolvedName)));
+        } else {
+          // 简单类名尾部匹配：类全限定名以 ".TypeName" 结尾 或等于 "TypeName"
+          String suffix = "." + typeName;
+          matcher = matcher.and(
+              ElementMatchers.takesArgument(index,
+                  new net.bytebuddy.matcher.ElementMatcher<TypeDescription>() {
+                    @Override
+                    public boolean matches(TypeDescription target) {
+                      String fullName = target.getName();
+                      return fullName.endsWith(suffix) || fullName.equals(typeName);
+                    }
+                  }));
+        }
+      }
+    }
+
+    return matcher;
+  }
+
+  /**
+   * 将 Java 基本类型名解析为 JVM 内部类型名
+   *
+   * @param typeName 类型名
+   * @return JVM 类型全限定名，非基本类型返回 null
+   */
+  @Nullable
+  private static String resolvePrimitiveType(String typeName) {
+    switch (typeName) {
+      case "int":     return "int";
+      case "long":    return "long";
+      case "boolean": return "boolean";
+      case "double":  return "double";
+      case "float":   return "float";
+      case "short":   return "short";
+      case "byte":    return "byte";
+      case "char":    return "char";
+      case "void":    return "void";
+      default:        return null;
     }
   }
 

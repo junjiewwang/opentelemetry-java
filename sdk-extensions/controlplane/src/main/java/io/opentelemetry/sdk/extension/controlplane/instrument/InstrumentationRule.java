@@ -7,6 +7,7 @@ package io.opentelemetry.sdk.extension.controlplane.instrument;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -30,6 +31,7 @@ public final class InstrumentationRule {
   private final String className;
   private final String methodName;
   @Nullable private final String methodDescriptor;
+  @Nullable private final List<String> parameterTypes;
   private final InstrumentationType type;
   private final Map<String, String> config;
   @Nullable private final String spanName;
@@ -39,6 +41,8 @@ public final class InstrumentationRule {
     this.className = Objects.requireNonNull(builder.className, "className is required");
     this.methodName = Objects.requireNonNull(builder.methodName, "methodName is required");
     this.methodDescriptor = builder.methodDescriptor;
+    this.parameterTypes = builder.parameterTypes != null
+        ? Collections.unmodifiableList(builder.parameterTypes) : null;
     this.type = Objects.requireNonNull(builder.type, "type is required");
     this.config = Collections.unmodifiableMap(new HashMap<>(builder.config));
     this.spanName = builder.spanName;
@@ -59,10 +63,24 @@ public final class InstrumentationRule {
     return methodName;
   }
 
-  /** 获取方法描述符（可选，用于精确匹配重载方法） */
+  /** 获取方法描述符（可选，用于精确匹配重载方法，JVM 格式） */
   @Nullable
   public String getMethodDescriptor() {
     return methodDescriptor;
+  }
+
+  /**
+   * 获取参数类型列表（可选，用于匹配重载方法，Java 风格）
+   *
+   * <p>支持简单类名尾部匹配（如 "String" 匹配 "java.lang.String"）
+   * 和全限定名精确匹配。空列表（size=0）表示匹配无参方法。
+   * null 表示不指定（匹配所有同名方法）。
+   *
+   * <p>优先级：{@code methodDescriptor} > {@code parameterTypes} > 全部匹配。
+   */
+  @Nullable
+  public List<String> getParameterTypes() {
+    return parameterTypes;
   }
 
   /** 获取增强类型 */
@@ -127,11 +145,16 @@ public final class InstrumentationRule {
 
   @Override
   public String toString() {
+    String paramInfo = "";
+    if (methodDescriptor != null) {
+      paramInfo = "(" + methodDescriptor + ")";
+    } else if (parameterTypes != null) {
+      paramInfo = "(" + String.join(",", parameterTypes) + ")";
+    }
     return String.format(
         Locale.ROOT,
         "InstrumentationRule{ruleId='%s', type=%s, target='%s.%s'%s}",
-        ruleId, type.getValue(), className, methodName,
-        methodDescriptor != null ? "(" + methodDescriptor + ")" : "");
+        ruleId, type.getValue(), className, methodName, paramInfo);
   }
 
   // ===== Builder =====
@@ -145,6 +168,7 @@ public final class InstrumentationRule {
     @Nullable private String className;
     @Nullable private String methodName;
     @Nullable private String methodDescriptor;
+    @Nullable private List<String> parameterTypes;
     @Nullable private InstrumentationType type;
     private Map<String, String> config = new HashMap<>();
     @Nullable private String spanName;
@@ -171,6 +195,19 @@ public final class InstrumentationRule {
     public Builder methodDescriptor(String methodDescriptor) {
       this.methodDescriptor = methodDescriptor != null && !methodDescriptor.isEmpty()
           ? methodDescriptor : null;
+      return this;
+    }
+
+    /**
+     * 设置参数类型列表（Java 风格，用户友好）
+     *
+     * <p>支持简单类名（如 "String"）和全限定名（如 "java.lang.String"）。
+     * 空列表表示无参方法，null 表示不指定。
+     *
+     * @param parameterTypes 参数类型列表，null 表示不指定
+     */
+    public Builder parameterTypes(@Nullable List<String> parameterTypes) {
+      this.parameterTypes = parameterTypes;
       return this;
     }
 

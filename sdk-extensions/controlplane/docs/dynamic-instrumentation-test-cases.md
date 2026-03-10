@@ -82,7 +82,8 @@ sequenceDiagram
 | `class_name` | ✅ | 目标类全限定名 |
 | `method_name` | ✅ | 目标方法名 |
 | `type` | ✅ | 增强类型：`trace` / `metric` / `log` |
-| `method_descriptor` | ❌ | 方法描述符，精确匹配重载方法 |
+| `parameter_types` | ❌ | **Java 风格参数类型列表**（逗号分隔），用于匹配重载方法。支持简单类名（如 `String`）和全限定名（如 `java.lang.String`）。空字符串 `""` 匹配无参方法，不传则匹配所有同名方法 |
+| `method_descriptor` | ❌ | JVM 方法描述符（高级，优先级高于 `parameter_types`），如 `(Ljava/lang/String;I)V` |
 | `span_name` | ❌ | 自定义 Span 名称，仅 TRACE 类型有效 |
 | `config.force` | ❌ | 是否强制增强（忽略冲突检测） |
 
@@ -147,6 +148,7 @@ sequenceDiagram
 | TC-10 | 重复目标方法（不同 ruleId） | `dynamic_instrument` | 同一 class+method 被不同规则增强 | 返回目标重复错误 | `DUPLICATE_TARGET` |
 | TC-11 | 无效增强类型 | `dynamic_instrument` | 不支持的 type | 返回参数错误 | `INVALID_PARAMETERS` |
 | TC-12 | 还原不存在的规则 | `dynamic_uninstrument` | 规则未找到 | 返回明确错误 | `RULE_NOT_FOUND` |
+| TC-13 | 重载方法精确匹配（parameter_types） | `dynamic_instrument` | 正常增强 | 仅匹配指定参数类型的方法 | ✅ active |
 
 ---
 
@@ -462,6 +464,59 @@ sequenceDiagram
 
 ---
 
+### TC-13：重载方法精确匹配 — `parameter_types` 参数
+
+**为什么需要此测试**：当目标类存在多个重载方法时，需要通过 `parameter_types` 精确指定要增强的方法。支持 Java 风格的简单类名（如 `String`、`Wrapper`），对用户更友好。
+
+**场景 A — 无参方法精确匹配：**
+```json
+{
+  "task_id": "test-param-types-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-param-no-args\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"count\",\"type\":\"trace\",\"parameter_types\":\"\"}"
+}
+```
+
+**场景 B — 单参数简单类名匹配：**
+```json
+{
+  "task_id": "test-param-types-002",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-param-wrapper\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"count\",\"type\":\"trace\",\"parameter_types\":\"Wrapper\"}"
+}
+```
+
+**场景 C — 不指定 parameter_types（默认匹配所有重载）：**
+```json
+{
+  "task_id": "test-param-types-003",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-param-all\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"count\",\"type\":\"trace\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 下发场景 A | 仅增强无参的 `count()` 方法，不影响 `count(Wrapper)` |
+| 2 | 下发场景 B | 仅增强 `count(Wrapper)` 方法，不影响无参 `count()` |
+| 3 | 下发场景 C | 两个 `count` 重载都被增强 |
+| 4 | 分别还原并验证 | 各场景增强效果消失，业务功能正常 |
+
+**`parameter_types` 使用指南：**
+
+| 用户写法 | 含义 | 示例 |
+|---------|------|------|
+| 不传该字段 | 匹配所有同名方法 | — |
+| `""` （空字符串） | 精确匹配无参方法 | `count()` |
+| `"String"` | 单参数，简单类名尾部匹配 | `foo(java.lang.String)` |
+| `"String,int"` | 多参数，逗号分隔 | `foo(java.lang.String, int)` |
+| `"java.lang.String"` | 全限定名精确匹配 | `foo(java.lang.String)` |
+| `"Wrapper"` | 简单类名尾部匹配 | `foo(com.baomidou...Wrapper)` |
+
+---
+
 ## 六、推荐测试执行顺序
 
 ```mermaid
@@ -487,6 +542,10 @@ graph LR
         TC09 --> TC10[TC-10 重复目标方法]
         TC10 --> TC11[TC-11 无效类型]
         TC11 --> TC12[TC-12 还原不存在规则]
+    end
+
+    subgraph "Phase 5: 重载匹配"
+        TC12 --> TC13[TC-13 parameter_types]
     end
 ```
 
@@ -574,3 +633,4 @@ assertTrue(result.isSuccess());
 | TC-10 | 重复目标方法 | | | ⬜ 待测 | |
 | TC-11 | 无效增强类型 | | | ⬜ 待测 | |
 | TC-12 | 还原不存在规则 | | | ⬜ 待测 | |
+| TC-13 | 重载方法精确匹配 | | | ⬜ 待测 | |

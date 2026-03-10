@@ -8,7 +8,10 @@ package io.opentelemetry.sdk.extension.controlplane.instrument;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionContext;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionResult;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
@@ -25,7 +28,8 @@ import java.util.logging.Logger;
  *   "rule_id": "rule-001",
  *   "class_name": "com.example.MyService",
  *   "method_name": "handleRequest",
- *   "method_descriptor": "(Ljava/lang/String;)V",  // 可选
+ *   "parameter_types": "String,int",                 // 可选，Java 风格参数类型列表
+ *   "method_descriptor": "(Ljava/lang/String;I)V",  // 可选，JVM 格式（优先级高于 parameter_types）
  *   "type": "trace",                                 // trace | metric | log
  *   "span_name": "MyService.handleRequest",          // 可选
  *   "config.key": "value"                             // 额外配置
@@ -147,14 +151,56 @@ public final class DynamicInstrumentExecutor implements TaskExecutor {
       }
     }
 
+    // 解析参数类型列表（Java 风格，用户友好）
+    // 优先级：method_descriptor > parameter_types > 全部匹配
+    Object parameterTypesRaw = context.getParameters().get("parameter_types");
+    List<String> parameterTypes = parseParameterTypes(
+        parameterTypesRaw != null ? String.valueOf(parameterTypesRaw) : null);
+
     return InstrumentationRule.builder()
         .ruleId(context.getStringParameter("rule_id", context.getTaskId()))
         .className(context.getStringParameter("class_name", ""))
         .methodName(context.getStringParameter("method_name", ""))
         .methodDescriptor(context.getStringParameter("method_descriptor", ""))
+        .parameterTypes(parameterTypes)
         .type(type)
         .spanName(context.getStringParameter("span_name", ""))
         .config(config)
         .build();
+  }
+
+  /**
+   * 解析 parameter_types 字符串为类型列表
+   *
+   * <p>支持以下格式：
+   * <ul>
+   *   <li>{@code null} 或不传 → 返回 null（匹配所有同名方法）</li>
+   *   <li>{@code ""} 空字符串 → 返回空列表（精确匹配无参方法）</li>
+   *   <li>{@code "String"} → 单参数，简单类名尾部匹配</li>
+   *   <li>{@code "String,int"} → 多参数，逗号分隔</li>
+   *   <li>{@code "java.lang.String"} → 全限定名精确匹配</li>
+   * </ul>
+   *
+   * @param parameterTypesStr 逗号分隔的参数类型字符串，null 表示不指定
+   * @return 参数类型列表，null 表示不限制
+   */
+  @javax.annotation.Nullable
+  private static List<String> parseParameterTypes(@javax.annotation.Nullable String parameterTypesStr) {
+    if (parameterTypesStr == null) {
+      return null; // 不指定，匹配所有同名方法
+    }
+    String trimmed = parameterTypesStr.trim();
+    if (trimmed.isEmpty()) {
+      return Collections.emptyList(); // 空字符串，匹配无参方法
+    }
+    String[] parts = trimmed.split(",");
+    List<String> result = new ArrayList<>(parts.length);
+    for (String part : parts) {
+      String typeName = part.trim();
+      if (!typeName.isEmpty()) {
+        result.add(typeName);
+      }
+    }
+    return Collections.unmodifiableList(result);
   }
 }
