@@ -11,6 +11,7 @@ import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import io.opentelemetry.sdk.extension.controlplane.ControlPlaneManager;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
+import io.opentelemetry.sdk.extension.controlplane.instrument.DynamicInstrumentationIntegration;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
@@ -136,6 +137,10 @@ public final class ControlPlaneAutoConfigurationProvider
         managerBuilder.enableArthas();
         logger.log(Level.INFO, "Arthas integration enabled via configuration");
       }
+
+      // 注册动态增强集成（提供 dynamic_instrument / dynamic_uninstrument 任务执行器）
+      managerBuilder.addComponent(DynamicInstrumentationIntegration.create());
+      logger.log(Level.INFO, "DynamicInstrumentationIntegration registered");
 
       try {
         controlPlaneManager = managerBuilder.build();

@@ -32,6 +32,12 @@ dependencies {
   // 2. 在 opentelemetry-java-instrumentation 中，ByteBuddy 已存在
   // 3. 如果 classpath 中没有此依赖，会优雅降级（需要手动设置 Instrumentation）
   compileOnly("net.bytebuddy:byte-buddy-agent:1.14.18")
+  // ByteBuddy Core（用于动态增强模块的 Advice 字节码织入）
+  // compileOnly 原因：在 OTel Java Agent 环境中 ByteBuddy 已在 classpath；
+  // 独立运行时如果不可用，TransformerManager 会优雅降级到标记式 Transformer
+  compileOnly("net.bytebuddy:byte-buddy:1.14.18")
+  // SpotBugs 注解（ByteBuddy 内部使用 @SuppressFBWarnings，需要此依赖避免编译警告）
+  compileOnly("com.github.spotbugs:spotbugs-annotations:4.8.6")
 
   // Async Profiler Java API（进程内直接调用 async-profiler）
   // 包含 one.profiler.AsyncProfiler 等 Java API 类（~50KB）
