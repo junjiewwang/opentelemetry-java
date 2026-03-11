@@ -63,8 +63,17 @@ public final class TransformerManager {
   private final ConcurrentHashMap<String, ManagedTransformer> transformers =
       new ConcurrentHashMap<>();
 
-  /** 目标方法(className#methodName) -> ruleId 的映射，防止不同 ruleId 增强同一方法 */
-  private final ConcurrentHashMap<String, String> targetMethodToRuleId =
+  /**
+   * 目标方法(className#methodName#type) -> 已增强条目列表 的映射
+   *
+   * <p>key 包含 type 维度，允许同一方法被不同类型（trace/metric/log）分别增强，
+   * 但同一类型内通过 {@link #checkTargetConflict} 进行精细化冲突检测：
+   * <ul>
+   *   <li>完全相同的重载签名 → DUPLICATE_TARGET</li>
+   *   <li>有一方覆盖全部重载（未指定 parameterTypes）而另一方有交叉 → OVERLAPPING_TARGET</li>
+   * </ul>
+   */
+  private final ConcurrentHashMap<String, List<TargetEntry>> targetMethodToRules =
       new ConcurrentHashMap<>();
 
   /** 规则级别的锁，防止同一规则的增强和还原操作竞态 */
@@ -175,6 +184,31 @@ public final class TransformerManager {
     return transformers.containsKey(ruleId);
   }
 
+  /**
+   * 根据目标方法信息查找对应的 ruleId 列表
+   *
+   * <p>用于还原时无需指定 rule_id，通过 class_name + method_name + type 查找。
+   * 如果同一目标方法有多条规则（不同重载），返回所有匹配的 ruleId。
+   *
+   * @param className 全限定类名
+   * @param methodName 方法名
+   * @param type 增强类型
+   * @return 匹配的 ruleId 列表，无匹配返回空列表
+   */
+  public List<String> findRuleIdsByTarget(
+      String className, String methodName, InstrumentationType type) {
+    String targetKey = buildTargetKey(className, methodName, type);
+    List<TargetEntry> entries = targetMethodToRules.get(targetKey);
+    if (entries == null || entries.isEmpty()) {
+      return Collections.emptyList();
+    }
+    List<String> result = new ArrayList<>(entries.size());
+    for (TargetEntry entry : entries) {
+      result.add(entry.ruleId);
+    }
+    return Collections.unmodifiableList(result);
+  }
+
   // ===== 私有方法 =====
 
   private EnhancementResult doApplyRule(InstrumentationRule rule) {
@@ -192,13 +226,12 @@ public final class TransformerManager {
           "Rule already applied: " + ruleId);
     }
 
-    // 3. 检查同一 class+method 是否已被其他规则增强
-    String targetKey = buildTargetKey(rule.getClassName(), rule.getMethodName());
-    String existingRuleId = targetMethodToRuleId.get(targetKey);
-    if (existingRuleId != null) {
-      return EnhancementResult.failed(ruleId, "DUPLICATE_TARGET",
-          "Method " + rule.getClassName() + "#" + rule.getMethodName()
-              + " already enhanced by rule: " + existingRuleId);
+    // 3. 检查同一 class+method+type 是否与已有规则冲突
+    String targetKey = buildTargetKey(rule.getClassName(), rule.getMethodName(), rule.getType());
+    String conflictError = checkTargetConflict(targetKey, rule);
+    if (conflictError != null) {
+      return EnhancementResult.failed(ruleId, conflictError.startsWith("OVERLAPPING")
+          ? "OVERLAPPING_TARGET" : "DUPLICATE_TARGET", conflictError);
     }
 
     // 4. 检查数量限制
@@ -284,7 +317,8 @@ public final class TransformerManager {
     // 14. 记录映射关系
     ManagedTransformer managed = new ManagedTransformer(ruleId, rule, transformer, targetClass);
     transformers.put(ruleId, managed);
-    targetMethodToRuleId.put(targetKey, ruleId);
+    targetMethodToRules.computeIfAbsent(targetKey, k -> new ArrayList<>())
+        .add(new TargetEntry(ruleId, rule.getParameterTypes()));
 
     // 15. 更新状态
     state.markActive(targetClass.getName());
@@ -350,8 +384,8 @@ public final class TransformerManager {
     // 7. 清理映射
     transformers.remove(ruleId);
     String revertTargetKey = buildTargetKey(
-        managed.rule.getClassName(), managed.rule.getMethodName());
-    targetMethodToRuleId.remove(revertTargetKey);
+        managed.rule.getClassName(), managed.rule.getMethodName(), managed.rule.getType());
+    removeTargetEntry(revertTargetKey, ruleId);
 
     // 8. 更新状态
     if (state != null) {
@@ -779,14 +813,90 @@ public final class TransformerManager {
   }
 
   /**
-   * 构建目标方法的唯一标识 key
+   * 构建目标方法的唯一标识 key（包含 type 维度）
+   *
+   * <p>包含 type 维度使得同一方法可以被不同类型分别增强（如 trace + metric），
+   * 而同一类型内通过 {@link #checkTargetConflict} 做精细冲突检测。
    *
    * @param className 全限定类名
    * @param methodName 方法名
-   * @return className#methodName 格式的 key
+   * @param type 增强类型
+   * @return className#methodName#type 格式的 key
    */
-  private static String buildTargetKey(String className, String methodName) {
-    return className + "#" + methodName;
+  private static String buildTargetKey(
+      String className, String methodName, InstrumentationType type) {
+    return className + "#" + methodName + "#" + type.getValue();
+  }
+
+  /**
+   * 检查新规则是否与已有规则存在目标冲突
+   *
+   * <p>冲突检测矩阵：
+   * <ul>
+   *   <li>完全相同的签名（parameterTypes 相等） → DUPLICATE_TARGET</li>
+   *   <li>新规则或已有规则覆盖全部重载（parameterTypes == null）而另一方存在 → OVERLAPPING_TARGET</li>
+   *   <li>不同重载签名 → 允许</li>
+   * </ul>
+   *
+   * @param targetKey className#methodName#type 格式的 key
+   * @param newRule 新增强规则
+   * @return 冲突错误描述，无冲突返回 null
+   */
+  @Nullable
+  private String checkTargetConflict(String targetKey, InstrumentationRule newRule) {
+    List<TargetEntry> existing = targetMethodToRules.get(targetKey);
+    if (existing == null || existing.isEmpty()) {
+      return null;
+    }
+
+    String target = newRule.getClassName() + "#" + newRule.getMethodName();
+    for (TargetEntry entry : existing) {
+      // 新规则覆盖全部重载，但已有精确匹配的规则 → 重叠
+      if (newRule.getParameterTypes() == null) {
+        return "OVERLAPPING: " + target + " (all overloads) overlaps with existing rule '"
+            + entry.ruleId + "'" + formatEntryParams(entry)
+            + ". Revert the existing rule first, or specify 'parameter_types' to target a specific overload.";
+      }
+      // 已有规则覆盖全部重载，新规则是精确匹配 → 重叠
+      if (entry.parameterTypes == null) {
+        return "OVERLAPPING: " + target + "(" + String.join(",", newRule.getParameterTypes())
+            + ") overlaps with existing rule '" + entry.ruleId + "' (all overloads)"
+            + ". Revert the existing rule first.";
+      }
+      // 两者都是精确匹配，且签名相同 → 重复
+      if (newRule.getParameterTypes().equals(entry.parameterTypes)) {
+        return "DUPLICATE: " + target + "(" + String.join(",", newRule.getParameterTypes())
+            + ") already enhanced by rule: " + entry.ruleId;
+      }
+    }
+    // 不同重载签名，无冲突
+    return null;
+  }
+
+  /**
+   * 格式化 TargetEntry 的参数类型信息，用于错误消息
+   */
+  private static String formatEntryParams(TargetEntry entry) {
+    if (entry.parameterTypes == null) {
+      return " (all overloads)";
+    }
+    return "(" + String.join(",", entry.parameterTypes) + ")";
+  }
+
+  /**
+   * 从目标映射中移除指定 ruleId 的条目
+   *
+   * @param targetKey className#methodName#type 格式的 key
+   * @param ruleId 要移除的规则 ID
+   */
+  private void removeTargetEntry(String targetKey, String ruleId) {
+    List<TargetEntry> entries = targetMethodToRules.get(targetKey);
+    if (entries != null) {
+      entries.removeIf(e -> e.ruleId.equals(ruleId));
+      if (entries.isEmpty()) {
+        targetMethodToRules.remove(targetKey);
+      }
+    }
   }
 
   // ===== 内部类 =====
@@ -894,6 +1004,21 @@ public final class TransformerManager {
       }
       return "EnhancementResult{ruleId='" + ruleId + "', success=false"
           + ", errorCode='" + errorCode + "', errorMessage='" + errorMessage + "'}";
+    }
+  }
+
+  /**
+   * 目标方法增强条目，记录一条已增强规则的 ruleId 和参数类型
+   *
+   * <p>用于精细化冲突检测：同一 className#methodName#type 下可以存在多个不同重载的条目。
+   */
+  private static final class TargetEntry {
+    final String ruleId;
+    @Nullable final List<String> parameterTypes;
+
+    TargetEntry(String ruleId, @Nullable List<String> parameterTypes) {
+      this.ruleId = ruleId;
+      this.parameterTypes = parameterTypes;
     }
   }
 

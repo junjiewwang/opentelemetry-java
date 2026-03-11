@@ -122,6 +122,46 @@ public final class InstrumentationRule {
   }
 
   /**
+   * 根据规则的目标信息自动生成确定性的 ruleId
+   *
+   * <p>生成规则：{@code <SimpleClassName>.<methodName>[(<parameterTypes>)]_<type>}
+   *
+   * <p>示例：
+   * <ul>
+   *   <li>{@code UserService.handleRequest_trace} — 不指定参数类型（所有重载）</li>
+   *   <li>{@code UserService.count()_trace} — 空参数列表（无参方法）</li>
+   *   <li>{@code UserService.count(String,int)_metric} — 精确参数类型</li>
+   * </ul>
+   *
+   * @param className 全限定类名
+   * @param methodName 方法名
+   * @param type 增强类型
+   * @param parameterTypes 参数类型列表（null 表示不限制）
+   * @return 自动生成的 ruleId
+   */
+  public static String generateRuleId(
+      String className, String methodName, InstrumentationType type,
+      @Nullable List<String> parameterTypes) {
+    // 取简单类名
+    String simpleClassName = className;
+    int lastDot = className.lastIndexOf('.');
+    if (lastDot >= 0) {
+      simpleClassName = className.substring(lastDot + 1);
+    }
+
+    StringBuilder sb = new StringBuilder();
+    sb.append(simpleClassName).append('.').append(methodName);
+
+    // 如果指定了 parameterTypes，拼接参数签名
+    if (parameterTypes != null) {
+      sb.append('(').append(String.join(",", parameterTypes)).append(')');
+    }
+
+    sb.append('_').append(type.getValue());
+    return sb.toString();
+  }
+
+  /**
    * 校验规则参数
    *
    * @return 校验失败的原因，null 表示校验通过

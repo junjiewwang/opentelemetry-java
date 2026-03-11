@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.instrument;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionContext;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutionResult;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
+import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -25,7 +26,7 @@ import java.util.logging.Logger;
  * <p>任务参数示例：
  * <pre>{@code
  * {
- *   "rule_id": "rule-001",
+ *   "rule_id": "rule-001",                            // 可选，不传则自动生成（推荐）
  *   "class_name": "com.example.MyService",
  *   "method_name": "handleRequest",
  *   "parameter_types": "String,int",                 // 可选，Java 风格参数类型列表
@@ -35,6 +36,13 @@ import java.util.logging.Logger;
  *   "config.key": "value"                             // 额外配置
  * }
  * }</pre>
+ *
+ * <p>当 {@code rule_id} 未指定时，自动生成格式为
+ * {@code <SimpleClassName>.<methodName>[(<parameterTypes>)]_<type>}，例如：
+ * <ul>
+ *   <li>{@code MyService.handleRequest_trace}</li>
+ *   <li>{@code MyService.handleRequest(String,int)_trace}</li>
+ * </ul>
  */
 public final class DynamicInstrumentExecutor implements TaskExecutor {
 
@@ -78,11 +86,12 @@ public final class DynamicInstrumentExecutor implements TaskExecutor {
           logger.log(Level.INFO,
               "[DYNAMIC-INSTRUMENT] Enhancement applied successfully: {0}", result);
           return TaskExecutionResult.success(
-              "{\"rule_id\":\"" + rule.getRuleId()
-                  + "\",\"class_name\":\"" + rule.getClassName()
-                  + "\",\"method_name\":\"" + rule.getMethodName()
-                  + "\",\"type\":\"" + rule.getType().getValue()
-                  + "\",\"status\":\"active\"}",
+              JsonUtils.toJsonObject(
+                  "rule_id", rule.getRuleId(),
+                  "class_name", rule.getClassName(),
+                  "method_name", rule.getMethodName(),
+                  "type", rule.getType().getValue(),
+                  "status", "active"),
               executionTime);
         } else {
           logger.log(Level.WARNING,
@@ -157,10 +166,24 @@ public final class DynamicInstrumentExecutor implements TaskExecutor {
     List<String> parameterTypes = parseParameterTypes(
         parameterTypesRaw != null ? String.valueOf(parameterTypesRaw) : null);
 
+    String className = context.getStringParameter("class_name", "");
+    String methodName = context.getStringParameter("method_name", "");
+
+    // rule_id 可选：用户传了就用，不传则自动生成确定性的 ruleId
+    String ruleIdParam = context.getStringParameter("rule_id", "");
+    String ruleId;
+    if (!ruleIdParam.isEmpty()) {
+      ruleId = ruleIdParam;
+    } else {
+      ruleId = InstrumentationRule.generateRuleId(className, methodName, type, parameterTypes);
+      logger.log(Level.INFO,
+          "[DYNAMIC-INSTRUMENT] Auto-generated rule_id: {0}", ruleId);
+    }
+
     return InstrumentationRule.builder()
-        .ruleId(context.getStringParameter("rule_id", context.getTaskId()))
-        .className(context.getStringParameter("class_name", ""))
-        .methodName(context.getStringParameter("method_name", ""))
+        .ruleId(ruleId)
+        .className(className)
+        .methodName(methodName)
         .methodDescriptor(context.getStringParameter("method_descriptor", ""))
         .parameterTypes(parameterTypes)
         .type(type)

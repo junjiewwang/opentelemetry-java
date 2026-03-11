@@ -54,7 +54,7 @@ sequenceDiagram
 {
   "task_id": "task-xxx-001",
   "task_type_name": "dynamic_instrument",
-  "parameters_json": "{\"rule_id\":\"xxx\",\"class_name\":\"全限定类名\",\"method_name\":\"方法名\",\"type\":\"trace|metric|log\",\"span_name\":\"可选-自定义Span名\"}",
+  "parameters_json": "{\"class_name\":\"全限定类名\",\"method_name\":\"方法名\",\"type\":\"trace|metric|log\",\"span_name\":\"可选-自定义Span名\"}",
   "priority_num": 50,
   "timeout_millis": 30000,
   "created_at_millis": 1741512000000,
@@ -62,8 +62,13 @@ sequenceDiagram
 }
 ```
 
+> **注意**：`rule_id` 现在是可选的。不传时 Agent 会自动生成格式为 `<SimpleClassName>.<methodName>[(<parameterTypes>)]_<type>` 的确定性 ruleId，如 `UserService.handleLogin_trace`。返回结果中会包含实际使用的 `rule_id`。
+
 ### 2.2 还原任务（`dynamic_uninstrument`）
 
+支持两种还原方式：
+
+**方式 1：按 rule_id 还原（精确）**
 ```json
 {
   "task_id": "task-xxx-002",
@@ -74,11 +79,24 @@ sequenceDiagram
 }
 ```
 
+**方式 2：按目标方法还原（简化，自动推导 rule_id）**
+```json
+{
+  "task_id": "task-xxx-003",
+  "task_type_name": "dynamic_uninstrument",
+  "parameters_json": "{\"class_name\":\"全限定类名\",\"method_name\":\"方法名\",\"type\":\"trace\"}",
+  "priority_num": 80,
+  "timeout_millis": 15000
+}
+```
+
+> **说明**：方式 2 中 `type` 可选，不传则还原该方法所有类型（trace/metric/log）的增强。当两种方式都传时，优先使用 `rule_id`。
+
 ### 2.3 `parameters_json` 字段说明
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
-| `rule_id` | ✅ | 规则 ID（全局唯一） |
+| `rule_id` | ❌ | 规则 ID。**可选**：不传时自动生成格式为 `<SimpleClassName>.<methodName>[(<parameterTypes>)]_<type>` 的确定性 ruleId |
 | `class_name` | ✅ | 目标类全限定名 |
 | `method_name` | ✅ | 目标方法名 |
 | `type` | ✅ | 增强类型：`trace` / `metric` / `log` |
@@ -124,7 +142,14 @@ sequenceDiagram
 
 ### 3.2 已实施的防护机制
 
-**Step 1（基础防护）已实施**：在 `TransformerManager.doApplyRule()` 中新增了 `targetMethodToRuleId` 映射表，防止不同 ruleId 增强同一 class+method。若检测到重复目标，返回错误码 `DUPLICATE_TARGET`。
+**Step 1（精细化冲突检测）已实施**：在 `TransformerManager.doApplyRule()` 中使用 `targetMethodToRules` 映射表（key 为 `className#methodName#type`），实现了多维度冲突检测：
+
+| 场景 | 行为 | 错误码 |
+|------|------|--------|
+| 同一 class+method+type，完全相同的重载签名 | ❌ 拒绝 | `DUPLICATE_TARGET` |
+| 同一 class+method+type，有一方覆盖全部重载而另一方有交叉 | ❌ 拒绝 | `OVERLAPPING_TARGET` |
+| 同一 class+method+type，不同精确重载 | ✅ 允许 | — |
+| 同一 class+method，不同 type（如 trace + metric） | ✅ 允许 | — |
 
 ---
 
@@ -141,6 +166,17 @@ sequenceDiagram
 | TC-05 | 多方法多类型混合增强 | `dynamic_instrument` ×3 | `UserBusinessService` | 3 个方法 | trace+metric+log | ❌ 无 | 三种效果同时生效+全部还原 | ✅ all active |
 | TC-06 | Service 层方法增强 | `dynamic_instrument` | `UserInfoService` | `mockBatched` | trace | ❌ 无 | Span 层级（Controller→Service→Redis/JDBC） | ✅ active |
 | TC-07 | 异常场景方法增强 | `dynamic_instrument` | `UserBusinessService` | `checkNotificationServiceHealth` | trace | ❌ 无 | 异常被 catch 时 Span 状态 | ✅ active |
+
+### 4.1.1 新增场景（精细化冲突检测 + 自动 rule_id）
+
+| # | 用例名称 | task_type_name | 目标类 | 目标方法 | type | 验证重点 | 预期 |
+|---|---------|---------------|--------|---------|------|---------|------|
+| TC-23 | 同一方法不同 type 组合 | `dynamic_instrument` ×2 | `UserBusinessService` | `handleUserLogin` | trace+metric | 两者独立运行互不干扰 | ✅ 允许 |
+| TC-24 | 自动 rule_id + 不同重载 | `dynamic_instrument` ×2 | `UserInfoService` | `count` | trace | 自动生成 ruleId，不同重载独立 | ✅ 允许 |
+| TC-25 | OVERLAPPING_TARGET | `dynamic_instrument` | `UserInfoService` | `count` | trace | 精确重载 + 全部重载冲突 | ❌ OVERLAPPING_TARGET |
+| TC-26 | 按目标方法还原 | `dynamic_uninstrument` | `UserBusinessService` | `handleUserLogin` | trace | 指定 class+method+type 还原 | ✅ reverted |
+| TC-27 | 还原所有 type | `dynamic_uninstrument` | `UserBusinessService` | `handleUserLogin` | 全部 | 不指定 type 一次性还原 | ✅ reverted |
+| TC-28 | 自动 rule_id 幂等性 | `dynamic_instrument` ×2 | `UserBusinessService` | `handleUserLogin` | trace | 同参数不同 task_id，第二次被拒绝 | ❌ ALREADY_APPLIED |
 
 ### 4.2 参数/返回值采集场景
 
@@ -162,7 +198,7 @@ sequenceDiagram
 |---|---------|---------------|---------|---------|----------|
 | TC-08 | 不存在的类 | `dynamic_instrument` | 类找不到 | 返回明确错误信息 | `CLASS_NOT_FOUND` |
 | TC-09 | 重复 ruleId | `dynamic_instrument` | 规则已存在 | 返回 ruleId 重复错误 | `ALREADY_APPLIED` |
-| TC-10 | 重复目标方法（不同 ruleId） | `dynamic_instrument` | 同一 class+method 被不同规则增强 | 返回目标重复错误 | `DUPLICATE_TARGET` |
+| TC-10 | 重复目标方法（同一 type+同一重载） | `dynamic_instrument` | 同一 class+method+type 被不同规则增强 | 返回目标重复错误 | `DUPLICATE_TARGET` |
 | TC-11 | 无效增强类型 | `dynamic_instrument` | 不支持的 type | 返回参数错误 | `INVALID_PARAMETERS` |
 | TC-12 | 还原不存在的规则 | `dynamic_uninstrument` | 规则未找到 | 返回明确错误 | `RULE_NOT_FOUND` |
 | TC-13 | 重载方法精确匹配（parameter_types） | `dynamic_instrument` | 正常增强 | 仅匹配指定参数类型的方法 | ✅ active |
@@ -416,26 +452,28 @@ sequenceDiagram
 
 ---
 
-### TC-10：异常场景 — 重复目标方法（不同 ruleId）
+### TC-10：异常场景 — 重复目标方法（同一 type+同一重载）
 
-**前置条件**：先成功下发 TC-01 对 `handleUserLogin` 的增强
+**前置条件**：先成功下发 TC-01 对 `handleUserLogin` 的 trace 增强
 
-**下发任务（不同 ruleId，同一 class+method）：**
+**下发任务（不同 ruleId，同一 class+method+type）：**
 ```json
 {
   "task_id": "test-err-dup-target-001",
   "task_type_name": "dynamic_instrument",
-  "parameters_json": "{\"rule_id\":\"rule-another-trace-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"metric\"}"
+  "parameters_json": "{\"rule_id\":\"rule-another-trace-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\"}"
 }
 ```
 
 **预期结果：**
 ```json
 {
-  "error_code": "DUPLICATE_TARGET",
-  "error_message": "Method com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService#handleUserLogin already enhanced by rule: rule-safe-trace-login"
+  "error_code": "OVERLAPPING_TARGET",
+  "error_message": "OVERLAPPING: ...UserBusinessService#handleUserLogin (all overloads) overlaps with existing rule 'rule-safe-trace-login' (all overloads). Revert the existing rule first, or specify 'parameter_types' to target a specific overload."
 }
 ```
+
+> **注意**：如果改为 `"type":"metric"`，则不会冲突，因为不同 type 允许组合增强。参见 TC-23。
 
 ---
 
@@ -817,6 +855,198 @@ sequenceDiagram
 
 ---
 
+### TC-23：同一方法不同 type 组合增强 — trace + metric
+
+**验证目标**：同一方法可以同时被 trace 和 metric 增强，两者独立运行互不干扰。
+
+**步骤 1 — TRACE 增强 handleUserLogin：**
+```json
+{
+  "task_id": "test-multi-type-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\"}"
+}
+```
+> 自动生成 `rule_id = "UserBusinessService.handleUserLogin_trace"`
+
+**步骤 2 — METRIC 增强同一方法：**
+```json
+{
+  "task_id": "test-multi-type-002",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"metric\"}"
+}
+```
+> 自动生成 `rule_id = "UserBusinessService.handleUserLogin_metric"`
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------||
+| 1 | 下发 trace 增强 | ✅ 成功 |
+| 2 | 下发 metric 增强 | ✅ 成功（不同 type，不冲突） |
+| 3 | 触发 `handleUserLogin` | 方法正常执行 |
+| 4 | 检查 Trace 后端 | 出现动态 Span |
+| 5 | 检查 Metric 后端 | 出现 duration + invocations |
+| 6 | 还原 trace 增强 | Span 消失，Metric 仍在 |
+| 7 | 还原 metric 增强 | Metric 也消失 |
+
+**还原（方式 1 按 rule_id）：**
+```json
+{"task_id":"test-multi-type-revert-001","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"UserBusinessService.handleUserLogin_trace\"}"}
+{"task_id":"test-multi-type-revert-002","task_type_name":"dynamic_uninstrument","parameters_json":"{\"rule_id\":\"UserBusinessService.handleUserLogin_metric\"}"}
+```
+
+**还原（方式 2 按目标方法，一次性还原所有 type）：**
+```json
+{"task_id":"test-multi-type-revert-all","task_type_name":"dynamic_uninstrument","parameters_json":"{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\"}"}
+```
+
+---
+
+### TC-24：自动 rule_id + 不同重载独立增强
+
+**验证目标**：
+1. 不传 `rule_id` 时自动生成确定性的 ruleId
+2. 同一方法不同重载可以独立增强
+
+**步骤 1 — 增强 count()（无参）：**
+```json
+{
+  "task_id": "test-auto-rule-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"count\",\"type\":\"trace\",\"parameter_types\":\"\"}"
+}
+```
+> 自动生成 `rule_id = "UserInfoService.count()_trace"`
+
+**步骤 2 — 增强 count(Wrapper)：**
+```json
+{
+  "task_id": "test-auto-rule-002",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"count\",\"type\":\"trace\",\"parameter_types\":\"Wrapper\"}"
+}
+```
+> 自动生成 `rule_id = "UserInfoService.count(Wrapper)_trace"`
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------||
+| 1 | 下发步骤 1 | ✅ 成功，返回 `rule_id = "UserInfoService.count()_trace"` |
+| 2 | 下发步骤 2 | ✅ 成功（不同重载，不冲突），返回 `rule_id = "UserInfoService.count(Wrapper)_trace"` |
+| 3 | 调用无参 `count()` | 仅无参重载产生 Span |
+| 4 | 调用 `count(wrapper)` | 仅带参重载产生 Span |
+| 5 | 还原无参重载 | 无参重载 Span 消失，带参重载 Span 仍在 |
+
+---
+
+### TC-25：OVERLAPPING_TARGET — 全部重载与精确重载冲突
+
+**验证目标**：先增强一个精确重载，再尝试增强全部重载（不指定 `parameter_types`），应被 `OVERLAPPING_TARGET` 拒绝。
+
+**前置条件**：先成功增强 `count()`（TC-24 步骤 1）
+
+**下发任务（全部重载）：**
+```json
+{
+  "task_id": "test-overlap-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserInfoService\",\"method_name\":\"count\",\"type\":\"trace\"}"
+}
+```
+
+**预期结果：**
+```json
+{
+  "error_code": "OVERLAPPING_TARGET",
+  "error_message": "OVERLAPPING: ...UserInfoService#count (all overloads) overlaps with existing rule 'UserInfoService.count()_trace'(). Revert the existing rule first, or specify 'parameter_types' to target a specific overload."
+}
+```
+
+---
+
+### TC-26：按目标方法还原（简化还原方式）
+
+**验证目标**：还原时不需要指定 `rule_id`，通过 `class_name + method_name + type` 即可还原。
+
+**前置条件**：先成功增强 `UserBusinessService.handleUserLogin` 为 trace
+
+**按目标方法还原：**
+```json
+{
+  "task_id": "test-revert-by-target-001",
+  "task_type_name": "dynamic_uninstrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\"}"
+}
+```
+
+**验证步骤：**
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------||
+| 1 | 增强 handleUserLogin (trace) | ✅ 成功 |
+| 2 | 触发方法调用 | 产生动态 Span |
+| 3 | 下发上述按目标方法还原任务 | ✅ 成功，返回 `{"rule_ids":["UserBusinessService.handleUserLogin_trace"],"status":"reverted"}` |
+| 4 | 再次触发方法调用 | **不再**产生动态 Span |
+
+---
+
+### TC-27：按目标方法还原（不指定 type，一次性还原所有类型）
+
+**前置条件**：同一方法同时增强了 trace + metric（参见 TC-23）
+
+**不指定 type 还原：**
+```json
+{
+  "task_id": "test-revert-all-types-001",
+  "task_type_name": "dynamic_uninstrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\"}"
+}
+```
+
+**预期结果：**
+```json
+{
+  "rule_ids": ["UserBusinessService.handleUserLogin_trace", "UserBusinessService.handleUserLogin_metric"],
+  "status": "reverted"
+}
+```
+
+---
+
+### TC-28：自动 rule_id 幂等性验证
+
+**验证目标**：同样的增强参数，不同批次下发，自动生成的 `rule_id` 相同 → 第二次被 `ALREADY_APPLIED` 拒绝（幂等）。
+
+**步骤 1 — 第一次增强：**
+```json
+{
+  "task_id": "test-idempotent-001",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\"}"
+}
+```
+
+**步骤 2 — 不同 task_id，完全相同的增强参数：**
+```json
+{
+  "task_id": "test-idempotent-002",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserLogin\",\"type\":\"trace\"}"
+}
+```
+
+**预期结果：**
+
+| 步骤 | 结果 |
+|------|------|
+| 步骤 1 | ✅ 成功，返回 `rule_id = "UserBusinessService.handleUserLogin_trace"` |
+| 步骤 2 | ❌ `ALREADY_APPLIED`，因为自动生成的 ruleId 与步骤 1 相同 |
+
+---
+
 ## 六、推荐测试执行顺序
 
 ```mermaid
@@ -848,6 +1078,15 @@ graph LR
         TC12 --> TC13[TC-13 parameter_types]
     end
 
+    subgraph "Phase 5.5: 新增冲突检测 + 自动 rule_id"
+        TC13 --> TC23[TC-23 同方法多type]
+        TC23 --> TC24[TC-24 自动rule_id+重载]
+        TC24 --> TC25[TC-25 OVERLAPPING]
+        TC25 --> TC26[TC-26 按目标还原]
+        TC26 --> TC27[TC-27 还原所有type]
+        TC27 --> TC28[TC-28 幂等性]
+    end
+
     subgraph "Phase 6: 参数/返回值采集"
         TC13 --> TC14[TC-14 按索引采集]
         TC14 --> TC15[TC-15 按参数名采集]
@@ -859,6 +1098,8 @@ graph LR
         TC20 --> TC21[TC-21 异常时采集不丢失]
         TC21 --> TC22[TC-22 零开销对比]
     end
+
+    TC28 --> TC14
 ```
 
 ---
@@ -1021,3 +1262,9 @@ assertTrue(result.isSuccess());
 | TC-20 | 值截断（max_length） | | | ⬜ 待测 | |
 | TC-21 | 异常时参数采集不丢失 | | | ⬜ 待测 | |
 | TC-22 | 无采集配置走轻量 Advice | | | ⬜ 待测 | 零开销对比 |
+| TC-23 | 同一方法不同 type 组合增强 | | | ⬜ 待测 | trace + metric |
+| TC-24 | 自动 rule_id + 不同重载独立增强 | | | ⬜ 待测 | 自动生成 ruleId |
+| TC-25 | OVERLAPPING_TARGET 冲突检测 | | | ⬜ 待测 | 全部重载 vs 精确重载 |
+| TC-26 | 按目标方法还原 | | | ⬜ 待测 | 简化还原方式 |
+| TC-27 | 按目标方法还原（不指定 type） | | | ⬜ 待测 | 一次性还原所有 type |
+| TC-28 | 自动 rule_id 幂等性验证 | | | ⬜ 待测 | 同参数不同 task_id |
