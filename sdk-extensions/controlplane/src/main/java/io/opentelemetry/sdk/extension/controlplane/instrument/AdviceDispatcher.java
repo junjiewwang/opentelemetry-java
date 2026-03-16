@@ -50,7 +50,7 @@ public final class AdviceDispatcher {
     } else if (type == InstrumentationType.METRIC) {
       DynamicMetricAdvice.registerRule(rule);
     } else if (type == InstrumentationType.LOG) {
-      DynamicLogAdvice.registerRule(rule);
+      DynamicLogAdvice.registerRule(rule, captureConfig);
     }
   }
 
@@ -125,7 +125,7 @@ public final class AdviceDispatcher {
       } else if (type == InstrumentationType.METRIC) {
         return DynamicMetricAdvice.onMethodEnter(ruleId);
       } else if (type == InstrumentationType.LOG) {
-        return DynamicLogAdvice.onMethodEnter(ruleId);
+        return DynamicLogAdvice.onMethodEnterWithCapture(ruleId, args);
       }
       return null;
     } catch (RuntimeException e) {
@@ -205,10 +205,9 @@ public final class AdviceDispatcher {
             enterContext instanceof Long ? (Long) enterContext : null,
             thrown);
       } else if (type == InstrumentationType.LOG) {
-        DynamicLogAdvice.onMethodExit(
-            ruleId,
-            enterContext instanceof Long ? (Long) enterContext : null,
-            thrown);
+        DynamicLogAdvice.onMethodExitWithCapture(
+            enterContext instanceof Object[] ? (Object[]) enterContext : null,
+            thrown, returnValue);
       }
     } catch (RuntimeException e) {
       logger.log(Level.WARNING,
