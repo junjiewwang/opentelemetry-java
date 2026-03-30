@@ -15,6 +15,9 @@ import io.opentelemetry.sdk.extension.controlplane.instrument.DynamicInstrumenta
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
+import io.opentelemetry.sdk.extension.controlplane.peerservice.CallerServiceBaggageSpanProcessor;
+import io.opentelemetry.sdk.extension.controlplane.peerservice.PeerServiceResolverConfig;
+import io.opentelemetry.sdk.extension.controlplane.peerservice.PeerServiceSpanProcessor;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -55,6 +58,17 @@ public final class ControlPlaneAutoConfigurationProvider
         (builder, config) -> {
           if (!isEnabled(config)) {
             return builder;
+          }
+
+          // 注册 peer.service 自动填充处理器
+          PeerServiceResolverConfig peerServiceConfig = PeerServiceResolverConfig.create(config);
+          if (peerServiceConfig.isEnabled()) {
+            String serviceName = AgentIdentityProvider.getServiceName();
+            builder.addSpanProcessor(
+                new CallerServiceBaggageSpanProcessor(
+                    serviceName, peerServiceConfig.getBaggageKey()));
+            builder.addSpanProcessor(new PeerServiceSpanProcessor(peerServiceConfig));
+            logger.log(Level.INFO, "Registered peer.service processors");
           }
 
           // 初始化并启动控制平面管理器
