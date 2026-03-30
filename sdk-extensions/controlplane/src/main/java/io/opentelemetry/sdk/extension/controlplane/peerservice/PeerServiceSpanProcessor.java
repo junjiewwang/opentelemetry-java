@@ -23,7 +23,7 @@ import javax.annotation.Nullable;
  * <p>实现 {@link ExtendedSpanProcessor}，在 {@code onEnding()} 阶段根据 Span 类型自动填充
  * {@code peer.service} 属性，使可观测后端能正确绘制服务拓扑图。
  *
- * <h3>处理逻辑</h3>
+ * <h2>处理逻辑</h2>
  * <ul>
  *   <li><b>SERVER/CONSUMER（入方向）</b>：从 Baggage 中读取 {@code caller.service.name}，
  *       设置为 {@code peer.service}（表示"谁调用了我"）</li>
