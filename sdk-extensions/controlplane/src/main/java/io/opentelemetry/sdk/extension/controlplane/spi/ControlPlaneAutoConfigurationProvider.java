@@ -15,7 +15,7 @@ import io.opentelemetry.sdk.extension.controlplane.instrument.DynamicInstrumenta
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicSampler;
 import io.opentelemetry.sdk.extension.controlplane.identity.AgentIdentityProvider;
-import io.opentelemetry.sdk.extension.controlplane.peerservice.CallerServiceBaggageSpanProcessor;
+import io.opentelemetry.sdk.extension.controlplane.peerservice.CallerServiceBaggagePropagator;
 import io.opentelemetry.sdk.extension.controlplane.peerservice.PeerServiceResolverConfig;
 import io.opentelemetry.sdk.extension.controlplane.peerservice.PeerServiceSpanProcessor;
 import java.util.logging.Level;
@@ -63,12 +63,8 @@ public final class ControlPlaneAutoConfigurationProvider
           // 注册 peer.service 自动填充处理器
           PeerServiceResolverConfig peerServiceConfig = PeerServiceResolverConfig.create(config);
           if (peerServiceConfig.isEnabled()) {
-            String serviceName = AgentIdentityProvider.getServiceName();
-            builder.addSpanProcessor(
-                new CallerServiceBaggageSpanProcessor(
-                    serviceName, peerServiceConfig.getBaggageKey()));
             builder.addSpanProcessor(new PeerServiceSpanProcessor(peerServiceConfig));
-            logger.log(Level.INFO, "Registered peer.service processors");
+            logger.log(Level.INFO, "Registered PeerServiceSpanProcessor");
           }
 
           // 初始化并启动控制平面管理器
@@ -94,6 +90,33 @@ public final class ControlPlaneAutoConfigurationProvider
               AgentIdentityProvider.get().getAgentId());
 
           return resource;
+        });
+
+    // 添加传播器自定义：在 inject 阶段将 caller.service.name 注入 Baggage
+    // 注意：propagatorCustomizer 在 resourceCustomizer 之后执行，
+    // 此时 AgentIdentityProvider 已初始化
+    autoConfiguration.addPropagatorCustomizer(
+        (propagator, config) -> {
+          if (!isEnabled(config)) {
+            return propagator;
+          }
+
+          PeerServiceResolverConfig peerServiceConfig = PeerServiceResolverConfig.create(config);
+          if (!peerServiceConfig.isEnabled()) {
+            return propagator;
+          }
+
+          String serviceName = AgentIdentityProvider.getServiceName();
+          if (serviceName == null || serviceName.isEmpty()) {
+            logger.log(
+                Level.WARNING,
+                "Service name is empty, CallerServiceBaggagePropagator will not be registered");
+            return propagator;
+          }
+
+          logger.log(Level.INFO, "Wrapping propagator with CallerServiceBaggagePropagator");
+          return new CallerServiceBaggagePropagator(
+              propagator, serviceName, peerServiceConfig.getBaggageKey());
         });
   }
 

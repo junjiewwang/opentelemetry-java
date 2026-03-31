@@ -13,8 +13,8 @@
  * <ul>
  *   <li>{@link io.opentelemetry.sdk.extension.controlplane.peerservice.PeerServiceSpanProcessor}
  *       - 在 onEnding() 中根据 Span 类型推断并填充 peer.service</li>
- *   <li>{@link io.opentelemetry.sdk.extension.controlplane.peerservice.CallerServiceBaggageSpanProcessor}
- *       - 在 onStart() 中将本服务 service.name 注入 Baggage，传递给下游</li>
+ *   <li>{@link io.opentelemetry.sdk.extension.controlplane.peerservice.CallerServiceBaggagePropagator}
+ *       - 装饰原始 TextMapPropagator，在 inject() 时将本服务 service.name 注入 Baggage 传递给下游</li>
  *   <li>{@link io.opentelemetry.sdk.extension.controlplane.peerservice.PeerServiceResolverConfig}
  *       - 配置类，持有 service_mapping、推断策略开关等</li>
  * </ul>

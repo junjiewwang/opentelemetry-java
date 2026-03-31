@@ -12,6 +12,7 @@ import io.opentelemetry.context.Context;
 import io.opentelemetry.sdk.trace.ReadWriteSpan;
 import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.internal.ExtendedSpanProcessor;
+import java.util.List;
 import java.util.Objects;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -20,14 +21,16 @@ import javax.annotation.Nullable;
 /**
  * peer.service 自动填充处理器
  *
- * <p>实现 {@link ExtendedSpanProcessor}，在 {@code onEnding()} 阶段根据 Span 类型自动填充
- * {@code peer.service} 属性，使可观测后端能正确绘制服务拓扑图。
+ * <p>实现 {@link ExtendedSpanProcessor}，根据 Span 类型自动填充 {@code peer.service} 属性，
+ * 使可观测后端能正确绘制服务拓扑图。
  *
  * <h2>处理逻辑</h2>
  * <ul>
- *   <li><b>SERVER/CONSUMER（入方向）</b>：从 Baggage 中读取 {@code caller.service.name}，
- *       设置为 {@code peer.service}（表示"谁调用了我"）</li>
- *   <li><b>CLIENT/PRODUCER（出方向）</b>：按优先级推断 peer.service：
+ *   <li><b>SERVER/CONSUMER（入方向）</b>：在 {@code onStart()} 阶段从 Baggage 中读取
+ *       {@code caller.service.name}，直接设置为 {@code peer.service}（表示"谁调用了我"）。
+ *       在 {@code onStart()} 中处理是因为此时可以访问 {@code parentContext}（Baggage），
+ *       且 {@code ReadWriteSpan} 可写，无需引入临时属性。</li>
+ *   <li><b>CLIENT/PRODUCER（出方向）</b>：在 {@code onEnding()} 阶段按优先级推断 peer.service：
  *     <ol>
  *       <li>已有 peer.service → 直接使用</li>
  *       <li>中间件类推断（DB: {@code db.system:server.address:server.port/db.name}，
@@ -36,6 +39,7 @@ import javax.annotation.Nullable;
  *       <li>service_mapping 匹配</li>
  *       <li>rpc.service</li>
  *     </ol>
+ *     在 {@code onEnding()} 中处理是因为需要等待 Response Header 等属性就绪。
  *   </li>
  * </ul>
  */
@@ -46,10 +50,6 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
 
   // peer.service 属性键
   private static final AttributeKey<String> PEER_SERVICE = AttributeKey.stringKey("peer.service");
-
-  // 内部临时属性键（用于在 onStart 和 onEnding 之间传递 Baggage 中的 caller 信息）
-  private static final AttributeKey<String> INTERNAL_CALLER_SERVICE =
-      AttributeKey.stringKey("_internal.caller.service.name");
 
   // DB 相关语义约定属性键
   private static final AttributeKey<String> DB_SYSTEM = AttributeKey.stringKey("db.system");
@@ -76,8 +76,6 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
       AttributeKey.stringKey("net.peer.name");
   private static final AttributeKey<Long> NET_PEER_PORT = AttributeKey.longKey("net.peer.port");
 
-  // RPC 相关属性键
-  private static final AttributeKey<String> RPC_SERVICE = AttributeKey.stringKey("rpc.service");
 
   private final PeerServiceResolverConfig config;
 
@@ -100,13 +98,23 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
     }
 
     SpanKind kind = span.getKind();
-    // 对于 SERVER/CONSUMER Span，在 onStart 时从 Baggage 中读取 caller.service.name
-    // 并缓存为临时属性，因为 onEnding 中无法访问 Context
+    // 对于 SERVER/CONSUMER Span，直接在 onStart 中从 Baggage 读取 caller.service.name
+    // 并设置 peer.service。在 onStart 中处理的原因：
+    // 1. 此时可以访问 parentContext（Baggage）
+    // 2. ReadWriteSpan 可写，可以直接设置 peer.service
+    // 3. 无需引入临时属性（如 _internal.caller.service.name），避免属性清理问题
+    //    （OTel SDK 的 SdkSpan.setAttribute(key, null) 会被忽略，无法真正删除属性）
     if (kind == SpanKind.SERVER || kind == SpanKind.CONSUMER) {
+      // 如果已有 peer.service，直接返回
+      String existingPeerService = span.getAttribute(PEER_SERVICE);
+      if (existingPeerService != null && !existingPeerService.isEmpty()) {
+        return;
+      }
+
       Baggage baggage = Baggage.fromContext(parentContext);
       String callerService = baggage.getEntryValue(config.getBaggageKey());
       if (callerService != null && !callerService.isEmpty()) {
-        span.setAttribute(INTERNAL_CALLER_SERVICE, callerService);
+        span.setAttribute(PEER_SERVICE, callerService);
       }
     }
   }
@@ -134,29 +142,21 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
       return;
     }
 
+    SpanKind kind = span.getKind();
+
+    // 仅处理 CLIENT/PRODUCER（出方向）Span
+    // SERVER/CONSUMER 已在 onStart() 中处理完毕
+    if (kind != SpanKind.CLIENT && kind != SpanKind.PRODUCER) {
+      return;
+    }
+
     // 如果已有 peer.service，直接返回
     String existingPeerService = span.getAttribute(PEER_SERVICE);
     if (existingPeerService != null && !existingPeerService.isEmpty()) {
       return;
     }
 
-    SpanKind kind = span.getKind();
-    String peerService = null;
-
-    switch (kind) {
-      case SERVER:
-      case CONSUMER:
-        peerService = resolveForInbound(span);
-        break;
-      case CLIENT:
-      case PRODUCER:
-        peerService = resolveForOutbound(span);
-        break;
-      default:
-        // INTERNAL 类型不处理
-        break;
-    }
-
+    String peerService = resolveForOutbound(span);
     if (peerService != null && !peerService.isEmpty()) {
       span.setAttribute(PEER_SERVICE, peerService);
     }
@@ -165,24 +165,6 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
   @Override
   public boolean isOnEndingRequired() {
     return true;
-  }
-
-  // ===== 入方向解析（SERVER/CONSUMER） =====
-
-  /**
-   * 解析入方向 Span 的 peer.service
-   *
-   * <p>从 onStart 阶段缓存的临时属性中读取 caller.service.name
-   */
-  @Nullable
-  private static String resolveForInbound(ReadWriteSpan span) {
-    String callerService = span.getAttribute(INTERNAL_CALLER_SERVICE);
-    if (callerService != null && !callerService.isEmpty()) {
-      // 移除临时属性，避免导出到后端
-      span.setAttribute(INTERNAL_CALLER_SERVICE, (String) null);
-      return callerService;
-    }
-    return null;
   }
 
   // ===== 出方向解析（CLIENT/PRODUCER） =====
@@ -223,9 +205,7 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
     if (result != null) {
       return result;
     }
-
-    // 5. rpc.service
-    return span.getAttribute(RPC_SERVICE);
+    return "";
   }
 
   /**
@@ -329,19 +309,34 @@ public final class PeerServiceSpanProcessor implements ExtendedSpanProcessor {
   /**
    * 从 Response Header 中获取 peer.service
    *
-   * <p>OTel instrumentation 捕获的 response header 存储为
-   * {@code http.response.header.<header-name>} 属性
+   * <p>OTel HTTP instrumentation 捕获的 response header 存储为
+   * {@code http.response.header.<header-name>} 属性，类型为 {@code List<String>}。
+   * 本方法优先尝试 {@code List<String>} 类型读取，降级到 {@code String} 类型以兼容自定义场景。
    */
   @Nullable
   private String resolveFromResponseHeader(ReadWriteSpan span) {
-    AttributeKey<String> headerKey =
-        AttributeKey.stringKey(config.getResponseHeaderAttributeKey());
-    String headerValue = span.getAttribute(headerKey);
+    String attributeKeyName = config.getResponseHeaderAttributeKey();
+
+    // 优先尝试 List<String> 类型（OTel HTTP instrumentation 标准行为）
+    AttributeKey<List<String>> listHeaderKey = AttributeKey.stringArrayKey(attributeKeyName);
+    List<String> headerValues = span.getAttribute(listHeaderKey);
+    if (headerValues != null && !headerValues.isEmpty()) {
+      String value = headerValues.get(headerValues.size() - 1);
+      if (value != null && !value.isEmpty()) {
+        // 移除临时的 response header 属性，避免导出到后端
+        span.setAttribute(listHeaderKey, null);
+        return value;
+      }
+    }
+
+    // 降级到 String 类型（兼容自定义场景）
+    AttributeKey<String> stringHeaderKey = AttributeKey.stringKey(attributeKeyName);
+    String headerValue = span.getAttribute(stringHeaderKey);
     if (headerValue != null && !headerValue.isEmpty()) {
-      // 移除临时的 response header 属性，避免导出到后端
-      span.setAttribute(headerKey, (String) null);
+      span.setAttribute(stringHeaderKey, (String) null);
       return headerValue;
     }
+
     return null;
   }
 
