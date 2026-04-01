@@ -12,6 +12,7 @@ import io.opentelemetry.sdk.extension.controlplane.core.model.ServerMetadata;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager.ServerMetadataListener;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasExecSyncExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
@@ -70,6 +71,9 @@ public final class ArthasIntegration
   /** 就绪门闩：集中判定/等待 Terminal 可交互能力 */
   private final ArthasReadinessGate readinessGate;
 
+  /** 结构化命令桥接器：负责反射复用 Arthas 内部 CommandExecutorImpl */
+  private final ArthasStructuredCommandBridge structuredCommandBridge;
+
   // ===== 运行时状态（从 ArthasConfig 移出，由 Integration 管理） =====
 
   /** 服务端下发的 HTTP 端口（用于修正 gRPC 场景下的 Tunnel 端口） */
@@ -112,6 +116,9 @@ public final class ArthasIntegration
     this.environment = ArthasEnvironmentDetector.detect();
     this.lifecycleManager = new ArthasLifecycleManager(config, this);
     this.lifecycleManager.setStateEventBus(stateEventBus);
+
+    this.structuredCommandBridge =
+        new ArthasStructuredCommandBridge(lifecycleManager.getArthasBootstrap());
 
     // readinessGate 依赖 lifecycleManager，必须在 lifecycleManager 初始化之后构造
     this.readinessGate = new ArthasReadinessGate(stateEventBus, lifecycleManager);
@@ -256,6 +263,7 @@ public final class ArthasIntegration
 
     return Arrays.asList(
         new ArthasAttachExecutor(this, scheduler),
+        new ArthasExecSyncExecutor(this),
         new ArthasDetachExecutor(this));
   }
 
@@ -381,6 +389,11 @@ public final class ArthasIntegration
   /** 获取生命周期管理器 */
   public ArthasLifecycleManager getLifecycleManager() {
     return lifecycleManager;
+  }
+
+  /** 获取结构化命令桥接器 */
+  public ArthasStructuredCommandBridge getStructuredCommandBridge() {
+    return structuredCommandBridge;
   }
 
 

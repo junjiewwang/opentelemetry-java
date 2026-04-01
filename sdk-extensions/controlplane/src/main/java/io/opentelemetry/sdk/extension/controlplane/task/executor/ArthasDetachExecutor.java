@@ -7,6 +7,7 @@ package io.opentelemetry.sdk.extension.controlplane.task.executor;
 
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager;
+import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasTaskProtocol;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Locale;
@@ -38,7 +39,7 @@ public final class ArthasDetachExecutor implements TaskExecutor {
   private static final Logger logger = Logger.getLogger(ArthasDetachExecutor.class.getName());
 
   /** 任务类型 */
-  public static final String TASK_TYPE = "arthas_detach";
+  public static final String TASK_TYPE = ArthasTaskProtocol.TaskType.DETACH;
 
   /** 默认停止超时：10秒 */
   private static final long DEFAULT_STOP_TIMEOUT_MILLIS = 10 * 1000;
@@ -84,15 +85,16 @@ public final class ArthasDetachExecutor implements TaskExecutor {
     if (arthasIntegration == null) {
       logger.log(Level.WARNING, "[ARTHAS-DETACH] ArthasIntegration not configured");
       future.complete(TaskExecutionResult.failed(
-          "ARTHAS_NOT_CONFIGURED",
+          ArthasTaskProtocol.ErrorCode.ARTHAS_NOT_CONFIGURED,
           "ArthasIntegration is not configured"));
       return future;
     }
 
     // 获取参数
-    String action = context.getStringParameter("action", "detach");
-    long stopTimeout = context.getLongParameter("stop_timeout_millis", DEFAULT_STOP_TIMEOUT_MILLIS);
-    boolean force = context.getBooleanParameter("force", false);
+    String action = context.getStringParameter(ArthasTaskProtocol.ParameterKey.ACTION, "detach");
+    long stopTimeout = context.getLongParameter(
+        ArthasTaskProtocol.ParameterKey.STOP_TIMEOUT_MILLIS, DEFAULT_STOP_TIMEOUT_MILLIS);
+    boolean force = context.getBooleanParameter(ArthasTaskProtocol.ParameterKey.FORCE, false);
 
     logger.log(
         Level.INFO,
@@ -127,7 +129,7 @@ public final class ArthasDetachExecutor implements TaskExecutor {
         long executionTime = System.currentTimeMillis() - startTime;
         logger.log(Level.WARNING, "[ARTHAS-DETACH] Execution failed: {0}", e.getMessage());
         future.complete(TaskExecutionResult.failed(
-            "ARTHAS_DETACH_ERROR",
+            ArthasTaskProtocol.ErrorCode.ARTHAS_DETACH_ERROR,
             "Arthas detach failed: " + e.getMessage(),
             executionTime));
       }
@@ -221,7 +223,7 @@ public final class ArthasDetachExecutor implements TaskExecutor {
       }
 
       return TaskExecutionResult.failed(
-          "STOP_REQUEST_FAILED",
+          ArthasTaskProtocol.ErrorCode.STOP_REQUEST_FAILED,
           "Failed to initiate Arthas stop, current state: " + newState);
     }
 
@@ -288,7 +290,7 @@ public final class ArthasDetachExecutor implements TaskExecutor {
             "[ARTHAS-DETACH] Stop cancelled, Arthas returned to {0}, taskId={1}",
             new Object[] {state, taskId});
         return TaskExecutionResult.failed(
-            "STOP_CANCELLED",
+            ArthasTaskProtocol.ErrorCode.STOP_CANCELLED,
             "Arthas stop was cancelled, current state: " + state);
       }
 
@@ -297,7 +299,7 @@ public final class ArthasDetachExecutor implements TaskExecutor {
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         return TaskExecutionResult.failed(
-            "INTERRUPTED",
+            ArthasTaskProtocol.ErrorCode.INTERRUPTED,
             "Interrupted while waiting for Arthas to stop");
       }
     }
@@ -348,7 +350,7 @@ public final class ArthasDetachExecutor implements TaskExecutor {
 
     // 【重构】使用 JsonUtils 构建 JSON，避免 String.format 的特殊字符问题
     String resultJson = JsonUtils.toJsonObject(
-        "arthas_state", manager.getState().name());
+        ArthasTaskProtocol.ResultField.ARTHAS_STATE, manager.getState().name());
 
     // message 仅用于日志记录
     logger.log(

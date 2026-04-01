@@ -571,10 +571,14 @@ public final class LongPollCoordinator implements Closeable {
         .build();
 
     // 构建 TaskRequest（复用 task.proto 定义）
+    TaskLongPollHandler taskHandler = getTaskHandler();
+    AgentCapabilities capabilities =
+        taskHandler != null ? taskHandler.buildAgentCapabilities() : AgentCapabilities.newBuilder().build();
+
     TaskRequest taskRequest = TaskRequest.newBuilder()
         .setAgentId(agentId)
         .setLongPollTimeoutMillis(timeoutMillis)
-        .setCapabilities(AgentCapabilities.newBuilder().build())
+        .setCapabilities(capabilities)
         .build();
 
     // 构建统一轮询请求（顶层 agent_id/timeout 优先级高于子请求）

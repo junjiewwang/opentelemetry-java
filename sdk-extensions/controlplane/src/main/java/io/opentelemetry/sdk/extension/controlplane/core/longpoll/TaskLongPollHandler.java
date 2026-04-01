@@ -18,6 +18,7 @@ import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskDispatcher;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusReporter;
 import java.util.HashMap;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -570,7 +571,23 @@ public final class TaskLongPollHandler implements LongPollHandler<TaskResponse> 
     return TaskRequest.newBuilder()
         .setAgentId(AgentIdentityProvider.getAgentId())
         .setLongPollTimeoutMillis(config.getTimeoutMillis())
-        .setCapabilities(AgentCapabilities.newBuilder().build())
+        .setCapabilities(buildAgentCapabilities())
         .build();
+  }
+
+  AgentCapabilities buildAgentCapabilities() {
+    AgentCapabilities.Builder builder = AgentCapabilities.newBuilder();
+
+    TaskDispatcher dispatcher = this.taskDispatcher;
+    if (dispatcher == null) {
+      return builder.build();
+    }
+
+    List<String> supportedTaskTypes = new ArrayList<>(dispatcher.getRegisteredTaskTypes());
+    supportedTaskTypes.sort(String::compareTo);
+
+    builder.addAllSupportedTaskTypes(supportedTaskTypes);
+    builder.setMaxConcurrentTasks(Math.max(1, dispatcher.getExecutorCount()));
+    return builder.build();
   }
 }

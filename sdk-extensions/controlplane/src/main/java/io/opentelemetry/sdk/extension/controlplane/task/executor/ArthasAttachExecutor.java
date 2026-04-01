@@ -6,6 +6,7 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager.StartResult;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasReadinessGate;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasStateEventBus;
+import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasTaskProtocol;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Locale;
@@ -45,7 +46,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
   private static final Logger logger = Logger.getLogger(ArthasAttachExecutor.class.getName());
 
   /** 任务类型 */
-  public static final String TASK_TYPE = "arthas_attach";
+  public static final String TASK_TYPE = ArthasTaskProtocol.TaskType.ATTACH;
 
   /** 默认启动超时：30秒 */
   private static final long DEFAULT_START_TIMEOUT_MILLIS = 30 * 1000;
@@ -145,14 +146,16 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     if (arthasIntegration == null) {
       logger.log(Level.WARNING, "[ARTHAS-ATTACH] ArthasIntegration not configured");
       future.complete(TaskExecutionResult.failed(
-          "ARTHAS_NOT_CONFIGURED",
+          ArthasTaskProtocol.ErrorCode.ARTHAS_NOT_CONFIGURED,
           "ArthasIntegration is not configured"));
       return future;
     }
 
     // 获取参数（统一计算有效超时）
-    long startTimeout = context.getLongParameter("start_timeout_millis", DEFAULT_START_TIMEOUT_MILLIS);
-    long connectTimeout = context.getLongParameter("connect_timeout_millis", DEFAULT_CONNECT_TIMEOUT_MILLIS);
+    long startTimeout = context.getLongParameter(
+        ArthasTaskProtocol.ParameterKey.START_TIMEOUT_MILLIS, DEFAULT_START_TIMEOUT_MILLIS);
+    long connectTimeout = context.getLongParameter(
+        ArthasTaskProtocol.ParameterKey.CONNECT_TIMEOUT_MILLIS, DEFAULT_CONNECT_TIMEOUT_MILLIS);
     // 有效超时：取 startTimeout 和 connectTimeout 的较大值
     long effectiveTimeout = Math.max(startTimeout, connectTimeout);
 
@@ -181,7 +184,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // 获取有效调度器
     ScheduledExecutorService effectiveScheduler = scheduler != null ? scheduler : context.getScheduler();
     if (effectiveScheduler == null) {
-      future.complete(TaskExecutionResult.failed("NO_SCHEDULER", "No scheduler available for attach operation"));
+      future.complete(TaskExecutionResult.failed(
+          ArthasTaskProtocol.ErrorCode.NO_SCHEDULER,
+          "No scheduler available for attach operation"));
       return future;
     }
 
@@ -273,7 +278,10 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                 if (startResult.isFailed()) {
                   // 启动请求本身失败（如：状态不允许启动）
                   long executionTime = System.currentTimeMillis() - startTime;
-                  String errorCode = startResult.getErrorCode() != null ? startResult.getErrorCode() : "UNKNOWN_ERROR";
+                  String errorCode =
+                      startResult.getErrorCode() != null
+                          ? startResult.getErrorCode()
+                          : ArthasTaskProtocol.ErrorCode.COMMAND_EXECUTION_FAILED;
                   String errorMsg = startResult.getErrorMessage() != null ? startResult.getErrorMessage() : "Unknown error";
                   // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
                   // emitter.failed(errorCode, errorMsg);
@@ -297,7 +305,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                 logger.log(Level.WARNING, "[ARTHAS-ATTACH] Execution exception: {0}", e.getMessage());
                 future.complete(
                     TaskExecutionResult.failed(
-                        "ARTHAS_ATTACH_ERROR",
+                        ArthasTaskProtocol.ErrorCode.ARTHAS_ATTACH_ERROR,
                         "Arthas attach failed: " + e.getMessage(),
                         executionTime));
               }
@@ -328,7 +336,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
       // emitter.failed("ARTHAS_START_FAILED", msg);
       logger.log(Level.WARNING, "[ARTHAS-ATTACH] Start failed: {0}", msg);
-      future.complete(TaskExecutionResult.failed("ARTHAS_START_FAILED", msg, executionTime));
+      future.complete(TaskExecutionResult.failed(
+          ArthasTaskProtocol.ErrorCode.ARTHAS_START_FAILED, msg, executionTime));
       return;
     }
 
@@ -366,7 +375,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
     // emitter.failed("ARTHAS_ATTACH_STATE_INVALID", msg);
     logger.log(Level.WARNING, "[ARTHAS-ATTACH] Invalid state: {0}", msg);
-    future.complete(TaskExecutionResult.failed("ARTHAS_ATTACH_STATE_INVALID", msg, executionTime));
+    future.complete(TaskExecutionResult.failed(
+        ArthasTaskProtocol.ErrorCode.ARTHAS_ATTACH_STATE_INVALID, msg, executionTime));
   }
 
   /**
@@ -397,7 +407,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
       // emitter.failed("ARTHAS_START_FAILED", msg);
       logger.log(Level.WARNING, "[ARTHAS-ATTACH] Timeout with STOPPED state: {0}", msg);
-      future.complete(TaskExecutionResult.failed("ARTHAS_START_FAILED", msg, executionTime));
+      future.complete(TaskExecutionResult.failed(
+          ArthasTaskProtocol.ErrorCode.ARTHAS_START_FAILED, msg, executionTime));
     } else {
       String logSummary = getStartupLogSummary(manager);
       String timeoutMsg = String.format(
@@ -452,7 +463,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
                 logger.log(Level.WARNING, "[ARTHAS-ATTACH] Execution failed: {0}", e.getMessage());
                 future.complete(
                     TaskExecutionResult.failed(
-                        "ARTHAS_ATTACH_ERROR",
+                        ArthasTaskProtocol.ErrorCode.ARTHAS_ATTACH_ERROR,
                         "Arthas attach failed: " + e.getMessage(),
                         executionTime));
               }
@@ -513,7 +524,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
           "[ARTHAS-ATTACH] Failed to start Arthas: {0}, taskId={1}",
           new Object[] {startResult.getErrorMessage(), taskId});
       return TaskExecutionResult.failed(
-          "ARTHAS_START_FAILED",
+          ArthasTaskProtocol.ErrorCode.ARTHAS_START_FAILED,
           "Failed to start Arthas: " + startResult.getErrorMessage());
     }
 
@@ -588,7 +599,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       if (state == ArthasLifecycleManager.State.STOPPED) {
         String logSummary = getStartupLogSummary(manager);
         return TaskExecutionResult.failed(
-            "ARTHAS_STOPPED",
+            ArthasTaskProtocol.ErrorCode.ARTHAS_STOPPED,
             "Arthas stopped unexpectedly." + logSummary);
       }
 
@@ -597,7 +608,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         return TaskExecutionResult.failed(
-            "INTERRUPTED",
+            ArthasTaskProtocol.ErrorCode.INTERRUPTED,
             "Interrupted while waiting for Arthas to start");
       }
     }
@@ -691,7 +702,9 @@ public final class ArthasAttachExecutor implements TaskExecutor {
         Thread.sleep(CHECK_INTERVAL_MILLIS);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        return TaskExecutionResult.failed("INTERRUPTED", "Interrupted while waiting for tunnel registration");
+        return TaskExecutionResult.failed(
+            ArthasTaskProtocol.ErrorCode.INTERRUPTED,
+            "Interrupted while waiting for tunnel registration");
       }
     }
 
@@ -721,8 +734,8 @@ public final class ArthasAttachExecutor implements TaskExecutor {
 
     // 【重构】使用 JsonUtils 构建 JSON，避免 String.format 的特殊字符问题
     String resultJson = JsonUtils.toJsonObject(
-        "arthas_state", manager.getState().name(),
-        "tunnel_ready", tunnelReady);
+        ArthasTaskProtocol.ResultField.ARTHAS_STATE, manager.getState().name(),
+        ArthasTaskProtocol.ResultField.TUNNEL_READY, tunnelReady);
 
     // message 仅用于日志记录
     logger.log(
@@ -761,7 +774,7 @@ public final class ArthasAttachExecutor implements TaskExecutor {
 
     // 动态计算 grace（允许服务端通过参数覆盖）
     long gracePeriod = context.getLongParameter(
-        "health_check_grace_period_millis",
+        ArthasTaskProtocol.ParameterKey.HEALTH_CHECK_GRACE_PERIOD_MILLIS,
         calculateGracePeriod(effectiveTimeout));
 
     // 先做诊断检查（不执行清理）
