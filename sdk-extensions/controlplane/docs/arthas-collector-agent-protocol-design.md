@@ -233,7 +233,7 @@ Agent **不负责**：
   "ttl_ms": 300000,
   "idle_timeout_ms": 60000,
   "auto_attach": true,
-  "require_tunnel_ready": true
+  "require_tunnel_ready": false
 }
 ```
 
