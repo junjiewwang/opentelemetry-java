@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Executor;
 import javax.annotation.Nullable;
 
 /**
@@ -46,6 +47,7 @@ public final class TaskExecutionContext {
   @Nullable private final ControlPlaneService service;
   @Nullable private final ScheduledExecutorService scheduler;
   @Nullable private final TaskStatusEmitter statusEmitter;
+  @Nullable private final Executor taskExecutor;
 
   // 执行跟踪
   private final long receivedAtMillis;
@@ -63,6 +65,7 @@ public final class TaskExecutionContext {
     this.service = builder.service;
     this.scheduler = builder.scheduler;
     this.statusEmitter = builder.statusEmitter;
+    this.taskExecutor = builder.taskExecutor;
     this.receivedAtMillis = builder.receivedAtMillis;
   }
 
@@ -142,6 +145,11 @@ public final class TaskExecutionContext {
   @Nullable
   public TaskStatusEmitter getStatusEmitter() {
     return statusEmitter;
+  }
+
+  @Nullable
+  public Executor getTaskExecutor() {
+    return taskExecutor;
   }
 
   public long getReceivedAtMillis() {
@@ -277,6 +285,7 @@ public final class TaskExecutionContext {
     @Nullable private ControlPlaneService service;
     @Nullable private ScheduledExecutorService scheduler;
     @Nullable private TaskStatusEmitter statusEmitter;
+    @Nullable private Executor taskExecutor;
     private long receivedAtMillis = System.currentTimeMillis();
 
     public Builder taskId(String taskId) {
@@ -357,6 +366,11 @@ public final class TaskExecutionContext {
 
     public Builder statusEmitter(@Nullable TaskStatusEmitter statusEmitter) {
       this.statusEmitter = statusEmitter;
+      return this;
+    }
+
+    public Builder taskExecutor(@Nullable Executor taskExecutor) {
+      this.taskExecutor = taskExecutor;
       return this;
     }
 

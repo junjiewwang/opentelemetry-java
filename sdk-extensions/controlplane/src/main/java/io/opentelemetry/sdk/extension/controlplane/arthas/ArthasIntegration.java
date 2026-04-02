@@ -13,6 +13,11 @@ import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager.
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasDetachExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasExecSyncExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasSessionCloseExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasSessionExecExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasSessionInterruptExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasSessionOpenExecutor;
+import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasSessionPullExecutor;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.TaskExecutor;
 import java.io.Closeable;
 import java.lang.instrument.Instrumentation;
@@ -74,6 +79,9 @@ public final class ArthasIntegration
   /** 结构化命令桥接器：负责反射复用 Arthas 内部 CommandExecutorImpl */
   private final ArthasStructuredCommandBridge structuredCommandBridge;
 
+  /** Arthas 异步会话注册表：负责 session 生命周期、TTL 与 idle timeout 管理。 */
+  private final ArthasSessionRegistry sessionRegistry = new ArthasSessionRegistry();
+
   // ===== 运行时状态（从 ArthasConfig 移出，由 Integration 管理） =====
 
   /** 服务端下发的 HTTP 端口（用于修正 gRPC 场景下的 Tunnel 端口） */
@@ -86,9 +94,11 @@ public final class ArthasIntegration
 
   /** Tunnel 断开后的超时销毁任务 */
   @Nullable private ScheduledFuture<?> tunnelDisconnectTimeoutTask;
+  @Nullable private ScheduledFuture<?> sessionCleanupTask;
 
   /** Tunnel 断开后等待重连的超时时间（毫秒） */
   private static final long TUNNEL_RECONNECT_TIMEOUT_MILLIS = 300_000;
+  private static final long SESSION_CLEANUP_INTERVAL_MILLIS = 10_000;
 
   /** 组件是否已启动 */
   private final AtomicBoolean started = new AtomicBoolean(false);
@@ -200,11 +210,13 @@ public final class ArthasIntegration
     // 【模式2核心】启动 Tunnel 状态桥接器
     // 从 Arthas 内部获取 tunnel 状态，桥接到 OTel 状态事件总线
     tunnelStatusBridge.start(scheduler, 1000); // 每秒轮询一次
+    scheduleSessionCleanup();
 
     logger.log(
         Level.INFO,
         "Arthas integration started (Mode2: official tunnel), environment: {0}",
         environment);
+
   }
 
   /**
@@ -228,6 +240,7 @@ public final class ArthasIntegration
   public void close() {
     stop();
     cancelTunnelDisconnectTimeout();
+    cancelSessionCleanup();
     tunnelStatusBridge.stop();
     lifecycleManager.close();
     started.set(false);
@@ -264,7 +277,13 @@ public final class ArthasIntegration
     return Arrays.asList(
         new ArthasAttachExecutor(this, scheduler),
         new ArthasExecSyncExecutor(this),
-        new ArthasDetachExecutor(this));
+        new ArthasDetachExecutor(this),
+        new ArthasSessionOpenExecutor(this),
+        new ArthasSessionExecExecutor(this),
+        new ArthasSessionPullExecutor(this),
+        new ArthasSessionInterruptExecutor(this),
+        new ArthasSessionCloseExecutor(this));
+
   }
 
   // ===== ServerMetadataListener 接口实现 =====
@@ -396,6 +415,16 @@ public final class ArthasIntegration
     return structuredCommandBridge;
   }
 
+  /** 获取 Arthas 异步会话注册表。 */
+  public ArthasSessionRegistry getSessionRegistry() {
+    return sessionRegistry;
+  }
+
+  /** 获取组件调度器。 */
+  @Nullable
+  public ScheduledExecutorService getScheduler() {
+    return scheduler;
+  }
 
   /** 获取环境信息 */
   public ArthasEnvironmentDetector.Environment getEnvironment() {
@@ -689,12 +718,33 @@ public final class ArthasIntegration
     }
   }
 
+  private void scheduleSessionCleanup() {
+    cancelSessionCleanup();
+    if (scheduler == null) {
+      return;
+    }
+    sessionCleanupTask =
+        scheduler.scheduleWithFixedDelay(
+            sessionRegistry::cleanupExpiredSessions,
+            SESSION_CLEANUP_INTERVAL_MILLIS,
+            SESSION_CLEANUP_INTERVAL_MILLIS,
+            TimeUnit.MILLISECONDS);
+  }
+
+  private void cancelSessionCleanup() {
+    if (sessionCleanupTask != null) {
+      sessionCleanupTask.cancel(false);
+      sessionCleanupTask = null;
+    }
+  }
+
   /**
    * 安排 tunnel 断开超时任务
    *
    * <p>如果在超时时间内 tunnel 未重连，则销毁 Arthas。
    */
   private void scheduleTunnelDisconnectTimeout(String disconnectReason) {
+
     // 取消之前的超时任务（如果有）
     cancelTunnelDisconnectTimeout();
 

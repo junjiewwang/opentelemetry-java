@@ -333,6 +333,7 @@ public final class TaskDispatcher implements Closeable {
         .scheduler(context.getScheduler())
         .receivedAtMillis(context.getReceivedAtMillis())
         .statusEmitter(emitter)
+        .taskExecutor(taskExecutor)
         .build();
 
     // 记录任务开始
@@ -502,6 +503,7 @@ public final class TaskDispatcher implements Closeable {
         .parametersJson(task.getParametersJson())
         .service(service)
         .scheduler(scheduler)
+        .taskExecutor(taskExecutor)
         .receivedAtMillis(System.currentTimeMillis())
         .build();
   }
