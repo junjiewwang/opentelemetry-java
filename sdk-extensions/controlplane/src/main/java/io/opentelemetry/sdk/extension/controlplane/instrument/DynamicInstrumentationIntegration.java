@@ -25,8 +25,9 @@ import java.util.logging.Logger;
  * <p>遵循与 {@code AsyncProfilerIntegration} 相同的设计模式：
  * <ul>
  *   <li>{@link ControlPlaneComponent}：统一生命周期管理（start / stop / close）</li>
- *   <li>{@link TaskExecutorProvider}：自动注册 {@code dynamic_instrument} 和
- *       {@code dynamic_uninstrument} 任务执行器到 TaskDispatcher</li>
+ *   <li>{@link TaskExecutorProvider}：自动注册 {@code dynamic_instrument}、
+ *       {@code dynamic_uninstrument} 和 {@code dynamic_instrument_list}
+ *       任务执行器到 TaskDispatcher</li>
  * </ul>
  *
  * <p>使用方式：
@@ -51,17 +52,20 @@ public final class DynamicInstrumentationIntegration
   private final EnhancementStateRegistry stateRegistry;
   private final DynamicInstrumentExecutor instrumentExecutor;
   private final DynamicUninstrumentExecutor uninstrumentExecutor;
+  private final DynamicInstrumentListExecutor listExecutor;
   private final AtomicBoolean started = new AtomicBoolean(false);
 
   private DynamicInstrumentationIntegration(
       TransformerManager transformerManager,
       EnhancementStateRegistry stateRegistry,
       DynamicInstrumentExecutor instrumentExecutor,
-      DynamicUninstrumentExecutor uninstrumentExecutor) {
+      DynamicUninstrumentExecutor uninstrumentExecutor,
+      DynamicInstrumentListExecutor listExecutor) {
     this.transformerManager = transformerManager;
     this.stateRegistry = stateRegistry;
     this.instrumentExecutor = instrumentExecutor;
     this.uninstrumentExecutor = uninstrumentExecutor;
+    this.listExecutor = listExecutor;
   }
 
   /**
@@ -81,6 +85,8 @@ public final class DynamicInstrumentationIntegration
     TransformerManager manager = new TransformerManager(provider, registry);
     DynamicInstrumentExecutor instrumentExecutor = new DynamicInstrumentExecutor(manager);
     DynamicUninstrumentExecutor uninstrumentExecutor = new DynamicUninstrumentExecutor(manager);
+    DynamicInstrumentListExecutor listExecutor =
+        new DynamicInstrumentListExecutor(registry, manager, provider);
 
     logger.log(Level.INFO,
         "[DYNAMIC-INSTRUMENT] Integration created: instrumentationAvailable={0}, "
@@ -88,7 +94,7 @@ public final class DynamicInstrumentationIntegration
         new Object[] {provider.isAvailable(), provider.hasEnhancementCapability()});
 
     return new DynamicInstrumentationIntegration(
-        manager, registry, instrumentExecutor, uninstrumentExecutor);
+        manager, registry, instrumentExecutor, uninstrumentExecutor, listExecutor);
   }
 
   // ===== ControlPlaneComponent 接口 =====
@@ -136,7 +142,7 @@ public final class DynamicInstrumentationIntegration
 
   @Override
   public List<TaskExecutor> getTaskExecutors() {
-    return Arrays.asList(instrumentExecutor, uninstrumentExecutor);
+    return Arrays.asList(instrumentExecutor, uninstrumentExecutor, listExecutor);
   }
 
   // ===== 额外的管理 API =====
