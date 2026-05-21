@@ -7,7 +7,11 @@ package io.opentelemetry.sdk.extension.controlplane.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
+import io.opentelemetry.sdk.autoconfigure.spi.internal.DefaultConfigProperties;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class ControlPlaneConfigTest {
@@ -17,11 +21,25 @@ class ControlPlaneConfigTest {
     ControlPlaneConfig config = ControlPlaneConfig.builder().build();
 
     assertThat(config.isEnabled()).isTrue(); // 默认启用控制平面
-    assertThat(config.getProtocol()).isEqualTo("grpc");
+    // 未配置 otel.exporter.otlp.protocol 时，fallback 为 http/protobuf（与 javaagent 一致）
+    assertThat(config.getProtocol()).isEqualTo("http/protobuf");
+    assertThat(config.isHttpProtobuf()).isTrue();
+    assertThat(config.isGrpc()).isFalse();
+    // endpoint 根据协议自动选择：http/protobuf → 4318
+    assertThat(config.getEndpoint()).isEqualTo("http://localhost:4318");
     assertThat(config.getHttpBasePath()).isEqualTo("/v1/control");
     assertThat(config.getLongPollTimeout()).isEqualTo(Duration.ofSeconds(60));
-    // configPollInterval 和 taskPollInterval 已由长轮询替代
     assertThat(config.getStatusReportInterval()).isEqualTo(Duration.ofSeconds(30));
+  }
+
+  @Test
+  void defaultValuesWithGrpcProtocol() {
+    // 显式设置 grpc 协议时，endpoint 自动选择 4317
+    ControlPlaneConfig config = ControlPlaneConfig.builder().setProtocol("grpc").build();
+
+    assertThat(config.getProtocol()).isEqualTo("grpc");
+    assertThat(config.isGrpc()).isTrue();
+    assertThat(config.getEndpoint()).isEqualTo("http://localhost:4317");
   }
 
   @Test
@@ -79,5 +97,87 @@ class ControlPlaneConfigTest {
     assertThat(config.getControlPlaneUrl()).isEqualTo("http://localhost:4318/v1/control");
   }
 
+  // ===== 统一端点：优先级覆盖模式测试 =====
+
+  @Test
+  void dedicatedEndpointOverridesOtlpEndpoint() {
+    // 场景：控制平面和遥测分离部署
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.endpoint", "http://collector:4318");
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put("otel.agent.control.endpoint", "http://control-server:8080");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    ControlPlaneConfig config = ControlPlaneConfig.create(properties);
+
+    // 控制平面专属 endpoint 生效
+    assertThat(config.getEndpoint()).isEqualTo("http://control-server:8080");
+    assertThat(config.getProtocol()).isEqualTo("http/protobuf");
+    assertThat(config.getControlPlaneUrl()).isEqualTo("http://control-server:8080/v1/control");
+  }
+
+  @Test
+  void dedicatedProtocolOverridesOtlpProtocol() {
+    // 场景：遥测用 gRPC，控制平面用 HTTP
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.protocol", "grpc");
+    props.put("otel.exporter.otlp.endpoint", "http://collector:4317");
+    props.put("otel.agent.control.protocol", "http/protobuf");
+    props.put("otel.agent.control.endpoint", "http://control-server:4318");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    ControlPlaneConfig config = ControlPlaneConfig.create(properties);
+
+    // 控制平面专属 protocol 和 endpoint 生效
+    assertThat(config.getProtocol()).isEqualTo("http/protobuf");
+    assertThat(config.getEndpoint()).isEqualTo("http://control-server:4318");
+    assertThat(config.getControlPlaneUrl()).isEqualTo("http://control-server:4318/v1/control");
+  }
+
+  @Test
+  void fallbackToOtlpWhenNoDedicatedConfig() {
+    // 场景：统一部署，只配 OTLP endpoint（最常见用法）
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.endpoint", "http://collector:4318");
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    ControlPlaneConfig config = ControlPlaneConfig.create(properties);
+
+    // 复用 OTLP 共享配置
+    assertThat(config.getEndpoint()).isEqualTo("http://collector:4318");
+    assertThat(config.getProtocol()).isEqualTo("http/protobuf");
+    assertThat(config.getControlPlaneUrl()).isEqualTo("http://collector:4318/v1/control");
+  }
+
+  @Test
+  void onlyDedicatedEndpointWithSharedProtocol() {
+    // 场景：只覆盖 endpoint，协议继续共享
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put("otel.agent.control.endpoint", "http://control-server:9090");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    ControlPlaneConfig config = ControlPlaneConfig.create(properties);
+
+    assertThat(config.getEndpoint()).isEqualTo("http://control-server:9090");
+    assertThat(config.getProtocol()).isEqualTo("http/protobuf");
+    assertThat(config.getControlPlaneUrl()).isEqualTo("http://control-server:9090/v1/control");
+  }
+
+  @Test
+  void onlyDedicatedProtocolWithDefaultEndpoint() {
+    // 场景：只覆盖 protocol，endpoint 根据 protocol 推导
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.agent.control.protocol", "grpc");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    ControlPlaneConfig config = ControlPlaneConfig.create(properties);
+
+    assertThat(config.getProtocol()).isEqualTo("grpc");
+    // endpoint 根据 protocol=grpc 推导为 4317
+    assertThat(config.getEndpoint()).isEqualTo("http://localhost:4317");
+    assertThat(config.getControlPlaneUrl()).isEqualTo("http://localhost:4317");
+  }
 
 }

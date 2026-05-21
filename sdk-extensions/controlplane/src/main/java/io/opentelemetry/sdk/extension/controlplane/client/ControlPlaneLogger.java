@@ -286,14 +286,16 @@ public final class ControlPlaneLogger {
    * 记录服务初始化
    *
    * @param transportType 传输类型
+   * @param protocol 协议 (grpc / http/protobuf)
    * @param baseUrl 基础 URL
    * @param hasAuth 是否有鉴权
    */
-  public void logServiceInitialized(String transportType, String baseUrl, boolean hasAuth) {
+  public void logServiceInitialized(
+      String transportType, String protocol, String baseUrl, boolean hasAuth) {
     logger.log(
         Level.INFO,
-        "{0} [SERVICE_INITIALIZED] transportType={1}, baseUrl={2}, hasAuth={3}",
-        new Object[] {PREFIX, transportType, baseUrl, hasAuth});
+        "{0} [SERVICE_INITIALIZED] transportType={1}, protocol={2}, baseUrl={3}, hasAuth={4}",
+        new Object[] {PREFIX, transportType, protocol, baseUrl, hasAuth});
   }
 
   /**

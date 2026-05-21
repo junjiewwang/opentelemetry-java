@@ -60,6 +60,7 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
 
     logger.logServiceInitialized(
         transport.getType().getValue(),
+        config.getProtocol(),
         config.getControlPlaneUrl(),
         config.getAuthorizationHeader() != null);
   }

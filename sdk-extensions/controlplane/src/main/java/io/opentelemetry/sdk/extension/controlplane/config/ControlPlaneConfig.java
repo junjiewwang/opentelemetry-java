@@ -35,6 +35,8 @@ public final class ControlPlaneConfig {
 
   // 控制平面基础配置
   private static final String CONTROL_ENABLED = "otel.agent.control.enabled";
+  private static final String CONTROL_ENDPOINT = "otel.agent.control.endpoint";
+  private static final String CONTROL_PROTOCOL = "otel.agent.control.protocol";
   private static final String CONTROL_HTTP_BASE_PATH = "otel.agent.control.http.base.path";
   private static final String CONTROL_HTTP_LONG_POLL_TIMEOUT =
       "otel.agent.control.http.long.poll.timeout";
@@ -69,7 +71,12 @@ public final class ControlPlaneConfig {
 
 
   // ===== 默认值常量 =====
-  private static final String DEFAULT_PROTOCOL = "grpc";
+  // 协议不再硬编码默认值，而是从 ConfigProperties 中读取（javaagent 环境下由
+  // OtlpProtocolPropertiesSupplier 注入 "http/protobuf"）。仅当 ConfigProperties 中
+  // 未提供时才使用此兜底值，与 javaagent 默认行为保持一致。
+  private static final String FALLBACK_PROTOCOL = "http/protobuf";
+  private static final String DEFAULT_GRPC_ENDPOINT = "http://localhost:4317";
+  private static final String DEFAULT_HTTP_ENDPOINT = "http://localhost:4318";
   private static final String DEFAULT_HTTP_BASE_PATH = "/v1/control";
   private static final Duration DEFAULT_LONG_POLL_TIMEOUT = Duration.ofSeconds(60);
   private static final Duration DEFAULT_STATUS_REPORT_INTERVAL = Duration.ofSeconds(30);
@@ -116,8 +123,8 @@ public final class ControlPlaneConfig {
 
   private ControlPlaneConfig(Builder builder) {
     this.enabled = builder.enabled;
-    this.endpoint = builder.endpoint;
-    this.protocol = builder.protocol;
+    this.endpoint = Objects.requireNonNull(builder.endpoint, "endpoint must be resolved in build()");
+    this.protocol = Objects.requireNonNull(builder.protocol, "protocol must be resolved in build()");
     this.httpBasePath = builder.httpBasePath;
     this.longPollTimeout = builder.longPollTimeout;
     this.statusReportInterval = builder.statusReportInterval;
@@ -429,8 +436,8 @@ public final class ControlPlaneConfig {
   /** 构建器 */
   public static final class Builder {
     private boolean enabled = true;
-    private String endpoint = "http://localhost:4317";
-    private String protocol = DEFAULT_PROTOCOL;
+    @Nullable private String endpoint; // 不再硬编码，build() 时根据协议动态决定
+    @Nullable private String protocol; // 不再硬编码，从 ConfigProperties 获取
     private String httpBasePath = DEFAULT_HTTP_BASE_PATH;
     private Duration longPollTimeout = DEFAULT_LONG_POLL_TIMEOUT;
     private Duration statusReportInterval = DEFAULT_STATUS_REPORT_INTERVAL;
@@ -450,10 +457,20 @@ public final class ControlPlaneConfig {
     private int storageMaxFiles = DEFAULT_STORAGE_MAX_FILES;
     private long storageMaxSize = DEFAULT_STORAGE_MAX_SIZE;
 
+    // 来源标记（用于日志输出）
+    private boolean dedicatedEndpoint = false;
+    private boolean dedicatedProtocol = false;
+
     private Builder() {}
 
     /**
      * 从 ConfigProperties 加载配置
+     *
+     * <p>endpoint 和 protocol 采用"共享为默认，专属可覆盖"的优先级模式：
+     * <ul>
+     *   <li>endpoint: otel.agent.control.endpoint &gt; otel.exporter.otlp.endpoint &gt; 根据协议自动推导</li>
+     *   <li>protocol: otel.agent.control.protocol &gt; otel.exporter.otlp.protocol &gt; fallback "http/protobuf"</li>
+     * </ul>
      *
      * @param properties 配置属性
      * @return 构建器
@@ -461,15 +478,26 @@ public final class ControlPlaneConfig {
     public Builder fromConfigProperties(ConfigProperties properties) {
       this.enabled = properties.getBoolean(CONTROL_ENABLED, true);
 
-      // 复用 OTLP 配置
-      String otlpEndpoint = properties.getString(OTLP_ENDPOINT);
-      if (otlpEndpoint != null) {
-        this.endpoint = otlpEndpoint;
+      // 协议：控制平面专属 > OTLP 共享
+      String controlProtocol = properties.getString(CONTROL_PROTOCOL);
+      String otlpProtocol = properties.getString(OTLP_PROTOCOL);
+      if (controlProtocol != null) {
+        this.protocol = controlProtocol;
+        this.dedicatedProtocol = true;
+      } else if (otlpProtocol != null) {
+        this.protocol = otlpProtocol;
+        this.dedicatedProtocol = false;
       }
 
-      String otlpProtocol = properties.getString(OTLP_PROTOCOL);
-      if (otlpProtocol != null) {
-        this.protocol = otlpProtocol;
+      // Endpoint：控制平面专属 > OTLP 共享
+      String controlEndpoint = properties.getString(CONTROL_ENDPOINT);
+      String otlpEndpoint = properties.getString(OTLP_ENDPOINT);
+      if (controlEndpoint != null) {
+        this.endpoint = controlEndpoint;
+        this.dedicatedEndpoint = true;
+      } else if (otlpEndpoint != null) {
+        this.endpoint = otlpEndpoint;
+        this.dedicatedEndpoint = false;
       }
 
       this.headers = properties.getString(OTLP_HEADERS);
@@ -634,11 +662,75 @@ public final class ControlPlaneConfig {
     /**
      * 构建配置实例
      *
+     * <p>协议和 endpoint 的解析逻辑：
+     * <ul>
+     *   <li>protocol 未设置时，使用 FALLBACK_PROTOCOL ("http/protobuf")，与 javaagent 默认行为一致</li>
+     *   <li>endpoint 未设置时，根据最终协议选择对应的默认端口 (grpc→4317, http→4318)</li>
+     * </ul>
+     *
      * @return 配置实例
      */
     public ControlPlaneConfig build() {
+      // 解析最终协议：dedicated > shared > fallback
+      String protocolSource;
+      if (this.protocol == null) {
+        this.protocol = FALLBACK_PROTOCOL;
+        protocolSource = "fallback (neither otel.agent.control.protocol nor "
+            + "otel.exporter.otlp.protocol found in ConfigProperties)";
+        logger.log(
+            Level.WARNING,
+            "[CONTROL-PLANE] [PROTOCOL_RESOLVED] protocol={0}, source={1}. "
+                + "This usually means OtlpProtocolPropertiesSupplier did not inject the value. "
+                + "Set otel.agent.control.protocol or otel.exporter.otlp.protocol explicitly.",
+            new Object[] {FALLBACK_PROTOCOL, protocolSource});
+      } else {
+        protocolSource = resolveProtocolSource();
+        logger.log(
+            Level.INFO,
+            "[CONTROL-PLANE] [PROTOCOL_RESOLVED] protocol={0}, source={1}",
+            new Object[] {this.protocol, protocolSource});
+      }
+
+      // 解析最终 endpoint：dedicated > shared > default(derived from protocol)
+      String endpointSource;
+      if (this.endpoint == null) {
+        this.endpoint =
+            "grpc".equalsIgnoreCase(this.protocol)
+                ? DEFAULT_GRPC_ENDPOINT
+                : DEFAULT_HTTP_ENDPOINT;
+        endpointSource = "default (derived from protocol)";
+      } else {
+        endpointSource = resolveEndpointSource();
+      }
+      logger.log(
+          Level.INFO,
+          "[CONTROL-PLANE] [ENDPOINT_RESOLVED] endpoint={0}, protocol={1}, source={2}",
+          new Object[] {this.endpoint, this.protocol, endpointSource});
+
       validate();
       return new ControlPlaneConfig(this);
+    }
+
+    /**
+     * 判断 protocol 来源：专属配置 or OTLP 共享配置
+     * 通过重新检查字段是否与 dedicated key 一致来确定（build 时已设置完毕）
+     */
+    private String resolveProtocolSource() {
+      // 由 fromConfigProperties 的设置顺序保证：
+      // controlProtocol != null → 来自 dedicated, 否则来自 shared
+      // 这里通过标记字段判断（简化实现：fromConfigProperties 设置了 dedicatedProtocol 标记）
+      return dedicatedProtocol
+          ? "otel.agent.control.protocol (dedicated)"
+          : "otel.exporter.otlp.protocol (shared)";
+    }
+
+    /**
+     * 判断 endpoint 来源
+     */
+    private String resolveEndpointSource() {
+      return dedicatedEndpoint
+          ? "otel.agent.control.endpoint (dedicated)"
+          : "otel.exporter.otlp.endpoint (shared)";
     }
 
     private static void validate() {
