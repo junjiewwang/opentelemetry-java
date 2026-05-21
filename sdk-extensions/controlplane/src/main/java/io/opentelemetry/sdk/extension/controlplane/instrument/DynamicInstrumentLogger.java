@@ -90,7 +90,8 @@ public final class DynamicInstrumentLogger {
     try {
       rootLogger = Logger.getLogger(LOGGER_PREFIX);
       // 关键：阻断向父 Logger（Root）传播，避免污染业务日志
-      rootLogger.setUseParentHandlers(false);
+      // 使用安全调用，兼容 Javaagent PatchLogger 环境（PatchLogger 可能未实现此方法）
+      safeSetUseParentHandlers(rootLogger, /* useParentHandlers= */ false);
 
       // 配置日志级别
       Level logLevel = resolveLogLevel();
@@ -102,7 +103,7 @@ public final class DynamicInstrumentLogger {
         rootLogger.addHandler(fileHandler);
       } else {
         // FileHandler 创建失败时，回退使用父 Handler（至少有输出）
-        rootLogger.setUseParentHandlers(true);
+        safeSetUseParentHandlers(rootLogger, /* useParentHandlers= */ true);
         rootLogger.log(Level.WARNING,
             "[DYNAMIC-INSTRUMENT-LOG] FileHandler creation failed, falling back to parent handlers");
       }
@@ -184,6 +185,26 @@ public final class DynamicInstrumentLogger {
       } catch (Throwable alsoIgnored) {
         // 无能为力
       }
+    }
+  }
+
+  /**
+   * 安全调用 {@code Logger.setUseParentHandlers}，兼容 Javaagent PatchLogger 环境。
+   *
+   * <p>在 Javaagent 环境中，{@code java.util.logging.Logger} 可能被 agent 的
+   * {@code PatchLogger} 代理替换，而 PatchLogger 不一定实现了 setUseParentHandlers
+   * 方法，直接调用会抛出 {@link NoSuchMethodError}。此方法通过 try-catch 保护调用安全。
+   *
+   * @param logger 目标 Logger
+   * @param useParentHandlers 是否使用父 Handler
+   */
+  private static void safeSetUseParentHandlers(Logger logger, boolean useParentHandlers) {
+    try {
+      logger.setUseParentHandlers(useParentHandlers);
+    } catch (NoSuchMethodError | UnsupportedOperationException e) {
+      // 在 Javaagent PatchLogger 环境中该方法可能不存在或不支持，静默忽略
+      System.err.println("[DYNAMIC-INSTRUMENT-LOG] setUseParentHandlers not supported "
+          + "(likely PatchLogger environment), skipping: " + e.getMessage());
     }
   }
 

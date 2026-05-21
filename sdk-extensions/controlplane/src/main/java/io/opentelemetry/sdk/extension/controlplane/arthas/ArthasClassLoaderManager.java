@@ -53,7 +53,53 @@ public final class ArthasClassLoaderManager {
   @Nullable private volatile ClassLoader parentClassLoader;
 
   public ArthasClassLoaderManager() {
-    this.parentClassLoader = getClass().getClassLoader();
+    this.parentClassLoader = resolveParentClassLoader();
+  }
+
+  /**
+   * 解析合适的父 ClassLoader。
+   *
+   * <p>在 OTel Agent Extension 模式下，当前类由 ExtensionClassLoader 加载，
+   * 其 parent delegation 链无法正确委托到 bootstrap classloader，
+   * 导致 Arthas ClassLoader 找不到通过 {@code appendToBootstrapClassLoaderSearch}
+   * 注入的 {@code java.arthas.SpyAPI}，触发 "Prohibited package name: java.arthas" 错误。
+   *
+   * <p>解决方案：检测 Extension 模式，使用 SystemClassLoader 作为 parent，
+   * 保证 parent delegation 链为 ArthasURLCL → SystemCL → Bootstrap，
+   * 从而正确找到 bootstrap 中的 SpyAPI。
+   *
+   * @return 合适的父 ClassLoader
+   */
+  private ClassLoader resolveParentClassLoader() {
+    ClassLoader current = getClass().getClassLoader();
+    if (isExtensionClassLoader(current)) {
+      logger.log(
+          Level.INFO,
+          "Detected OTel Extension mode (ClassLoader: {0}), "
+              + "using SystemClassLoader as parent to ensure bootstrap delegation",
+          current.getClass().getName());
+      return ClassLoader.getSystemClassLoader();
+    }
+    return current;
+  }
+
+  /**
+   * 检测当前 ClassLoader 是否为 OTel Agent 的 ExtensionClassLoader。
+   *
+   * <p>OTel Agent 使用 ExtensionClassLoader 加载用户扩展，其 class delegation
+   * 机制与标准 parent delegation 不同，无法透传到 bootstrap classloader。
+   *
+   * @param classLoader 待检测的 ClassLoader
+   * @return 是否为 Extension 模式
+   */
+  private static boolean isExtensionClassLoader(@Nullable ClassLoader classLoader) {
+    if (classLoader == null) {
+      return false;
+    }
+    // 通过类名检测，避免对 OTel Agent 内部类的编译期依赖
+    String className = classLoader.getClass().getName();
+    return className.contains("ExtensionClassLoader")
+        || className.contains("AgentClassLoader");
   }
 
   /**
