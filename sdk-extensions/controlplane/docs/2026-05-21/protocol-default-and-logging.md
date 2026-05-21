@@ -35,6 +35,9 @@ ControlPlane 模块原先硬编码 `DEFAULT_PROTOCOL = "grpc"`，但 javaagent �
 | `otel.exporter.otlp.endpoint` | OTLP 共享 endpoint | 次之 |
 | `otel.agent.control.protocol` | 控制平面专属协议 | 最高 |
 | `otel.exporter.otlp.protocol` | OTLP 共享协议 | 次之 |
+| `otel.agent.control.token` | 控制平面专属 Token | 最高 |
+| `otel.resource.attributes` 中的 `token` | Resource Attributes 共享 Token | 次之 |
+| `otel.exporter.otlp.headers` 中的 `Authorization` | OTLP Headers 共享 Token | 最低 |
 | (无配置) | 兜底 `http/protobuf` + 根据协议推导端口 | 最低 |
 
 ### 使用场景
@@ -66,6 +69,16 @@ java -javaagent:opentelemetry-javaagent.jar \
      -Dotel.agent.control.protocol=http/protobuf \
      -Dotel.agent.control.endpoint=http://control-server:4318 \
      -jar myapp.jar
+```
+
+**场景 D：控制平面使用独立 Token**
+```bash
+java -javaagent:opentelemetry-javaagent.jar \
+     -Dotel.javaagent.extensions=/path/to/controlplane-extension.jar \
+     -Dotel.exporter.otlp.endpoint=http://collector:4318 \
+     -Dotel.agent.control.token=my-control-plane-secret \
+     -jar myapp.jar
+# 遥测无需认证，控制平面使用独立 token
 ```
 
 ### 协议解析流程
@@ -126,22 +139,25 @@ INFO [CONTROL-PLANE] [ENDPOINT_RESOLVED] endpoint=http://localhost:4318, protoco
 - [x] 移除硬编码 `DEFAULT_PROTOCOL`，改为 `FALLBACK_PROTOCOL = "http/protobuf"`
 - [x] Builder 的 protocol/endpoint 字段改为 `@Nullable`
 - [x] 新增 `otel.agent.control.endpoint` 和 `otel.agent.control.protocol` 配置键
+- [x] 新增 `otel.agent.control.token` 配置键（Token 专属覆盖）
 - [x] `fromConfigProperties()` 实现优先级逻辑：dedicated > shared > fallback
+- [x] Token 解析优先级：dedicated > resource.attributes[token] > otlp.headers[Authorization]
 - [x] `build()` 日志体现来源（dedicated/shared/fallback）
 - [x] fallback 场景使用 WARNING 级别，附带排查提示
 - [x] `ControlPlaneLogger.logServiceInitialized()` 增加 `protocol` 字段
 - [x] `DefaultControlPlaneService` 传入 protocol 参数
 - [x] 新增统一端点覆盖测试用例（5 个场景）
+- [x] 新增 Token 优先级覆盖测试用例（4 个场景）
 - [x] 所有测试通过
 
 ### 改动文件
 
 | 文件 | 改动 |
 |------|------|
-| `ControlPlaneConfig.java` | 新增 2 个配置键 + 优先级解析逻辑 + 来源标记 + 增强日志 |
+| `ControlPlaneConfig.java` | 新增 3 个配置键（endpoint/protocol/token） + 优先级解析逻辑 + 来源标记 + 增强日志 |
 | `ControlPlaneLogger.java` | `logServiceInitialized` 增加 protocol 参数 |
 | `DefaultControlPlaneService.java` | 传入 protocol |
-| `ControlPlaneConfigTest.java` | 新增 5 个统一端点覆盖场景测试 |
+| `ControlPlaneConfigTest.java` | 新增 5 个统一端点覆盖场景测试 + 4 个 Token 优先级测试 |
 
 ### 兼容性
 
@@ -149,6 +165,7 @@ INFO [CONTROL-PLANE] [ENDPOINT_RESOLVED] endpoint=http://localhost:4318, protoco
 |------|---------|------|
 | 新增 `otel.agent.control.endpoint` | ✅ | 纯增量，不配置时行为不变 |
 | 新增 `otel.agent.control.protocol` | ✅ | 纯增量，不配置时行为不变 |
+| 新增 `otel.agent.control.token` | ✅ | 纯增量，不配置时 fallback 到原有 token 解析链 |
 | 日志格式变更 | ✅ | 更详细的 source 信息，不影响功能 |
 
 ## 遗留问题

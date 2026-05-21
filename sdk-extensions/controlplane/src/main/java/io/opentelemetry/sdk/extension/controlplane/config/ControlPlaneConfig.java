@@ -37,6 +37,7 @@ public final class ControlPlaneConfig {
   private static final String CONTROL_ENABLED = "otel.agent.control.enabled";
   private static final String CONTROL_ENDPOINT = "otel.agent.control.endpoint";
   private static final String CONTROL_PROTOCOL = "otel.agent.control.protocol";
+  private static final String CONTROL_TOKEN = "otel.agent.control.token";
   private static final String CONTROL_HTTP_BASE_PATH = "otel.agent.control.http.base.path";
   private static final String CONTROL_HTTP_LONG_POLL_TIMEOUT =
       "otel.agent.control.http.long.poll.timeout";
@@ -141,7 +142,8 @@ public final class ControlPlaneConfig {
     this.storageMaxFiles = builder.storageMaxFiles;
     this.storageMaxSize = builder.storageMaxSize;
     // 一次性解析 AuthToken
-    AuthTokenResult result = resolveAuthToken(builder.resourceAttributes, builder.headers);
+    AuthTokenResult result =
+        resolveAuthToken(builder.dedicatedToken, builder.resourceAttributes, builder.headers);
     this.authToken = result.token;
     this.authTokenSource = result.source;
 
@@ -155,16 +157,25 @@ public final class ControlPlaneConfig {
    *
    * <p>优先级:
    * <ol>
+   *   <li>otel.agent.control.token（控制平面专属）</li>
    *   <li>Resource Attributes 中的 token</li>
    *   <li>OTLP Headers 中的 Authorization</li>
    * </ol>
    *
+   * @param dedicatedToken 控制平面专属 token
    * @param resourceAttributes resource attributes 字符串
    * @param otlpHeaders OTLP headers 字符串
    * @return 解析结果
    */
   private static AuthTokenResult resolveAuthToken(
-      @Nullable String resourceAttributes, @Nullable String otlpHeaders) {
+      @Nullable String dedicatedToken,
+      @Nullable String resourceAttributes,
+      @Nullable String otlpHeaders) {
+    // 优先级 0: 控制平面专属 token（最高优先级）
+    if (dedicatedToken != null && !dedicatedToken.isEmpty()) {
+      return new AuthTokenResult(dedicatedToken, "otel.agent.control.token (dedicated)");
+    }
+
     // 优先级 1: Resource Attributes 中的 token
     String token = extractTokenFromResourceAttributes(resourceAttributes);
     if (token != null && !token.isEmpty()) {
@@ -461,6 +472,9 @@ public final class ControlPlaneConfig {
     private boolean dedicatedEndpoint = false;
     private boolean dedicatedProtocol = false;
 
+    // 控制平面专属 token（最高优先级）
+    @Nullable private String dedicatedToken;
+
     private Builder() {}
 
     /**
@@ -501,6 +515,9 @@ public final class ControlPlaneConfig {
       }
 
       this.headers = properties.getString(OTLP_HEADERS);
+
+      // Token：控制平面专属 > resource.attributes[token] > otlp.headers[Authorization]
+      this.dedicatedToken = properties.getString(CONTROL_TOKEN);
 
       // Resource Attributes（用于解析 auth token）
       this.resourceAttributes = properties.getString(RESOURCE_ATTRIBUTES);
