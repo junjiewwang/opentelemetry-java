@@ -2,6 +2,7 @@ plugins {
   id("otel.protobuf-conventions")
   id("otel.publish-conventions")
   id("otel.animalsniffer-conventions")
+  id("otel.jmh-conventions")
   id("com.squareup.wire")
 }
 
