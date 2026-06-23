@@ -47,9 +47,6 @@ public final class ArthasLogIsolation {
   /** 配置 */
   private final ArthasConfig config;
 
-  /** 临时目录（用于存放 Arthas 日志文件） */
-  @Nullable private volatile Path tempLogDir;
-
   /**
    * AnsiLog.out(PrintStream) 是静态全局开关，需要全局重入保护，避免并发 start/stop 互相覆盖。
    */
@@ -109,32 +106,20 @@ public final class ArthasLogIsolation {
   /**
    * 获取或创建临时日志目录
    *
+   * <p>委托给 {@link ArthasTempDirectoryManager} 统一管理，支持跨 attach 周期复用。
+   *
    * @return 临时目录路径，失败返回 null
    */
   @Nullable
-  private String getOrCreateTempLogDir() {
-    Path dir = this.tempLogDir;
-    if (dir != null && Files.exists(dir)) {
+  private static String getOrCreateTempLogDir() {
+    try {
+      Path dir = ArthasTempDirectoryManager.getInstance()
+                     .getOrCreateDir(ArthasTempDirectoryManager.DirType.LOGS);
       return dir.toString();
-    }
-
-    synchronized (this) {
-      dir = this.tempLogDir;
-      if (dir != null && Files.exists(dir)) {
-        return dir.toString();
-      }
-
-      try {
-        dir = Files.createTempDirectory("arthas-logs-");
-        dir.toFile().deleteOnExit();
-        this.tempLogDir = dir;
-        logger.log(Level.INFO, "[ArthasLogIsolation] Created temp log dir: {0}", dir);
-        return dir.toString();
-      } catch (IOException e) {
-        logger.log(Level.WARNING, 
-            "[ArthasLogIsolation] Failed to create temp log dir: {0}", e.getMessage());
-        return null;
-      }
+    } catch (RuntimeException e) {
+      logger.log(Level.WARNING,
+          "[ArthasLogIsolation] Failed to create temp log dir: {0}", e.getMessage());
+      return null;
     }
   }
 

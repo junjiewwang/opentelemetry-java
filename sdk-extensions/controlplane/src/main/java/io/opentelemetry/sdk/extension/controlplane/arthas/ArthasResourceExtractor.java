@@ -93,7 +93,7 @@ public final class ArthasResourceExtractor {
    * <p>查找顺序：
    * <ol>
    *   <li>从配置的外部路径查找</li>
-   *   <li>从 classpath 资源提取</li>
+   *   <li>从 classpath 资源提取（通过 {@link ArthasTempDirectoryManager} 获取可复用目录）</li>
    * </ol>
    *
    * @param config Arthas 配置
@@ -111,17 +111,16 @@ public final class ArthasResourceExtractor {
       }
     }
 
-    // 2. 从 classpath 资源提取
+    // 2. 从 classpath 资源提取（通过 ArthasTempDirectoryManager 复用临时目录）
     try {
-      Path tempDir = Files.createTempDirectory("arthas-spy-");
-      tempDir.toFile().deleteOnExit();
-
-      Path spyJar = extractResource(ARTHAS_SPY_JAR_RESOURCE, tempDir, "arthas-spy.jar");
+      Path stagingDir = ArthasTempDirectoryManager.getInstance()
+                            .getOrCreateDir(ArthasTempDirectoryManager.DirType.SPY_JAR);
+      Path spyJar = extractResource(ARTHAS_SPY_JAR_RESOURCE, stagingDir, "arthas-spy.jar");
       if (spyJar != null) {
         logger.log(Level.FINE, "Extracted arthas-spy.jar to: {0}", spyJar);
         return spyJar.toFile();
       }
-    } catch (IOException e) {
+    } catch (RuntimeException e) {
       logger.log(Level.WARNING, "Failed to extract arthas-spy.jar: {0}", e.getMessage());
     }
 
@@ -131,6 +130,9 @@ public final class ArthasResourceExtractor {
   /**
    * 从 classpath 资源提取 Arthas core jars
    *
+   * <p>通过 {@link ArthasTempDirectoryManager} 获取可复用的 arthas-home 目录，
+   * 避免每次 attach 创建新的临时目录。
+   *
    * <p>同时提取 async-profiler native library 到 arthas-home 目录。
    *
    * @return URL 数组，包含 core jar 和 client jar（如果存在）；如果提取失败返回 null
@@ -138,34 +140,47 @@ public final class ArthasResourceExtractor {
   @Nullable
   @SuppressWarnings("AvoidObjectArrays") // URLClassLoader 需要 URL[] 参数
   public static URL[] extractCoreJars() {
-    try {
-      // 创建临时目录存放解压的 jar
-      Path tempDir = Files.createTempDirectory("arthas-");
-      tempDir.toFile().deleteOnExit();
+    Path arthasHome = ArthasTempDirectoryManager.getInstance()
+                          .getOrCreateDir(ArthasTempDirectoryManager.DirType.ARTHAS_HOME);
+    return extractCoreJarsTo(arthasHome);
+  }
 
+  /**
+   * 将 Arthas core jars 提取到指定的 arthas-home 目录
+   *
+   * <p>同时提取 async-profiler native library、JNI library 和生成 logback.xml。
+   * 幂等操作：已存在的文件会自动跳过提取。
+   *
+   * @param arthasHome Arthas 运行时根目录
+   * @return URL 数组，包含 core jar 和 client jar（如果存在）；如果提取失败返回 null
+   */
+  @Nullable
+  @SuppressWarnings("AvoidObjectArrays") // URLClassLoader 需要 URL[] 参数
+  public static URL[] extractCoreJarsTo(Path arthasHome) {
+    try {
       // 尝试解压 arthas-core.jar
-      Path coreJar = extractResource(ARTHAS_CORE_JAR_RESOURCE, tempDir, "arthas-core.jar");
+      Path coreJar = extractResource(ARTHAS_CORE_JAR_RESOURCE, arthasHome, "arthas-core.jar");
       if (coreJar == null) {
         logger.log(Level.FINE, "Arthas core jar not found in classpath resources");
         return null;
       }
 
       // 尝试解压 arthas-client.jar（可选）
-      Path clientJar = extractResource(ARTHAS_CLIENT_JAR_RESOURCE, tempDir, "arthas-client.jar");
+      Path clientJar = extractResource(ARTHAS_CLIENT_JAR_RESOURCE, arthasHome, "arthas-client.jar");
 
       // 【关键】生成 Arthas 专用 logback.xml 到 arthas-home 目录
       // 让 Arthas 的 SLF4J 日志只写文件，不污染应用控制台
-      generateArthasLogbackXml(tempDir);
+      generateArthasLogbackXml(arthasHome);
 
       // 【关键】提取 async-profiler native library 到 arthas-home 目录
       // 使 Arthas profiler 命令能够找到 libasyncProfiler.so
       // 失败不阻塞 Arthas 启动，仅影响 profiler 命令
-      extractAsyncProfilerLibrary(tempDir);
+      extractAsyncProfilerLibrary(arthasHome);
 
       // 【关键】提取 Arthas JNI library 到 arthas-home/lib 目录
       // 使 Arthas vmtool 命令能够找到 libArthasJniLibrary
       // 失败不阻塞 Arthas 启动，仅影响 vmtool 命令
-      extractArthasJniLibrary(tempDir);
+      extractArthasJniLibrary(arthasHome);
 
       // 构建 URL 数组
       int urlCount = clientJar != null ? 2 : 1;
@@ -175,7 +190,7 @@ public final class ArthasResourceExtractor {
         urls[1] = clientJar.toUri().toURL();
       }
 
-      logger.log(Level.INFO, "Extracted Arthas core jars to: {0}", tempDir);
+      logger.log(Level.INFO, "Extracted Arthas core jars to: {0}", arthasHome);
       return urls;
 
     } catch (IOException e) {

@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.file.Path;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -241,11 +242,16 @@ public final class ArthasClassLoaderManager {
   /**
    * 从 classpath 资源加载 Arthas jar
    *
+   * <p>通过 {@link ArthasTempDirectoryManager} 获取可复用的 arthas-home 目录，
+   * 避免每次 attach 创建新的临时目录。
+   *
    * @return ClassLoader
    */
   @Nullable
   private ClassLoader loadFromClasspathResources() {
-    URL[] urls = ArthasResourceExtractor.extractCoreJars();
+    Path arthasHome = ArthasTempDirectoryManager.getInstance()
+                          .getOrCreateDir(ArthasTempDirectoryManager.DirType.ARTHAS_HOME);
+    URL[] urls = ArthasResourceExtractor.extractCoreJarsTo(arthasHome);
     if (urls == null) {
       return null;
     }
