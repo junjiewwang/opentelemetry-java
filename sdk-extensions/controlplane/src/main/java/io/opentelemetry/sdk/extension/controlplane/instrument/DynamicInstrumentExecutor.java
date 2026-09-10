@@ -83,6 +83,8 @@ public final class DynamicInstrumentExecutor implements TaskExecutor {
         // 3. 构建返回结果
         long executionTime = System.currentTimeMillis() - startTime;
         if (result.isSuccess()) {
+          // 幂等成功（规则已活跃）→ status=already_active，控制平面据此收敛而非重试
+          String status = result.isIdempotent() ? "already_active" : "active";
           logger.log(Level.INFO,
               "[DYNAMIC-INSTRUMENT] Enhancement applied successfully: {0}", result);
           return TaskExecutionResult.success(
@@ -91,7 +93,7 @@ public final class DynamicInstrumentExecutor implements TaskExecutor {
                   "class_name", rule.getClassName(),
                   "method_name", rule.getMethodName(),
                   "type", rule.getType().getValue(),
-                  "status", "active"),
+                  "status", status),
               executionTime);
         } else {
           logger.log(Level.WARNING,

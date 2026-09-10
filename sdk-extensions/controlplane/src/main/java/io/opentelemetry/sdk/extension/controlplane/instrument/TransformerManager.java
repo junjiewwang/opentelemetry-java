@@ -211,6 +211,39 @@ public final class TransformerManager {
 
   // ===== 私有方法 =====
 
+  /**
+   * 判断「ruleId 已存在」时应返回的结果，区分幂等重放与真实冲突
+   *
+   * <ul>
+   *   <li>existingRule 为 null（未应用）→ 返回 null，继续正常应用流程</li>
+   *   <li>existingRule 与新规则语义等价 → 幂等成功（no-op，期望状态已达成）</li>
+   *   <li>existingRule 与新规则不同 → {@code RULE_ID_CONFLICT}（同 rule_id 不同内容）</li>
+   * </ul>
+   *
+   * <p>包级可见以便单元测试直接覆盖决策逻辑（无需真实 Instrumentation）。
+   *
+   * @param ruleId 规则 ID
+   * @param existingRule 已应用的规则（可能为 null）
+   * @param newRule 新下发的规则
+   * @return 需要直接返回的结果，或 null 表示无冲突可继续
+   */
+  @Nullable
+  static EnhancementResult resolveAlreadyApplied(
+      String ruleId, @Nullable InstrumentationRule existingRule, InstrumentationRule newRule) {
+    if (existingRule == null) {
+      return null;
+    }
+    if (existingRule.isSemanticallyEqual(newRule)) {
+      return EnhancementResult.idempotentSuccess(ruleId);
+    }
+    return EnhancementResult.failed(ruleId, "RULE_ID_CONFLICT",
+        "rule_id already used by a different rule: " + ruleId
+            + " (existing target: " + existingRule.getClassName() + "."
+            + existingRule.getMethodName()
+            + ", type=" + existingRule.getType().getValue()
+            + "). Revert the existing rule first before applying a different rule with the same rule_id.");
+  }
+
   private EnhancementResult doApplyRule(InstrumentationRule rule) {
     String ruleId = rule.getRuleId();
 
@@ -220,10 +253,12 @@ public final class TransformerManager {
       return EnhancementResult.failed(ruleId, "INVALID_RULE", validationError);
     }
 
-    // 2. 检查是否已存在
-    if (transformers.containsKey(ruleId)) {
-      return EnhancementResult.failed(ruleId, "ALREADY_APPLIED",
-          "Rule already applied: " + ruleId);
+    // 2. 检查是否已存在（区分幂等重放 vs 真实冲突）
+    ManagedTransformer existing = transformers.get(ruleId);
+    EnhancementResult alreadyApplied =
+        resolveAlreadyApplied(ruleId, existing == null ? null : existing.rule, rule);
+    if (alreadyApplied != null) {
+      return alreadyApplied;
     }
 
     // 3. 检查同一 class+method+type 是否与已有规则冲突
@@ -928,30 +963,49 @@ public final class TransformerManager {
     @Nullable private final String errorCode;
     @Nullable private final String errorMessage;
     @Nullable private final List<String> warnings;
+    private final boolean idempotent;
 
     @SuppressWarnings("BooleanParameter")
     private EnhancementResult(String ruleId, boolean success,
         @Nullable String errorCode, @Nullable String errorMessage,
-        @Nullable List<String> warnings) {
+        @Nullable List<String> warnings, boolean idempotent) {
       this.ruleId = ruleId;
       this.success = success;
       this.errorCode = errorCode;
       this.errorMessage = errorMessage;
       this.warnings = warnings;
+      this.idempotent = idempotent;
     }
 
     public static EnhancementResult success(String ruleId) {
-      return new EnhancementResult(ruleId, /* success= */ true, null, null, null);
+      return new EnhancementResult(ruleId, /* success= */ true, null, null, null,
+          /* idempotent= */ false);
     }
 
     public static EnhancementResult successWithWarnings(String ruleId, List<String> warnings) {
       return new EnhancementResult(ruleId, /* success= */ true, null, null,
-          Collections.unmodifiableList(new ArrayList<>(warnings)));
+          Collections.unmodifiableList(new ArrayList<>(warnings)), /* idempotent= */ false);
+    }
+
+    /**
+     * 创建幂等成功结果
+     *
+     * <p>表示规则已处于活跃状态、本次下发为 no-op（期望状态已达成）。
+     * 与 {@link #success} 的区别在于携带 {@code isIdempotent() == true}，
+     * 供执行器映射为 {@code status: "already_active"} 而非 {@code "active"}。
+     *
+     * @param ruleId 规则 ID
+     * @return 幂等成功结果
+     */
+    public static EnhancementResult idempotentSuccess(String ruleId) {
+      return new EnhancementResult(ruleId, /* success= */ true, null, null, null,
+          /* idempotent= */ true);
     }
 
     public static EnhancementResult failed(
         String ruleId, String errorCode, @Nullable String errorMessage) {
-      return new EnhancementResult(ruleId, /* success= */ false, errorCode, errorMessage, null);
+      return new EnhancementResult(ruleId, /* success= */ false, errorCode, errorMessage, null,
+          /* idempotent= */ false);
     }
 
     public String getRuleId() {
@@ -960,6 +1014,15 @@ public final class TransformerManager {
 
     public boolean isSuccess() {
       return success;
+    }
+
+    /**
+     * 是否为幂等成功（规则已活跃、本次为 no-op）
+     *
+     * <p>仅当 {@code success == true} 时才有意义。
+     */
+    public boolean isIdempotent() {
+      return idempotent;
     }
 
     @Nullable
@@ -996,6 +1059,9 @@ public final class TransformerManager {
     @Override
     public String toString() {
       if (success) {
+        if (idempotent) {
+          return "EnhancementResult{ruleId='" + ruleId + "', success=true, idempotent=true}";
+        }
         if (hasWarnings()) {
           return "EnhancementResult{ruleId='" + ruleId + "', success=true"
               + ", warnings=" + warnings + "}";

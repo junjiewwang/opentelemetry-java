@@ -176,7 +176,7 @@ sequenceDiagram
 | TC-25 | OVERLAPPING_TARGET | `dynamic_instrument` | `UserInfoService` | `count` | trace | 精确重载 + 全部重载冲突 | ❌ OVERLAPPING_TARGET |
 | TC-26 | 按目标方法还原 | `dynamic_uninstrument` | `UserBusinessService` | `handleUserLogin` | trace | 指定 class+method+type 还原 | ✅ reverted |
 | TC-27 | 还原所有 type | `dynamic_uninstrument` | `UserBusinessService` | `handleUserLogin` | 全部 | 不指定 type 一次性还原 | ✅ reverted |
-| TC-28 | 自动 rule_id 幂等性 | `dynamic_instrument` ×2 | `UserBusinessService` | `handleUserLogin` | trace | 同参数不同 task_id，第二次被拒绝 | ❌ ALREADY_APPLIED |
+| TC-28 | 自动 rule_id 幂等性 | `dynamic_instrument` ×2 | `UserBusinessService` | `handleUserLogin` | trace | 同参数不同 task_id，第二次幂等成功 | ✅ already_active |
 
 ### 4.2 参数/返回值采集场景
 
@@ -197,7 +197,7 @@ sequenceDiagram
 | # | 用例名称 | task_type_name | 异常类型 | 验证重点 | 预期错误码 |
 |---|---------|---------------|---------|---------|----------|
 | TC-08 | 不存在的类 | `dynamic_instrument` | 类找不到 | 返回明确错误信息 | `CLASS_NOT_FOUND` |
-| TC-09 | 重复 ruleId | `dynamic_instrument` | 规则已存在 | 返回 ruleId 重复错误 | `ALREADY_APPLIED` |
+| TC-09 | 重复 ruleId（相同内容→幂等 / 不同内容→冲突） | `dynamic_instrument` | 规则已存在 | 区分幂等重放与真实冲突 | `already_active` / `RULE_ID_CONFLICT` |
 | TC-10 | 重复目标方法（同一 type+同一重载） | `dynamic_instrument` | 同一 class+method+type 被不同规则增强 | 返回目标重复错误 | `DUPLICATE_TARGET` |
 | TC-11 | 无效增强类型 | `dynamic_instrument` | 不支持的 type | 返回参数错误 | `INVALID_PARAMETERS` |
 | TC-12 | 还原不存在的规则 | `dynamic_uninstrument` | 规则未找到 | 返回明确错误 | `RULE_NOT_FOUND` |
@@ -429,11 +429,13 @@ sequenceDiagram
 
 ---
 
-### TC-09：异常场景 — 重复 ruleId
+### TC-09：重复 ruleId（区分幂等重放 vs 真实冲突）
 
 **前置条件**：先成功下发 `rule-safe-trace-login` 增强任务（TC-01）
 
-**下发任务（同一 ruleId）：**
+#### TC-09a：同 rule_id + 相同内容 → 幂等成功
+
+**下发任务（同一 ruleId，内容完全一致）：**
 ```json
 {
   "task_id": "test-err-dup-rule-001",
@@ -442,13 +444,36 @@ sequenceDiagram
 }
 ```
 
-**预期结果：**
+**预期结果（幂等，不再视为失败）：**
 ```json
 {
-  "error_code": "ALREADY_APPLIED",
-  "error_message": "Rule already active: rule-safe-trace-login"
+  "rule_id": "rule-safe-trace-login",
+  "status": "already_active"
 }
 ```
+
+> 语义：期望状态已达成，控制平面据此收敛，不触发重试/告警。
+
+#### TC-09b：同 rule_id + 不同内容 → RULE_ID_CONFLICT
+
+**下发任务（同一 ruleId，但指向不同方法）：**
+```json
+{
+  "task_id": "test-err-dup-rule-002",
+  "task_type_name": "dynamic_instrument",
+  "parameters_json": "{\"rule_id\":\"rule-safe-trace-login\",\"class_name\":\"com.tencent.cloudmonitor.userservice.domain.service.UserBusinessService\",\"method_name\":\"handleUserRegistration\",\"type\":\"trace\"}"
+}
+```
+
+**预期结果（真实冲突，硬错误）：**
+```json
+{
+  "error_code": "RULE_ID_CONFLICT",
+  "error_message": "rule_id already used by a different rule: rule-safe-trace-login ... Revert the existing rule first ..."
+}
+```
+
+> 语义：同 rule_id 字符串被复用于不同目标，需要先 `dynamic_uninstrument` 还原旧规则，再重新下发。
 
 ---
 
@@ -1018,7 +1043,7 @@ sequenceDiagram
 
 ### TC-28：自动 rule_id 幂等性验证
 
-**验证目标**：同样的增强参数，不同批次下发，自动生成的 `rule_id` 相同 → 第二次被 `ALREADY_APPLIED` 拒绝（幂等）。
+**验证目标**：同样的增强参数，不同批次下发，自动生成的 `rule_id` 相同 → 第二次被识别为幂等成功（`already_active`），不再视为失败。
 
 **步骤 1 — 第一次增强：**
 ```json
@@ -1043,7 +1068,7 @@ sequenceDiagram
 | 步骤 | 结果 |
 |------|------|
 | 步骤 1 | ✅ 成功，返回 `rule_id = "UserBusinessService.handleUserLogin_trace"` |
-| 步骤 2 | ❌ `ALREADY_APPLIED`，因为自动生成的 ruleId 与步骤 1 相同 |
+| 步骤 2 | ✅ `already_active`（幂等成功），因为自动生成的 ruleId 与步骤 1 相同 |
 
 ---
 

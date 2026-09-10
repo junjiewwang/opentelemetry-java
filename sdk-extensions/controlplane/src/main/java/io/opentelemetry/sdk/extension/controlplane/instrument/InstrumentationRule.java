@@ -183,6 +183,32 @@ public final class InstrumentationRule {
     return null;
   }
 
+  /**
+   * 判断两条规则是否语义等价（目标方法 + 增强类型 + 采集配置完全相同）
+   *
+   * <p>用于区分「幂等重放」（同 rule_id 且内容一致，应视为 no-op 成功）与
+   * 「真实冲突」（同 rule_id 但内容不同，应报 RULE_ID_CONFLICT）。
+   *
+   * <p>注意：{@code methodDescriptor} 与 {@code parameterTypes} 虽然都用于方法定位，
+   * 但文本形式不同，这里采用保守的严格相等——写法不同即判为不同，宁可在歧义时
+   * 报冲突而非静默跳过。
+   *
+   * @param other 待比较的规则
+   * @return 是否语义等价
+   */
+  public boolean isSemanticallyEqual(InstrumentationRule other) {
+    if (other == null) {
+      return false;
+    }
+    return className.equals(other.className)
+        && methodName.equals(other.methodName)
+        && type == other.type
+        && Objects.equals(methodDescriptor, other.methodDescriptor)
+        && Objects.equals(parameterTypes, other.parameterTypes)
+        && Objects.equals(spanName, other.spanName)
+        && config.equals(other.config);
+  }
+
   @Override
   public String toString() {
     String paramInfo = "";
