@@ -38,10 +38,10 @@ public final class ArthasResourceExtractor {
 
   private static final Logger logger = Logger.getLogger(ArthasResourceExtractor.class.getName());
 
-  // Arthas jar 资源路径（嵌入式模式）
-  private static final String ARTHAS_CORE_JAR_RESOURCE = "/arthas/arthas-core.jar";
-  private static final String ARTHAS_CLIENT_JAR_RESOURCE = "/arthas/arthas-client.jar";
-  private static final String ARTHAS_SPY_JAR_RESOURCE = "/arthas/arthas-spy.jar";
+  // Arthas jar 资源路径（嵌入式模式）；包级私有供 ArthasResourceBundle 复用
+  static final String ARTHAS_CORE_JAR_RESOURCE = "/arthas/arthas-core.jar";
+  static final String ARTHAS_CLIENT_JAR_RESOURCE = "/arthas/arthas-client.jar";
+  static final String ARTHAS_SPY_JAR_RESOURCE = "/arthas/arthas-spy.jar";
 
   /**
    * Arthas 专用 logback.xml 模板
@@ -54,7 +54,7 @@ public final class ArthasResourceExtractor {
    *   <li>root level 设置为 INFO，Netty 等底层组件降级为 WARN 减少噪音</li>
    * </ul>
    */
-  private static final String ARTHAS_LOGBACK_XML_CONTENT =
+  static final String ARTHAS_LOGBACK_XML_CONTENT =
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
           + "<configuration>\n"
           + "  <!-- Arthas 专用日志配置 - 仅文件输出，不含 ConsoleAppender -->\n"
@@ -157,6 +157,11 @@ public final class ArthasResourceExtractor {
   @Nullable
   @SuppressWarnings("AvoidObjectArrays") // URLClassLoader 需要 URL[] 参数
   public static URL[] extractCoreJarsTo(Path arthasHome) {
+    // 内容寻址 bundle 已发布且校验通过：只读复用，绝不重写（I1）
+    if (ArthasResourceBundle.isPublishedBundle(arthasHome)) {
+      return buildUrlsFromPublished(arthasHome);
+    }
+
     try {
       // 尝试解压 arthas-core.jar
       Path coreJar = extractResource(ARTHAS_CORE_JAR_RESOURCE, arthasHome, "arthas-core.jar");
@@ -195,6 +200,28 @@ public final class ArthasResourceExtractor {
 
     } catch (IOException e) {
       logger.log(Level.WARNING, "Failed to extract Arthas core jars: {0}", e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * 从已发布的 bundle 目录构造 URL 数组（只读，不写任何文件）。
+   */
+  @Nullable
+  @SuppressWarnings("AvoidObjectArrays")
+  private static URL[] buildUrlsFromPublished(Path bundleDir) {
+    try {
+      Path coreJar = bundleDir.resolve("arthas-core.jar");
+      if (!Files.isRegularFile(coreJar)) {
+        return null;
+      }
+      Path clientJar = bundleDir.resolve("arthas-client.jar");
+      if (Files.isRegularFile(clientJar)) {
+        return new URL[] {coreJar.toUri().toURL(), clientJar.toUri().toURL()};
+      }
+      return new URL[] {coreJar.toUri().toURL()};
+    } catch (IOException e) {
+      logger.log(Level.WARNING, "Failed to build URLs from bundle: {0}", e.getMessage());
       return null;
     }
   }
