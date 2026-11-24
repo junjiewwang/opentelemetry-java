@@ -15,6 +15,7 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,7 +40,7 @@ import okhttp3.ResponseBody;
  *
  * <p>特性：
  * <ul>
- *   <li>支持鉴权（Authorization Header）
+ *   <li>支持透传完整请求头（含 Authorization）
  *   <li>支持 gzip（gRPC message-level 压缩）
  *   <li>异步非阻塞请求
  *   <li>优雅关闭
@@ -49,7 +50,6 @@ public final class GrpcTransport implements Transport {
 
   private static final Logger logger = Logger.getLogger(GrpcTransport.class.getName());
 
-  private static final String HEADER_AUTHORIZATION = "Authorization";
   private static final String HEADER_TE = "te";
   private static final String HEADER_GRPC_STATUS = "grpc-status";
   private static final String HEADER_GRPC_MESSAGE = "grpc-message";
@@ -73,13 +73,13 @@ public final class GrpcTransport implements Transport {
 
   private final OkHttpClient httpClient;
   private final String baseUrl;
-  @Nullable private final String authorizationHeader;
+  private final Map<String, String> headers;
   @Nullable private final Compressor compressor;
   private final AtomicBoolean closed;
 
   public GrpcTransport(TransportConfig config) {
     this.baseUrl = config.getBaseUrl();
-    this.authorizationHeader = config.getAuthorizationHeader();
+    this.headers = config.getHeaders();
     this.closed = new AtomicBoolean(false);
     this.compressor = config.isCompressionEnabled() ? GzipCompressor.getInstance() : null;
 
@@ -108,8 +108,8 @@ public final class GrpcTransport implements Transport {
     URI uri = URI.create(baseUrl);
     logger.log(
         Level.FINE,
-        "[GRPC-TRANSPORT] Initialized: baseUrl={0}, scheme={1}, hasAuth={2}, compression={3}",
-        new Object[] {baseUrl, uri.getScheme(), authorizationHeader != null, compressor != null});
+        "[GRPC-TRANSPORT] Initialized: baseUrl={0}, scheme={1}, headerCount={2}, compression={3}",
+        new Object[] {baseUrl, uri.getScheme(), headers.size(), compressor != null});
   }
 
   @Override
@@ -126,19 +126,17 @@ public final class GrpcTransport implements Transport {
 
     RequestBody grpcBody = new GrpcRequestBody(new ByteArrayMarshaler(requestBody), compressor);
 
-    Request.Builder requestBuilder =
-        new Request.Builder()
-            .url(url)
-            .post(grpcBody)
-            .header(HEADER_TE, TE_TRAILERS);
+    Request.Builder requestBuilder = new Request.Builder();
+    // 先应用用户 headers，再设置协议必需头，保证 te / grpc-encoding 不被覆盖
+    RequestHeaders.apply(requestBuilder, headers);
+    requestBuilder
+        .url(url)
+        .post(grpcBody)
+        .header(HEADER_TE, TE_TRAILERS);
 
     // 如果启用了压缩，需要告知服务端使用的压缩算法
     if (compressor != null) {
       requestBuilder.header("grpc-encoding", compressor.getEncoding());
-    }
-
-    if (authorizationHeader != null) {
-      requestBuilder.header(HEADER_AUTHORIZATION, authorizationHeader);
     }
 
     // 每次请求都设置一次 per-call timeout，避免影响 OkHttpClient 全局设置

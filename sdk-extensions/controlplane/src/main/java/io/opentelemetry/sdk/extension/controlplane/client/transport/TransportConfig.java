@@ -6,7 +6,10 @@
 package io.opentelemetry.sdk.extension.controlplane.client.transport;
 
 import java.time.Duration;
-import javax.annotation.Nullable;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
 
 /**
  * 传输层配置
@@ -16,7 +19,7 @@ import javax.annotation.Nullable;
 public final class TransportConfig {
 
   private final String baseUrl;
-  @Nullable private final String authorizationHeader;
+  private final Map<String, String> headers;
   private final Duration connectTimeout;
   private final Duration readTimeout;
   private final Duration writeTimeout;
@@ -24,7 +27,7 @@ public final class TransportConfig {
 
   private TransportConfig(Builder builder) {
     this.baseUrl = builder.baseUrl;
-    this.authorizationHeader = builder.authorizationHeader;
+    this.headers = Collections.unmodifiableMap(new LinkedHashMap<>(builder.headers));
     this.connectTimeout = builder.connectTimeout;
     this.readTimeout = builder.readTimeout;
     this.writeTimeout = builder.writeTimeout;
@@ -50,13 +53,12 @@ public final class TransportConfig {
   }
 
   /**
-   * 获取 Authorization Header
+   * 获取解码后的完整请求头，供 HTTP/gRPC 传输一次性应用。
    *
-   * @return Authorization Header，可能为 null
+   * @return 不可变的请求头 map
    */
-  @Nullable
-  public String getAuthorizationHeader() {
-    return authorizationHeader;
+  public Map<String, String> getHeaders() {
+    return headers;
   }
 
   /**
@@ -98,7 +100,7 @@ public final class TransportConfig {
   /** 配置构建器 */
   public static final class Builder {
     private String baseUrl = "";
-    @Nullable private String authorizationHeader;
+    private Map<String, String> headers = Collections.emptyMap();
     private Duration connectTimeout = Duration.ofSeconds(30);
     private Duration readTimeout = Duration.ofSeconds(70);
     private Duration writeTimeout = Duration.ofSeconds(30);
@@ -118,13 +120,15 @@ public final class TransportConfig {
     }
 
     /**
-     * 设置 Authorization Header
+     * 设置完整请求头。
      *
-     * @param authorizationHeader Authorization Header
+     * <p>传入的 map 会被复制为不可变副本，运行期不可修改。
+     *
+     * @param headers 解码后的请求头
      * @return this
      */
-    public Builder authorizationHeader(@Nullable String authorizationHeader) {
-      this.authorizationHeader = authorizationHeader;
+    public Builder headers(Map<String, String> headers) {
+      this.headers = Objects.requireNonNull(headers, "headers");
       return this;
     }
 
@@ -180,6 +184,13 @@ public final class TransportConfig {
     public TransportConfig build() {
       if (baseUrl == null || baseUrl.isEmpty()) {
         throw new IllegalArgumentException("baseUrl must not be empty");
+      }
+      for (Map.Entry<String, String> entry : headers.entrySet()) {
+        if (entry.getKey() == null
+            || entry.getKey().isEmpty()
+            || entry.getValue() == null) {
+          throw new IllegalArgumentException("Transport header key/value must not be null or empty");
+        }
       }
       return new TransportConfig(this);
     }

@@ -62,7 +62,7 @@ public final class DefaultControlPlaneService implements ControlPlaneService {
         transport.getType().getValue(),
         config.getProtocol(),
         config.getControlPlaneUrl(),
-        config.getAuthorizationHeader() != null);
+        !config.getResolvedHeaders().isEmpty());
   }
 
   @Override

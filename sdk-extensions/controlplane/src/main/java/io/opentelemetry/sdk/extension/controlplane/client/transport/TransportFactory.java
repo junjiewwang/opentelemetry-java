@@ -36,7 +36,7 @@ public final class TransportFactory {
     TransportConfig transportConfig =
         TransportConfig.builder()
             .baseUrl(config.getControlPlaneUrl())
-            .authorizationHeader(config.getAuthorizationHeader())
+            .headers(config.getResolvedHeaders())
             .connectTimeout(DEFAULT_CONNECT_TIMEOUT)
             .readTimeout(config.getLongPollTimeout().plusSeconds(READ_TIMEOUT_BUFFER_SECONDS))
             .writeTimeout(DEFAULT_WRITE_TIMEOUT)

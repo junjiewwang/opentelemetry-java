@@ -6,8 +6,10 @@
 package io.opentelemetry.sdk.extension.controlplane.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
+import io.opentelemetry.sdk.autoconfigure.spi.ConfigurationException;
 import io.opentelemetry.sdk.autoconfigure.spi.internal.DefaultConfigProperties;
 import java.time.Duration;
 import java.util.HashMap;
@@ -237,10 +239,11 @@ class ControlPlaneConfigTest {
   @Test
   void fallbackToOtlpHeadersTokenWhenNoOtherTokenSources() {
     // 场景：无专属 token 也无 resource.attributes token，fallback 到 OTLP headers
+    // 使用规范的百分号编码写法，正是此前导致 401 的输入
     Map<String, String> props = new HashMap<>();
     props.put("otel.exporter.otlp.endpoint", "http://collector:4318");
     props.put("otel.exporter.otlp.protocol", "http/protobuf");
-    props.put("otel.exporter.otlp.headers", "Authorization=Bearer header-token");
+    props.put("otel.exporter.otlp.headers", "authorization=Bearer%20header-token");
     ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
 
     ControlPlaneConfig config = ControlPlaneConfig.create(properties);
@@ -248,6 +251,102 @@ class ControlPlaneConfigTest {
     assertThat(config.hasAuthToken()).isTrue();
     assertThat(config.getAuthToken()).isEqualTo("header-token");
     assertThat(config.getAuthTokenSource()).isEqualTo("otel.exporter.otlp.headers[Authorization]");
+    assertThat(config.getResolvedHeaders())
+        .containsEntry("authorization", "Bearer header-token")
+        .doesNotContainValue("Bearer%20header-token");
+    assertThat(config.getAuthorizationHeader()).isEqualTo("Bearer header-token");
+  }
+
+  @Test
+  void multipleHeadersAndEncodedValuesArePreserved() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.endpoint", "http://collector:4318");
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put(
+        "otel.exporter.otlp.headers",
+        "authorization=Bearer%20t1,x-tenant=tenant%2C1,x-literal=100%25");
+
+    ControlPlaneConfig config =
+        ControlPlaneConfig.create(DefaultConfigProperties.createFromMap(props));
+
+    assertThat(config.getResolvedHeaders())
+        .containsEntry("authorization", "Bearer t1")
+        .containsEntry("x-tenant", "tenant,1")
+        .containsEntry("x-literal", "100%");
+    assertThat(config.getAuthToken()).isEqualTo("t1");
+  }
+
+  @Test
+  void dedicatedTokenOverridesOtlpHeadersAuthorization() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.endpoint", "http://collector:4318");
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put("otel.agent.control.token", "dedicated-token");
+    props.put("otel.exporter.otlp.headers", "authorization=Bearer%20otlp-token,x-tenant=t1");
+
+    ControlPlaneConfig config =
+        ControlPlaneConfig.create(DefaultConfigProperties.createFromMap(props));
+
+    assertThat(config.getResolvedHeaders())
+        .containsEntry("Authorization", "Bearer dedicated-token")
+        .containsEntry("x-tenant", "t1");
+    assertThat(config.getAuthorizationHeader()).isEqualTo("Bearer dedicated-token");
+    assertThat(config.getAuthToken()).isEqualTo("dedicated-token");
+    assertThat(config.getAuthTokenSource()).isEqualTo("otel.agent.control.token (dedicated)");
+  }
+
+  @Test
+  void resourceTokenOverridesOtlpHeadersAuthorization() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.endpoint", "http://collector:4318");
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put("otel.resource.attributes", "service.name=app,token=resource-token");
+    props.put("otel.exporter.otlp.headers", "authorization=Bearer%20otlp-token");
+
+    ControlPlaneConfig config =
+        ControlPlaneConfig.create(DefaultConfigProperties.createFromMap(props));
+
+    assertThat(config.getAuthorizationHeader()).isEqualTo("Bearer resource-token");
+    assertThat(config.getAuthToken()).isEqualTo("resource-token");
+    assertThat(config.getAuthTokenSource()).isEqualTo("resource.attributes[token]");
+  }
+
+  @Test
+  void duplicateAuthorizationKeysAreNormalized() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put(
+        "otel.exporter.otlp.headers",
+        "Authorization=Bearer%20first,authorization=Bearer%20second,x=a");
+
+    ControlPlaneConfig config =
+        ControlPlaneConfig.create(DefaultConfigProperties.createFromMap(props));
+
+    assertThat(config.getResolvedHeaders()).hasSize(2);
+    assertThat(config.getAuthorizationHeader()).isEqualTo("Bearer second");
+  }
+
+  @Test
+  void invalidPercentEncodingFailsFast() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.exporter.otlp.protocol", "http/protobuf");
+    props.put("otel.exporter.otlp.headers", "authorization=Bearer%ZZtoken");
+
+    assertThatThrownBy(
+            () ->
+                ControlPlaneConfig.create(
+                    DefaultConfigProperties.createFromMap(props)))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessageContaining("authorization");
+  }
+
+  @Test
+  void noHeadersYieldsEmptyMap() {
+    ControlPlaneConfig config = ControlPlaneConfig.builder().build();
+
+    assertThat(config.getResolvedHeaders()).isEmpty();
+    assertThat(config.getAuthorizationHeader()).isNull();
+    assertThat(config.hasAuthToken()).isFalse();
   }
 
 }

@@ -7,13 +7,13 @@ package io.opentelemetry.sdk.extension.controlplane.client.transport;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.zip.GZIPInputStream;
-import javax.annotation.Nullable;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.MediaType;
@@ -31,7 +31,7 @@ import okhttp3.ResponseBody;
  * <p>特性：
  * <ul>
  *   <li>支持 gzip 压缩响应解码
- *   <li>支持鉴权（Authorization Header）
+ *   <li>支持透传完整请求头（含 Authorization）
  *   <li>异步非阻塞请求
  *   <li>优雅关闭
  * </ul>
@@ -47,7 +47,7 @@ public final class HttpTransport implements Transport {
 
   private final OkHttpClient httpClient;
   private final String baseUrl;
-  @Nullable private final String authorizationHeader;
+  private final Map<String, String> headers;
   private final AtomicBoolean closed;
 
   /**
@@ -57,7 +57,7 @@ public final class HttpTransport implements Transport {
    */
   public HttpTransport(TransportConfig config) {
     this.baseUrl = config.getBaseUrl();
-    this.authorizationHeader = config.getAuthorizationHeader();
+    this.headers = config.getHeaders();
     this.closed = new AtomicBoolean(false);
 
     this.httpClient =
@@ -70,8 +70,8 @@ public final class HttpTransport implements Transport {
 
     logger.log(
         Level.FINE,
-        "[HTTP-TRANSPORT] Initialized: baseUrl={0}, hasAuth={1}",
-        new Object[] {baseUrl, authorizationHeader != null});
+        "[HTTP-TRANSPORT] Initialized: baseUrl={0}, headerCount={1}",
+        new Object[] {baseUrl, headers.size()});
   }
 
   @Override
@@ -86,15 +86,13 @@ public final class HttpTransport implements Transport {
     CompletableFuture<byte[]> future = new CompletableFuture<>();
 
     String url = baseUrl + operation.getHttpPath();
-    Request.Builder requestBuilder =
-        new Request.Builder()
-            .url(url)
-            .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
-            .header(HEADER_ACCEPT_ENCODING, GZIP);
-
-    if (authorizationHeader != null) {
-      requestBuilder.header("Authorization", authorizationHeader);
-    }
+    Request.Builder requestBuilder = new Request.Builder();
+    // 先应用用户 headers，再设置协议必需头，保证传输层自身依赖的头不被覆盖
+    RequestHeaders.apply(requestBuilder, headers);
+    requestBuilder
+        .url(url)
+        .post(RequestBody.create(requestBody, PROTOBUF_TYPE))
+        .header(HEADER_ACCEPT_ENCODING, GZIP);
 
     Request httpRequest = requestBuilder.build();
 

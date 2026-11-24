@@ -32,7 +32,9 @@ cd sdk-extensions/controlplane
 |----------|---------|-------------|
 | `otel.agent.control.enabled` | `false` | Enable control plane |
 | `otel.exporter.otlp.endpoint` | `http://localhost:4317` | OTLP endpoint (reused) |
-| `otel.exporter.otlp.protocol` | `grpc` | Protocol: `grpc` or `http/protobuf` |
+| `otel.exporter.otlp.protocol` | `http/protobuf` | Protocol: `grpc` or `http/protobuf` |
+| `otel.exporter.otlp.headers` | n/a | OTLP headers (reused). Values follow W3C Baggage and are percent-decoded, then forwarded as complete request headers, e.g. `authorization=Bearer%20<TOKEN>` becomes `Authorization: Bearer <TOKEN>`. Signal-specific header variables are not consumed. |
+| `otel.agent.control.token` | n/a | Dedicated token. Highest priority: overrides the `Authorization` header resolved from `otel.exporter.otlp.headers` |
 | `otel.agent.control.http.base.path` | `/v1/control` | HTTP base path |
 | `otel.agent.control.config.poll.interval` | `30s` | Config poll interval |
 | `otel.agent.control.task.poll.interval` | `10s` | Task poll interval |

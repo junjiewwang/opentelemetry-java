@@ -7,7 +7,10 @@ package io.opentelemetry.sdk.extension.controlplane.config;
 
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -16,7 +19,10 @@ import javax.annotation.Nullable;
 /**
  * 控制平面配置
  *
- * <p>从 OTLP 标准配置中复用 endpoint 和 protocol 配置，并扩展控制平面特定配置。
+ * <p>从 OTLP 标准配置中复用 endpoint、protocol 与 headers，并扩展控制平面特定配置。
+ *
+ * <p>鉴权以「解码后的完整 headers」为单一数据源：所有请求头、日志判断与 Arthas 复用的
+ * 纯 token 均从它派生，避免多处独立解析造成语义漂移。
  */
 public final class ControlPlaneConfig {
 
@@ -27,7 +33,6 @@ public final class ControlPlaneConfig {
   // OTLP 标准配置 (复用)
   private static final String OTLP_ENDPOINT = "otel.exporter.otlp.endpoint";
   private static final String OTLP_PROTOCOL = "otel.exporter.otlp.protocol";
-  private static final String OTLP_HEADERS = "otel.exporter.otlp.headers";
 
   // Resource Attributes 配置
   private static final String RESOURCE_ATTRIBUTES = "otel.resource.attributes";
@@ -111,14 +116,14 @@ public final class ControlPlaneConfig {
   private final boolean debugEnabled;
   private final boolean arthasEnabled;
   private final boolean asyncProfilerEnabled;
-  @Nullable private final String headers;
+  private final Map<String, String> resolvedHeaders;
 
   // 存储配置字段
   private final String storageDir;
   private final int storageMaxFiles;
   private final long storageMaxSize;
 
-  // Auth Token (启动时一次性解析)
+  // Auth Token (启动时从 resolvedHeaders 派生，供 Arthas 链路复用)
   @Nullable private final String authToken;
   @Nullable private final String authTokenSource;
 
@@ -137,23 +142,31 @@ public final class ControlPlaneConfig {
     this.debugEnabled = builder.debugEnabled;
     this.arthasEnabled = builder.arthasEnabled;
     this.asyncProfilerEnabled = builder.asyncProfilerEnabled;
-    this.headers = builder.headers;
+    this.resolvedHeaders = builder.resolvedHeaders;
     this.storageDir = builder.storageDir;
     this.storageMaxFiles = builder.storageMaxFiles;
     this.storageMaxSize = builder.storageMaxSize;
-    // 一次性解析 AuthToken
+    // 单一数据源：token 与来源都从最终 headers 派生
     AuthTokenResult result =
-        resolveAuthToken(builder.dedicatedToken, builder.resourceAttributes, builder.headers);
+        resolveAuthToken(
+            builder.dedicatedToken, builder.resourceAttributes, this.resolvedHeaders);
     this.authToken = result.token;
     this.authTokenSource = result.source;
 
     if (this.authToken != null) {
       logger.log(Level.INFO, "Auth token configured from source: {0}", this.authTokenSource);
     }
+    // 只输出 header 名称，绝不输出 header 值
+    if (this.debugEnabled) {
+      logger.log(
+          Level.FINE,
+          "[CONTROL-PLANE] Resolved OTLP header keys: {0}",
+          this.resolvedHeaders.keySet());
+    }
   }
 
   /**
-   * 按优先级解析 AuthToken
+   * 按优先级确定 AuthToken 及其来源，token 始终为不含 Bearer 前缀的纯 token。
    *
    * <p>优先级:
    * <ol>
@@ -164,26 +177,25 @@ public final class ControlPlaneConfig {
    *
    * @param dedicatedToken 控制平面专属 token
    * @param resourceAttributes resource attributes 字符串
-   * @param otlpHeaders OTLP headers 字符串
+   * @param resolvedHeaders 解码后的完整 headers
    * @return 解析结果
    */
   private static AuthTokenResult resolveAuthToken(
       @Nullable String dedicatedToken,
       @Nullable String resourceAttributes,
-      @Nullable String otlpHeaders) {
-    // 优先级 0: 控制平面专属 token（最高优先级）
+      Map<String, String> resolvedHeaders) {
     if (dedicatedToken != null && !dedicatedToken.isEmpty()) {
       return new AuthTokenResult(dedicatedToken, "otel.agent.control.token (dedicated)");
     }
 
-    // 优先级 1: Resource Attributes 中的 token
     String token = extractTokenFromResourceAttributes(resourceAttributes);
     if (token != null && !token.isEmpty()) {
       return new AuthTokenResult(token, "resource.attributes[token]");
     }
 
-    // 优先级 2: OTLP Headers 中的 Authorization
-    token = extractTokenFromOtlpHeaders(otlpHeaders);
+    token =
+        OtlpHeadersResolver.bearerToken(
+            OtlpHeadersResolver.find(resolvedHeaders, OtlpHeadersResolver.AUTHORIZATION));
     if (token != null && !token.isEmpty()) {
       return new AuthTokenResult(token, "otel.exporter.otlp.headers[Authorization]");
     }
@@ -207,32 +219,6 @@ public final class ControlPlaneConfig {
       String[] kv = pair.split("=", 2);
       if (kv.length == 2 && SERVICE_AUTH_TOKEN_KEY.equals(kv[0].trim())) {
         return kv[1].trim();
-      }
-    }
-    return null;
-  }
-
-  /**
-   * 从 OTLP Headers 提取 Authorization Token
-   *
-   * @param headers OTLP headers 字符串 (格式: Header1=Value1,Header2=Value2)
-   * @return token (不含 Bearer 前缀) 或 null
-   */
-  @Nullable
-  private static String extractTokenFromOtlpHeaders(@Nullable String headers) {
-    if (headers == null || headers.isEmpty()) {
-      return null;
-    }
-
-    for (String pair : headers.split(",")) {
-      String[] kv = pair.split("=", 2);
-      if (kv.length == 2 && "Authorization".equalsIgnoreCase(kv[0].trim())) {
-        String value = kv[1].trim();
-        // 移除 "Bearer " 前缀（如果有）
-        if (value.toLowerCase(Locale.ROOT).startsWith("bearer ")) {
-          return value.substring(7).trim();
-        }
-        return value;
       }
     }
     return null;
@@ -318,9 +304,13 @@ public final class ControlPlaneConfig {
     return retryBackoffMultiplier;
   }
 
-  @Nullable
-  public String getHeaders() {
-    return headers;
+  /**
+   * 获取解码后的完整请求头（不可变）。
+   *
+   * @return 请求头 map
+   */
+  public Map<String, String> getResolvedHeaders() {
+    return resolvedHeaders;
   }
 
   /**
@@ -334,16 +324,13 @@ public final class ControlPlaneConfig {
   }
 
   /**
-   * 获取完整的 Authorization Header 值
+   * 获取最终 Authorization header 值，直接来自 resolvedHeaders，不再二次拼接 Bearer。
    *
-   * @return "Bearer {@literal <token>}" 或 null
+   * @return 完整的 Authorization 值或 null
    */
   @Nullable
   public String getAuthorizationHeader() {
-    if (authToken != null && !authToken.isEmpty()) {
-      return "Bearer " + authToken;
-    }
-    return null;
+    return OtlpHeadersResolver.find(resolvedHeaders, OtlpHeadersResolver.AUTHORIZATION);
   }
 
   /**
@@ -460,7 +447,7 @@ public final class ControlPlaneConfig {
     private boolean debugEnabled = DEFAULT_DEBUG_ENABLED;
     private boolean arthasEnabled = DEFAULT_ARTHAS_ENABLED;
     private boolean asyncProfilerEnabled = DEFAULT_ASYNC_PROFILER_ENABLED;
-    @Nullable private String headers;
+    private Map<String, String> resolvedHeaders = Collections.emptyMap();
     @Nullable private String resourceAttributes;
 
     // 存储配置字段
@@ -514,13 +501,26 @@ public final class ControlPlaneConfig {
         this.dedicatedEndpoint = false;
       }
 
-      this.headers = properties.getString(OTLP_HEADERS);
+      // Headers：按 OTLP 规范解码后作为唯一数据源；专属 token 与 resource token 覆盖 Authorization
+      Map<String, String> mergedHeaders =
+          new LinkedHashMap<>(OtlpHeadersResolver.resolve(properties));
 
-      // Token：控制平面专属 > resource.attributes[token] > otlp.headers[Authorization]
-      this.dedicatedToken = properties.getString(CONTROL_TOKEN);
+      String dedicatedToken = properties.getString(CONTROL_TOKEN);
+      String resourceAttributes = properties.getString(RESOURCE_ATTRIBUTES);
+      this.dedicatedToken = dedicatedToken;
+      this.resourceAttributes = resourceAttributes;
 
-      // Resource Attributes（用于解析 auth token）
-      this.resourceAttributes = properties.getString(RESOURCE_ATTRIBUTES);
+      if (dedicatedToken != null && !dedicatedToken.isEmpty()) {
+        OtlpHeadersResolver.putIgnoreCase(
+            mergedHeaders, OtlpHeadersResolver.AUTHORIZATION, "Bearer " + dedicatedToken);
+      } else {
+        String resourceToken = extractTokenFromResourceAttributes(resourceAttributes);
+        if (resourceToken != null && !resourceToken.isEmpty()) {
+          OtlpHeadersResolver.putIgnoreCase(
+              mergedHeaders, OtlpHeadersResolver.AUTHORIZATION, "Bearer " + resourceToken);
+        }
+      }
+      this.resolvedHeaders = Collections.unmodifiableMap(mergedHeaders);
 
       // 控制平面特定配置
       String basePath = properties.getString(CONTROL_HTTP_BASE_PATH);

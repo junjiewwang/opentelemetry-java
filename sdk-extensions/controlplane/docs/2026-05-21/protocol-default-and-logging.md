@@ -35,9 +35,9 @@ ControlPlane 模块原先硬编码 `DEFAULT_PROTOCOL = "grpc"`，但 javaagent �
 | `otel.exporter.otlp.endpoint` | OTLP 共享 endpoint | 次之 |
 | `otel.agent.control.protocol` | 控制平面专属协议 | 最高 |
 | `otel.exporter.otlp.protocol` | OTLP 共享协议 | 次之 |
-| `otel.agent.control.token` | 控制平面专属 Token | 最高 |
-| `otel.resource.attributes` 中的 `token` | Resource Attributes 共享 Token | 次之 |
-| `otel.exporter.otlp.headers` 中的 `Authorization` | OTLP Headers 共享 Token | 最低 |
+| `otel.agent.control.token` | 控制平面专属 Token，覆盖最终 `Authorization` | 最高 |
+| `otel.resource.attributes` 中的 `token` | Resource Attributes 共享 Token，覆盖最终 `Authorization` | 次之 |
+| `otel.exporter.otlp.headers` | 解码后作为完整请求头透传（含 `Authorization`） | 最低 |
 | (无配置) | 兜底 `http/protobuf` + 根据协议推导端口 | 最低 |
 
 ### 使用场景
