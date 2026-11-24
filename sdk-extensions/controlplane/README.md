@@ -40,6 +40,33 @@ cd sdk-extensions/controlplane
 | `otel.agent.control.task.poll.interval` | `10s` | Task poll interval |
 | `otel.agent.control.status.report.interval` | `60s` | Status report interval |
 
+### Arthas Tunnel
+
+Arthas is started lazily by an `arthas_attach` task. The WebSocket endpoint used
+by the embedded Arthas `TunnelClient` is resolved in this order:
+
+1. `otel.agent.arthas.tunnel.endpoint` — explicit WS URL, highest priority.
+2. Derived from `otel.agent.control.endpoint` / `otel.exporter.otlp.endpoint`:
+   `http(s)://host:port` becomes `ws(s)://host:port/v1/arthas/ws` (the port can
+   be overridden by `server_metadata.http_port` from the control plane).
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `otel.agent.control.arthas.enabled` | `true` | Master switch used by auto-configuration |
+| `otel.agent.arthas.enabled` | inherits the master switch | Explicit override; `false` disables Arthas integration |
+| `otel.agent.arthas.tunnel.endpoint` | derived | Explicit Tunnel WebSocket endpoint |
+
+Example when the collector is reached through a reverse proxy / Ingress:
+
+```bash
+-Dotel.agent.arthas.tunnel.endpoint=ws://<collector-host>/v1/arthas/ws
+```
+
+The WS handshake is authenticated with the control-plane token: it is passed as
+the `appName` query parameter (Arthas official `agentRegister` convention), so
+`otel.agent.control.token` must be a valid app token. Command execution uses the
+control-plane task chain and does not require a registered Tunnel.
+
 ## Usage
 
 Once enabled, the extension automatically:

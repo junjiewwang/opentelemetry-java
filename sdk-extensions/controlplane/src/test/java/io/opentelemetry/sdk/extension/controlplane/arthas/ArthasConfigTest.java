@@ -8,9 +8,13 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
+import io.opentelemetry.sdk.autoconfigure.spi.internal.DefaultConfigProperties;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class ArthasConfigTest {
@@ -199,5 +203,48 @@ class ArthasConfigTest {
     assertThat(str).contains("enabled=true");
     assertThat(str).contains("version='3.8.0'");
     assertThat(str).contains("tunnelEndpoint='ws://localhost:8080/ws'");
+  }
+
+  @Test
+  void createUsesConfiguredDefaultWhenEnabledNotSet() {
+    ConfigProperties properties =
+        DefaultConfigProperties.createFromMap(new HashMap<String, String>());
+
+    assertThat(ArthasConfig.create(properties).isEnabled()).isFalse();
+    assertThat(ArthasConfig.create(properties, true).isEnabled()).isTrue();
+  }
+
+  @Test
+  void explicitEnabledOverridesConfiguredDefault() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.agent.arthas.enabled", "false");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    assertThat(ArthasConfig.create(properties, true).isEnabled()).isFalse();
+  }
+
+  @Test
+  void explicitTunnelEndpointIsLoadedFromProperties() {
+    Map<String, String> props = new HashMap<>();
+    props.put("otel.agent.arthas.tunnel.endpoint", "ws://collector.example/v1/arthas/ws");
+    ConfigProperties properties = DefaultConfigProperties.createFromMap(props);
+
+    ArthasConfig config = ArthasConfig.create(properties, true);
+
+    assertThat(config.isEnabled()).isTrue();
+    assertThat(config.hasExplicitTunnelEndpoint()).isTrue();
+    assertThat(config.getExplicitTunnelEndpoint())
+        .isEqualTo("ws://collector.example/v1/arthas/ws");
+  }
+
+  @Test
+  void createKeepsSingleArgumentDefaultDisabled() {
+    ConfigProperties properties =
+        DefaultConfigProperties.createFromMap(new HashMap<String, String>());
+
+    ArthasConfig config = ArthasConfig.create(properties);
+
+    assertThat(config.isEnabled()).isFalse();
+    assertThat(config.hasExplicitTunnelEndpoint()).isFalse();
   }
 }

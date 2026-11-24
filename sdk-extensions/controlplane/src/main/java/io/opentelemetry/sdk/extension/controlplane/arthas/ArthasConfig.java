@@ -179,7 +179,17 @@ public final class ArthasConfig {
    * @return Arthas 配置
    */
   public static ArthasConfig create(ConfigProperties properties) {
-    return builder().fromConfigProperties(properties).build();
+    return create(properties, DEFAULT_ENABLED);
+  }
+
+  /**
+   * 从 ConfigProperties 创建配置实例，并允许调用方指定 enabled 的默认值。
+   *
+   * <p>自动装配使用 {@code otel.agent.control.arthas.enabled} 作为默认值，这样即使没有显式
+   * 配置 {@code otel.agent.arthas.enabled}，Arthas 集成仍会按控制面开关启用；显式配置始终优先。
+   */
+  public static ArthasConfig create(ConfigProperties properties, boolean defaultEnabled) {
+    return builder().fromConfigProperties(properties, defaultEnabled).build();
   }
 
   /**
@@ -449,7 +459,14 @@ public final class ArthasConfig {
      * @return 构建器
      */
     public Builder fromConfigProperties(ConfigProperties properties) {
-      this.enabled = properties.getBoolean(ARTHAS_ENABLED, DEFAULT_ENABLED);
+      return fromConfigProperties(properties, DEFAULT_ENABLED);
+    }
+
+    /**
+     * 从 ConfigProperties 加载配置，enabled 的默认值由调用方决定。
+     */
+    public Builder fromConfigProperties(ConfigProperties properties, boolean defaultEnabled) {
+      this.enabled = properties.getBoolean(ARTHAS_ENABLED, defaultEnabled);
 
       String ver = properties.getString(ARTHAS_VERSION);
       if (ver != null && !ver.isEmpty()) {

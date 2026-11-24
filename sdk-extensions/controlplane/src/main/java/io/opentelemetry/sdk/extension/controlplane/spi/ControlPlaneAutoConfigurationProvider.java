@@ -9,6 +9,7 @@ import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizer;
 import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizerProvider;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import io.opentelemetry.sdk.extension.controlplane.ControlPlaneManager;
+import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasConfig;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.config.ControlPlaneConfig;
 import io.opentelemetry.sdk.extension.controlplane.instrument.DynamicInstrumentationIntegration;
@@ -169,10 +170,16 @@ public final class ControlPlaneAutoConfigurationProvider
                 + "Make sure InstrumentationProvider.setInstrumentation() is called in premain.");
       }
 
-      // 根据配置启用 Arthas
+      // 根据配置启用 Arthas。
+      // 使用 ArthasConfig.create 读取全部显式配置（尤其是 otel.agent.arthas.tunnel.endpoint），
+      // 并把控制面开关作为 enabled 默认值；显式 otel.agent.arthas.enabled 始终优先。
       if (controlConfig.isArthasEnabled()) {
-        managerBuilder.enableArthas();
-        logger.log(Level.INFO, "Arthas integration enabled via configuration");
+        ArthasConfig arthasConfig = ArthasConfig.create(config, controlConfig.isArthasEnabled());
+        managerBuilder.setArthasConfig(arthasConfig);
+        logger.log(
+            Level.INFO,
+            "Arthas integration enabled via configuration, explicit tunnel endpoint: {0}",
+            arthasConfig.hasExplicitTunnelEndpoint());
       }
 
       // 注册动态增强集成（提供 dynamic_instrument / dynamic_uninstrument 任务执行器）
