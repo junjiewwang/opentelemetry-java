@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.dynamic;
 import io.opentelemetry.sdk.extension.controlplane.core.model.ServerMetadata;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,8 +35,11 @@ public final class DynamicConfigManager {
   // 服务端元数据监听器（专用于 server_metadata 变更）
   private final List<ServerMetadataListener> serverMetadataListeners;
 
-  // 当前配置版本
+  // 当前配置版本（仅用于业务配置去重）
   private volatile String currentConfigVersion;
+
+  // 已应用的服务端元数据快照（独立于业务版本去重）
+  private volatile Map<String, String> currentServerMetadata = Collections.emptyMap();
 
   // 配置应用状态
   @Nullable private volatile ConfigApplyResult lastApplyResult;
@@ -113,9 +117,23 @@ public final class DynamicConfigManager {
   public ConfigApplyResult applyConfig(AgentConfigData config) {
     String newVersion = config.getConfigVersion();
 
-    // 版本检查
+    // 服务端元数据按内容独立去重：运营配置变更只影响 ETag，不污染业务 Version。
+    // 即使业务版本相同（甚至 metadata 变为空 map / key 被删除）也必须通知监听器，
+    // 否则探针无法回退到推导出的地址。
+    Map<String, String> serverMetadata = config.getServerMetadata();
+    Map<String, String> metadataSnapshot =
+        serverMetadata == null
+            ? Collections.<String, String>emptyMap()
+            : Collections.unmodifiableMap(new HashMap<>(serverMetadata));
+    boolean metadataChanged = !metadataSnapshot.equals(currentServerMetadata);
+    if (metadataChanged) {
+      currentServerMetadata = metadataSnapshot;
+      notifyServerMetadataListeners(metadataSnapshot);
+    }
+
+    // 业务配置仍按版本去重
     if (newVersion.equals(currentConfigVersion)) {
-      logger.log(Level.FINE, "Config version {0} already applied, skipping", newVersion);
+      logger.log(Level.FINE, "Config version {0} already applied, skipping business fields", newVersion);
       return ConfigApplyResult.noChange(newVersion);
     }
 
@@ -155,15 +173,7 @@ public final class DynamicConfigManager {
           failedFields);
     }
 
-    // 5. 处理服务端元数据（通知专用监听器）
-    Map<String, String> serverMetadata = config.getServerMetadata();
-    if (serverMetadata != null && !serverMetadata.isEmpty()) {
-      applyWithTracking(
-          "server_metadata",
-          () -> notifyServerMetadataListeners(serverMetadata),
-          appliedFields,
-          failedFields);
-    }
+    // 服务端元数据已按内容独立处理，不再参与业务字段应用与版本去重。
 
     // 更新当前版本
     currentConfigVersion = newVersion;

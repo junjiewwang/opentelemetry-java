@@ -24,9 +24,9 @@ import java.lang.instrument.Instrumentation;
 import java.util.Arrays;
 import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -87,8 +87,17 @@ public final class ArthasIntegration
   /** 服务端下发的 HTTP 端口（用于修正 gRPC 场景下的 Tunnel 端口） */
   @Nullable private volatile Integer currentServerHttpPort;
 
-  /** 当前生效的 Tunnel Endpoint（基于静态配置 + 动态端口计算） */
+  /** 运营端下发的 Tunnel Endpoint（null 表示未配置或已删除） */
+  @Nullable private volatile String opsTunnelEndpoint;
+
+  /** 已应用的运维配置 revision，用于心跳上报 */
+  @Nullable private volatile String appliedOpsRevision;
+
+  /** 当前生效的 Tunnel Endpoint（本地 -D > 运营端下发 > 推导） */
   @Nullable private volatile String currentEffectiveTunnelEndpoint;
+
+  /** 当前 Endpoint 来源：local / ops / derived / none，用于运营端展示 */
+  private volatile String tunnelEndpointSource = "none";
 
   @Nullable private ScheduledExecutorService scheduler;
 
@@ -200,8 +209,10 @@ public final class ArthasIntegration
 
     this.scheduler = scheduler;
 
-    // 初始化有效端点（基于静态配置，动态端口为 null）
-    this.currentEffectiveTunnelEndpoint = urlGenerator.resolveEffectiveEndpoint(config, null);
+    // 初始化有效端点（静态配置 + 已缓存的运营端下发值，动态端口为 null）
+    this.currentEffectiveTunnelEndpoint =
+        urlGenerator.resolveEffectiveEndpoint(config, opsTunnelEndpoint, null);
+    this.tunnelEndpointSource = resolveEndpointSource();
     logger.log(Level.FINE, "Initial tunnel endpoint: {0}", currentEffectiveTunnelEndpoint);
 
     // 【方案2A核心】将初始 endpoint 注入到 Bootstrap
@@ -304,38 +315,60 @@ public final class ArthasIntegration
       return;
     }
 
-    // 1. 解析新端口
+    // 1. 解析服务端下发的全部相关字段
     Integer newPort = metadata.getHttpPort();
+    String newOpsEndpoint = metadata.getOpsTunnelEndpoint();
+    String newOpsRevision = metadata.getOpsRevision();
 
-    // 2. 如果端口未变，直接返回
-    if (Objects.equals(currentServerHttpPort, newPort)) {
+    // 2. 更新运行时状态（key 缺失时回退到推导结果）
+    this.currentServerHttpPort = newPort;
+    this.opsTunnelEndpoint = newOpsEndpoint;
+    this.appliedOpsRevision = newOpsRevision;
+
+    // 3. 以"最终端点是否变化"作为唯一判据，避免端口不变时吞掉运营端变更
+    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newOpsEndpoint, newPort);
+    this.tunnelEndpointSource = resolveEndpointSource();
+    if (!urlGenerator.hasEndpointChanged(currentEffectiveTunnelEndpoint, newEndpoint)) {
       return;
     }
 
-    // 3. 更新运行时状态
-    this.currentServerHttpPort = newPort;
+    String oldEndpoint = currentEffectiveTunnelEndpoint;
+    logger.log(
+        Level.INFO,
+        "Arthas tunnel endpoint updated from server metadata: {0} -> {1}",
+        new Object[] {oldEndpoint, newEndpoint});
 
-    // 4. 重新计算有效端点
-    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newPort);
+    this.currentEffectiveTunnelEndpoint = newEndpoint;
 
-    // 5. 判断是否发生变更
-    if (urlGenerator.hasEndpointChanged(currentEffectiveTunnelEndpoint, newEndpoint)) {
-      String oldEndpoint = currentEffectiveTunnelEndpoint;
-      logger.log(Level.INFO,
-          "Arthas tunnel endpoint updated from server metadata: {0} -> {1}",
-          new Object[] {oldEndpoint, newEndpoint});
+    // 将新 endpoint 注入到 Bootstrap，下次启动时生效
+    lifecycleManager.getArthasBootstrap().setEffectiveTunnelEndpoint(newEndpoint);
 
-      this.currentEffectiveTunnelEndpoint = newEndpoint;
-
-      // 【方案2A核心】将新 endpoint 注入到 Bootstrap，下次启动时生效
-      lifecycleManager.getArthasBootstrap().setEffectiveTunnelEndpoint(newEndpoint);
-
-      // 【运行时更新】如果 Arthas 已经在运行，需要重启以应用新的 tunnel endpoint
-      // Arthas 官方 TunnelClient 不支持运行时更换 server，必须重启
-      if (lifecycleManager.isRunning()) {
-        handleTunnelEndpointChangeWhileRunning(oldEndpoint, newEndpoint);
-      }
+    // Arthas 官方 TunnelClient 不支持运行时更换 server，必须停止后等下次 attach
+    if (lifecycleManager.isRunning()) {
+      handleTunnelEndpointChangeWhileRunning(oldEndpoint, newEndpoint);
     }
+  }
+
+  /** 计算当前 Endpoint 来源，供心跳上报与运营端展示。 */
+  private String resolveEndpointSource() {
+    if (config.getExplicitTunnelEndpoint() != null
+        && !config.getExplicitTunnelEndpoint().isEmpty()) {
+      return "local";
+    }
+    if (opsTunnelEndpoint != null && !opsTunnelEndpoint.isEmpty()) {
+      return "ops";
+    }
+    return currentEffectiveTunnelEndpoint == null ? "none" : "derived";
+  }
+
+  /** 心跳上报的运维属性（低基数枚举 + revision，不含任何 token）。 */
+  public Map<String, String> getOpsStatusAttributes() {
+    Map<String, String> attrs = new HashMap<>();
+    attrs.put("arthas.tunnel.source", tunnelEndpointSource);
+    if (appliedOpsRevision != null) {
+      attrs.put("ops.revision.applied", appliedOpsRevision);
+    }
+    return Collections.unmodifiableMap(attrs);
   }
 
   /**

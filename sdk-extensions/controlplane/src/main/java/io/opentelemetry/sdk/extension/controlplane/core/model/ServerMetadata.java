@@ -25,11 +25,15 @@ public final class ServerMetadata {
 
   // 1. 集中定义 Key 常量
   private static final String KEY_HTTP_PORT = "http_port";
+  private static final String KEY_OPS_TUNNEL_ENDPOINT = "ops.arthas.tunnel_endpoint";
+  private static final String KEY_OPS_REVISION = "ops.revision";
 
   private final Map<String, String> rawMetadata;
 
   // 2. 预解析常用字段
   @Nullable private final Integer httpPort;
+  @Nullable private final String opsTunnelEndpoint;
+  @Nullable private final String opsRevision;
 
   private ServerMetadata(@Nullable Map<String, String> rawMetadata) {
     this.rawMetadata = rawMetadata != null
@@ -38,6 +42,8 @@ public final class ServerMetadata {
 
     // 在构造时进行解析，确保后续访问的高效和一致性
     this.httpPort = parseInteger(this.rawMetadata.get(KEY_HTTP_PORT));
+    this.opsTunnelEndpoint = normalize(this.rawMetadata.get(KEY_OPS_TUNNEL_ENDPOINT));
+    this.opsRevision = normalize(this.rawMetadata.get(KEY_OPS_REVISION));
   }
 
   // 3. 静态工厂方法
@@ -55,6 +61,18 @@ public final class ServerMetadata {
     return httpPort;
   }
 
+  /** Admin-managed tunnel endpoint, or null when the key was removed/absent. */
+  @Nullable
+  public String getOpsTunnelEndpoint() {
+    return opsTunnelEndpoint;
+  }
+
+  /** Monotonic revision tag of the admin-managed runtime config. */
+  @Nullable
+  public String getOpsRevision() {
+    return opsRevision;
+  }
+
   /**
    * 获取原始 Map (仅用于调试或透传)
    */
@@ -63,6 +81,14 @@ public final class ServerMetadata {
   }
 
   // 5. 内部解析工具
+  @Nullable
+  private static String normalize(@Nullable String value) {
+    if (value == null || value.trim().isEmpty()) {
+      return null;
+    }
+    return value.trim();
+  }
+
   @Nullable
   private static Integer parseInteger(@Nullable String value) {
     if (value == null || value.trim().isEmpty()) {

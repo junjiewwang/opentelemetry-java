@@ -71,14 +71,45 @@ public final class TunnelUrlGenerator {
       @Nullable String explicitEndpoint,
       @Nullable String baseOtlpEndpoint,
       @Nullable Integer serverHttpPort) {
+    return resolveEffectiveEndpoint(explicitEndpoint, null, baseOtlpEndpoint, serverHttpPort);
+  }
 
-    // 1. 优先使用显式配置
+  /**
+   * 计算最终 Tunnel 地址。
+   *
+   * <p>优先级（从高到低）：
+   * <ol>
+   *   <li>本地 -D 显式配置（应急调试，永远最高）</li>
+   *   <li>运营端通过 server_metadata 下发的值</li>
+   *   <li>由 OTLP/control endpoint 与动态端口推导</li>
+   * </ol>
+   *
+   * @param explicitEndpoint 本地 -D 配置，可为 null
+   * @param opsTunnelEndpoint 运营端下发值，可为 null（删除配置时回退到推导）
+   * @param baseOtlpEndpoint OTLP/control endpoint
+   * @param serverHttpPort 服务端下发的 HTTP 端口，可为 null
+   * @return 有效的 WebSocket 地址，或 null
+   */
+  @Nullable
+  public String resolveEffectiveEndpoint(
+      @Nullable String explicitEndpoint,
+      @Nullable String opsTunnelEndpoint,
+      @Nullable String baseOtlpEndpoint,
+      @Nullable Integer serverHttpPort) {
+
+    // 1. 本地显式配置（最高优先级）
     if (explicitEndpoint != null && !explicitEndpoint.isEmpty()) {
       logger.log(Level.FINE, "Using explicit tunnel endpoint: {0}", explicitEndpoint);
       return explicitEndpoint;
     }
 
-    // 2. 基于 OTLP Endpoint 和动态端口生成
+    // 2. 运营端下发（第二优先级）
+    if (opsTunnelEndpoint != null && !opsTunnelEndpoint.isEmpty()) {
+      logger.log(Level.FINE, "Using ops-managed tunnel endpoint: {0}", opsTunnelEndpoint);
+      return opsTunnelEndpoint;
+    }
+
+    // 3. 基于 OTLP Endpoint 和动态端口生成
     return generateDefaultEndpoint(baseOtlpEndpoint, serverHttpPort);
   }
 
@@ -93,6 +124,22 @@ public final class TunnelUrlGenerator {
   public String resolveEffectiveEndpoint(ArthasConfig config, @Nullable Integer serverHttpPort) {
     return resolveEffectiveEndpoint(
         config.getExplicitTunnelEndpoint(),
+        null,
+        config.getBaseOtlpEndpoint(),
+        serverHttpPort);
+  }
+
+  /**
+   * 配置对象便捷方法，额外接受运营端下发值。
+   */
+  @Nullable
+  public String resolveEffectiveEndpoint(
+      ArthasConfig config,
+      @Nullable String opsTunnelEndpoint,
+      @Nullable Integer serverHttpPort) {
+    return resolveEffectiveEndpoint(
+        config.getExplicitTunnelEndpoint(),
+        opsTunnelEndpoint,
         config.getBaseOtlpEndpoint(),
         serverHttpPort);
   }

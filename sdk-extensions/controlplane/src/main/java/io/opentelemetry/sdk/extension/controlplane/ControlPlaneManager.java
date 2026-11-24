@@ -630,6 +630,9 @@ public final class ControlPlaneManager implements Closeable {
           arthasConfig = builder.build();
         }
         ArthasIntegration arthasIntegration = ArthasIntegration.create(arthasConfig);
+        // 心跳上报 Tunnel 来源与已应用 revision，供运营端判断本地 -D 覆盖
+        AgentIdentityProvider.setDynamicAttributesSupplier(
+            arthasIntegration::getOpsStatusAttributes);
         // 如果已经设置了 Instrumentation，传递给 ArthasIntegration
         if (this.instrumentation != null) {
           arthasIntegration.setInstrumentation(this.instrumentation);

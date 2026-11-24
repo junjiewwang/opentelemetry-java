@@ -35,7 +35,39 @@ public final class AgentIdentityProvider {
   @Nullable private static volatile AgentIdentity instance;
   private static final Object lock = new Object();
 
+  /**
+   * Dynamic, low-cardinality attributes merged into every heartbeat identity.
+   * Supplied at runtime by components such as ArthasIntegration; never used for
+   * credentials.
+   */
+  @Nullable
+  private static volatile java.util.function.Supplier<Map<String, String>> dynamicAttributesSupplier;
+
   private AgentIdentityProvider() {}
+
+  /**
+   * Registers a supplier of dynamic heartbeat attributes.
+   * Passing null clears the supplier.
+   */
+  public static void setDynamicAttributesSupplier(
+      @Nullable java.util.function.Supplier<Map<String, String>> supplier) {
+    dynamicAttributesSupplier = supplier;
+  }
+
+  /** Returns a snapshot of dynamic attributes; never null. */
+  public static Map<String, String> getDynamicAttributes() {
+    java.util.function.Supplier<Map<String, String>> supplier = dynamicAttributesSupplier;
+    if (supplier == null) {
+      return java.util.Collections.emptyMap();
+    }
+    try {
+      Map<String, String> attrs = supplier.get();
+      return attrs == null ? java.util.Collections.<String, String>emptyMap() : attrs;
+    } catch (RuntimeException e) {
+      logger.log(Level.WARNING, "Dynamic identity attributes supplier failed", e);
+      return java.util.Collections.emptyMap();
+    }
+  }
 
   /**
    * 获取 Agent 身份标识单例
@@ -476,12 +508,14 @@ public final class AgentIdentityProvider {
      * @return Protobuf AgentIdentity 对象
      */
     public CommonProtos.AgentIdentity toProto() {
-      // 合并 labels 和 attributes 到 proto 的 attributes 字段
+      // 合并 labels、attributes 与运行时动态属性到 proto 的 attributes 字段
       Map<String, String> mergedAttributes = new HashMap<>(attributes);
       // labels 也作为 attributes 的一部分（加上 label. 前缀以区分）
       for (Map.Entry<String, String> entry : labels.entrySet()) {
         mergedAttributes.put("label." + entry.getKey(), entry.getValue());
       }
+      // 动态属性优先，反映每次心跳时的最新状态
+      mergedAttributes.putAll(AgentIdentityProvider.getDynamicAttributes());
 
       return CommonProtos.AgentIdentity.newBuilder()
           .setAgentId(agentId)
