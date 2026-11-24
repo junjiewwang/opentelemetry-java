@@ -18,9 +18,9 @@ class TunnelUrlGeneratorOpsTest {
     String result =
         generator.resolveEffectiveEndpoint(
             "ws://local.example/v1/arthas/ws",
-            "ws://ops.example/v1/arthas/ws",
             "http://collector.example:4318",
-            4318);
+            4318,
+            "ws://ops.example/v1/arthas/ws");
     assertThat(result).isEqualTo("ws://local.example/v1/arthas/ws");
   }
 
@@ -28,14 +28,14 @@ class TunnelUrlGeneratorOpsTest {
   void opsEndpointWinsOverDerived() {
     String result =
         generator.resolveEffectiveEndpoint(
-            null, "ws://ops.example/v1/arthas/ws", "http://collector.example:4318", 4318);
+            null, "http://collector.example:4318", 4318, "ws://ops.example/v1/arthas/ws");
     assertThat(result).isEqualTo("ws://ops.example/v1/arthas/ws");
   }
 
   @Test
   void missingOpsEndpointFallsBackToDerived() {
     String result =
-        generator.resolveEffectiveEndpoint(null, null, "http://collector.example:4318", null);
+        generator.resolveEffectiveEndpoint(null, "http://collector.example:4318", null, null);
     assertThat(result).isEqualTo("ws://collector.example:4318/v1/arthas/ws");
   }
 

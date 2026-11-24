@@ -211,7 +211,7 @@ public final class ArthasIntegration
 
     // 初始化有效端点（静态配置 + 已缓存的运营端下发值，动态端口为 null）
     this.currentEffectiveTunnelEndpoint =
-        urlGenerator.resolveEffectiveEndpoint(config, opsTunnelEndpoint, null);
+        urlGenerator.resolveEffectiveEndpoint(config, null, opsTunnelEndpoint);
     this.tunnelEndpointSource = resolveEndpointSource();
     logger.log(Level.FINE, "Initial tunnel endpoint: {0}", currentEffectiveTunnelEndpoint);
 
@@ -326,7 +326,7 @@ public final class ArthasIntegration
     this.appliedOpsRevision = newOpsRevision;
 
     // 3. 以"最终端点是否变化"作为唯一判据，避免端口不变时吞掉运营端变更
-    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newOpsEndpoint, newPort);
+    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newPort, newOpsEndpoint);
     this.tunnelEndpointSource = resolveEndpointSource();
     if (!urlGenerator.hasEndpointChanged(currentEffectiveTunnelEndpoint, newEndpoint)) {
       return;

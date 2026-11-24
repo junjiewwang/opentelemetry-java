@@ -71,11 +71,11 @@ public final class TunnelUrlGenerator {
       @Nullable String explicitEndpoint,
       @Nullable String baseOtlpEndpoint,
       @Nullable Integer serverHttpPort) {
-    return resolveEffectiveEndpoint(explicitEndpoint, null, baseOtlpEndpoint, serverHttpPort);
+    return resolveEffectiveEndpoint(explicitEndpoint, baseOtlpEndpoint, serverHttpPort, null);
   }
 
   /**
-   * 计算最终 Tunnel 地址。
+   * 计算最终 Tunnel 地址（全参数入口）。
    *
    * <p>优先级（从高到低）：
    * <ol>
@@ -84,18 +84,22 @@ public final class TunnelUrlGenerator {
    *   <li>由 OTLP/control endpoint 与动态端口推导</li>
    * </ol>
    *
+   * <p><b>参数顺序约定</b>：新增参数一律追加到参数列表末尾，使各重载之间的共有参数保持
+   * 相同的相对顺序（ErrorProne {@code InconsistentOverloads} 要求）。因此
+   * {@code opsTunnelEndpoint} 虽在优先级中排第二，仍置于末尾。
+   *
    * @param explicitEndpoint 本地 -D 配置，可为 null
-   * @param opsTunnelEndpoint 运营端下发值，可为 null（删除配置时回退到推导）
    * @param baseOtlpEndpoint OTLP/control endpoint
    * @param serverHttpPort 服务端下发的 HTTP 端口，可为 null
+   * @param opsTunnelEndpoint 运营端下发值，可为 null（删除配置时回退到推导）
    * @return 有效的 WebSocket 地址，或 null
    */
   @Nullable
   public String resolveEffectiveEndpoint(
       @Nullable String explicitEndpoint,
-      @Nullable String opsTunnelEndpoint,
       @Nullable String baseOtlpEndpoint,
-      @Nullable Integer serverHttpPort) {
+      @Nullable Integer serverHttpPort,
+      @Nullable String opsTunnelEndpoint) {
 
     // 1. 本地显式配置（最高优先级）
     if (explicitEndpoint != null && !explicitEndpoint.isEmpty()) {
@@ -122,26 +126,27 @@ public final class TunnelUrlGenerator {
    */
   @Nullable
   public String resolveEffectiveEndpoint(ArthasConfig config, @Nullable Integer serverHttpPort) {
-    return resolveEffectiveEndpoint(
-        config.getExplicitTunnelEndpoint(),
-        null,
-        config.getBaseOtlpEndpoint(),
-        serverHttpPort);
+    return resolveEffectiveEndpoint(config, serverHttpPort, null);
   }
 
   /**
-   * 配置对象便捷方法，额外接受运营端下发值。
+   * 基于配置对象计算有效端点，额外接受运营端下发值。
+   *
+   * @param config Arthas 配置
+   * @param serverHttpPort 服务端动态下发的 HTTP 端口（可为 null）
+   * @param opsTunnelEndpoint 运营端下发值，可为 null
+   * @return 有效的 WebSocket 连接地址，或 null
    */
   @Nullable
   public String resolveEffectiveEndpoint(
       ArthasConfig config,
-      @Nullable String opsTunnelEndpoint,
-      @Nullable Integer serverHttpPort) {
+      @Nullable Integer serverHttpPort,
+      @Nullable String opsTunnelEndpoint) {
     return resolveEffectiveEndpoint(
         config.getExplicitTunnelEndpoint(),
-        opsTunnelEndpoint,
         config.getBaseOtlpEndpoint(),
-        serverHttpPort);
+        serverHttpPort,
+        opsTunnelEndpoint);
   }
 
   /**
