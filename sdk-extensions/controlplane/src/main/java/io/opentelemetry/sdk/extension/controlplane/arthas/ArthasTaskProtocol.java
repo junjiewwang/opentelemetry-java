@@ -117,6 +117,7 @@ public final class ArthasTaskProtocol {
     public static final String ARTHAS_NOT_RUNNING = "ARTHAS_NOT_RUNNING";
     public static final String ARTHAS_NOT_READY = "ARTHAS_NOT_READY";
     public static final String TUNNEL_NOT_READY = "TUNNEL_NOT_READY";
+    public static final String TERMINAL_NOT_LISTENING = "TERMINAL_NOT_LISTENING";
     public static final String ARTHAS_CLASSLOADER_UNAVAILABLE =
         "ARTHAS_CLASSLOADER_UNAVAILABLE";
     public static final String ARTHAS_BOOTSTRAP_UNAVAILABLE =

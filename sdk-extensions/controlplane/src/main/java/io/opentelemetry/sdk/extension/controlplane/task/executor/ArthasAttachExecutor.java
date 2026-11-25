@@ -5,7 +5,6 @@ import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasIntegration;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasLifecycleManager.StartResult;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasReadinessGate;
-import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasStateEventBus;
 import io.opentelemetry.sdk.extension.controlplane.arthas.ArthasTaskProtocol;
 import io.opentelemetry.sdk.extension.controlplane.task.status.TaskStatusEmitter;
 import io.opentelemetry.sdk.extension.controlplane.util.JsonUtils;
@@ -218,11 +217,16 @@ public final class ArthasAttachExecutor implements TaskExecutor {
     // 安全获取 arthasIntegration（在此方法中已由调用方确认不为 null）
     ArthasIntegration integration = Objects.requireNonNull(arthasIntegration, "arthasIntegration");
 
-    // 订阅状态事件：等待 tunnel 注册成功
+    // 订阅状态事件：等待「可交互就绪」（tunnel 连接+注册、Arthas 运行中、ShellServer listen 完成）。
+    // 只看 isTunnelRegistered 会在 shellServer.listen() 之前就上报 SUCCESS，导致终端竞态。
     CompletableFuture<io.opentelemetry.sdk.extension.controlplane.arthas.ArthasStateEventBus.State>
         registeredFuture =
             integration.awaitState(
-                ArthasStateEventBus.State::isTunnelRegistered,
+                s -> s.isTunnelConnected()
+                    && s.isTunnelRegistered()
+                    && s.isShellServerReady()
+                    && (s.getArthasState() == ArthasLifecycleManager.State.RUNNING
+                        || s.getArthasState() == ArthasLifecycleManager.State.IDLE),
                 java.time.Duration.ofMillis(effectiveTimeout));
 
     // 订阅状态事件：检测启动失败（观测到 STARTING 后又回到 STOPPED）
@@ -351,16 +355,17 @@ public final class ArthasAttachExecutor implements TaskExecutor {
       return;
     }
 
-    // 检查是否已就绪（方式2：直接检查 tunnel 注册状态）
-    // 说明：当 tunnel 刚注册时，readinessGate 状态可能还未同步，
-    //       但只要 Arthas 运行中 + tunnel 已注册，就应视为 attach 成功
+    // 检查是否已就绪（方式2：直接检查各组件状态）
+    // 说明：当 tunnel 刚注册时，readinessGate 状态可能还未同步；
+    //       但必须同时满足 ShellServer 已 listen，否则仍会过早上报 SUCCESS
     if (arthasIntegration != null
         && (st == ArthasLifecycleManager.State.RUNNING || st == ArthasLifecycleManager.State.IDLE)
-        && arthasIntegration.isTunnelReady()) {
-      TaskExecutionResult ok = buildSuccessResult("Tunnel registered (direct check)", manager);
+        && arthasIntegration.isTunnelReady()
+        && arthasIntegration.isShellServerReady()) {
+      TaskExecutionResult ok = buildSuccessResult("Terminal ready (direct check)", manager);
       // 【方案A】终态不通过 emitter 上报，由 TaskDispatcher 统一上报
       // emitter.success(ok.getResultJson());
-      logger.log(Level.INFO, "[ARTHAS-ATTACH] Success: Tunnel registered (direct check)");
+      logger.log(Level.INFO, "[ARTHAS-ATTACH] Success: Terminal ready (direct check)");
       future.complete(TaskExecutionResult.success(ok.getResultJson(), executionTime));
       return;
     }

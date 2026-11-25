@@ -493,6 +493,16 @@ public final class ArthasIntegration
   }
 
   /**
+   * ShellServer 本地交互服务是否已完成 listen。
+   *
+   * <p>与 {@link #isTunnelReady()} 不同：后者只反映 TunnelClient 注册，不含本地 listen。
+   * MCP / 状态上报如需「真正可交互」语义，应使用 {@link #isTerminalBindable()}。
+   */
+  public boolean isShellServerReady() {
+    return stateEventBus.getState().isShellServerReady();
+  }
+
+  /**
    * 获取终端不可绑定原因（用于拒绝/日志）
    *
    * @return 为空表示可绑定
@@ -726,6 +736,17 @@ public final class ArthasIntegration
    *
    * <p>策略：给 TunnelClient 一定时间尝试重连，超时后销毁 Arthas 允许重新启动。
    */
+  @Override
+  public void onShellServerReady(boolean ready) {
+    // 按总线当前状态去重：Bridge 每次轮询都会通知，避免重复发布事件刷屏；
+    // 同时保证总线被清场（断连/重启）后能由下一次轮询恢复一致。
+    if (stateEventBus.getState().isShellServerReady() == ready) {
+      return;
+    }
+    logger.log(Level.INFO, "[MODE2] ShellServer listening status changed: ready={0}", ready);
+    stateEventBus.publishShellServerReady(ready);
+  }
+
   @Override
   public void onTunnelDisconnected(String reason) {
     logger.log(Level.WARNING, "[MODE2] Arthas internal tunnel disconnected: {0}", reason);

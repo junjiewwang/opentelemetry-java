@@ -23,8 +23,10 @@ public final class ArthasReadinessGate {
    * <p>注意：此处表达的是“能力（Capability）就绪”，而非任务成功与否。
    */
   public enum Readiness {
-    /** Arthas 本地可用 + Tunnel 已注册，可创建 Terminal session */
+    /** Arthas 本地可用 + Tunnel 已注册 + ShellServer 已 listen，可创建 Terminal session */
     TERMINAL_READY,
+    /** Tunnel 与 Arthas 都就绪，但本地交互服务尚未 listen 完成 */
+    TERMINAL_NOT_LISTENING,
     /** Arthas 本地可用，但 Tunnel 未就绪（未连接/未注册） */
     ARTHAS_READY_BUT_TUNNEL_NOT_READY,
     /** Tunnel 已就绪，但 Arthas 本地不可用（STARTING/STOPPED/STOPPING） */
@@ -38,6 +40,8 @@ public final class ArthasReadinessGate {
     NONE,
     TUNNEL_NOT_CONNECTED,
     TUNNEL_NOT_REGISTERED,
+    /** Tunnel/Arthas 均就绪，但本地交互服务尚未 listen 完成（等待态，非失败态） */
+    TERMINAL_NOT_LISTENING,
     ARTHAS_STARTING,
     ARTHAS_STOPPING,
     ARTHAS_STOPPED
@@ -47,12 +51,19 @@ public final class ArthasReadinessGate {
   public static final class Snapshot {
     private final boolean tunnelConnected;
     private final boolean tunnelRegistered;
+    private final boolean shellServerReady;
     private final ArthasLifecycleManager.State arthasState;
 
-    Snapshot(boolean tunnelConnected, boolean tunnelRegistered, ArthasLifecycleManager.State arthasState) {
+    Snapshot(boolean tunnelConnected, boolean tunnelRegistered, boolean shellServerReady,
+        ArthasLifecycleManager.State arthasState) {
       this.tunnelConnected = tunnelConnected;
       this.tunnelRegistered = tunnelRegistered;
+      this.shellServerReady = shellServerReady;
       this.arthasState = arthasState;
+    }
+
+    public boolean isShellServerReady() {
+      return shellServerReady;
     }
 
     public boolean isTunnelConnected() {
@@ -73,6 +84,8 @@ public final class ArthasReadinessGate {
           + tunnelConnected
           + ", tunnelRegistered="
           + tunnelRegistered
+          + ", shellServerReady="
+          + shellServerReady
           + ", arthasState="
           + arthasState
           + '}';
@@ -119,6 +132,8 @@ public final class ArthasReadinessGate {
           return "TUNNEL_NOT_CONNECTED";
         case TUNNEL_NOT_REGISTERED:
           return "TUNNEL_NOT_REGISTERED";
+        case TERMINAL_NOT_LISTENING:
+          return "TERMINAL_NOT_LISTENING";
         case ARTHAS_STARTING:
         case ARTHAS_STOPPING:
         case ARTHAS_STOPPED:
@@ -150,26 +165,33 @@ public final class ArthasReadinessGate {
 
     boolean tunnelConnected = s.isTunnelConnected();
     boolean tunnelRegistered = s.isTunnelRegistered();
+    boolean shellServerReady = s.isShellServerReady();
     ArthasLifecycleManager.State arthasState = s.getArthasState();
 
-    Snapshot snapshot = new Snapshot(tunnelConnected, tunnelRegistered, arthasState);
+    Snapshot snapshot = new Snapshot(
+        tunnelConnected, tunnelRegistered, shellServerReady, arthasState);
 
     boolean tunnelReady = tunnelConnected && tunnelRegistered;
     boolean arthasReady = arthasState == ArthasLifecycleManager.State.RUNNING || arthasState == ArthasLifecycleManager.State.IDLE;
 
-    if (tunnelReady && arthasReady) {
+    if (tunnelReady && arthasReady && shellServerReady) {
       return new Result(Readiness.TERMINAL_READY, ReasonCode.NONE, snapshot);
     }
 
     // 细分原因，优先给出最贴近用户动作的原因
-    ReasonCode reason = ReasonCode.NONE;
+    ReasonCode reason;
+    Readiness readiness;
 
     if (!tunnelConnected) {
       reason = ReasonCode.TUNNEL_NOT_CONNECTED;
+      readiness = arthasReady
+          ? Readiness.ARTHAS_READY_BUT_TUNNEL_NOT_READY : Readiness.NOT_READY;
     } else if (!tunnelRegistered) {
       reason = ReasonCode.TUNNEL_NOT_REGISTERED;
-    } else {
-      // tunnel ready but arthas not ready
+      readiness = arthasReady
+          ? Readiness.ARTHAS_READY_BUT_TUNNEL_NOT_READY : Readiness.NOT_READY;
+    } else if (!arthasReady) {
+      // tunnel 就绪但 Arthas 本地不可用
       switch (arthasState) {
         case STARTING:
           reason = ReasonCode.ARTHAS_STARTING;
@@ -177,22 +199,15 @@ public final class ArthasReadinessGate {
         case STOPPING:
           reason = ReasonCode.ARTHAS_STOPPING;
           break;
-        case STOPPED:
-        case RUNNING:
-        case IDLE:
-          // 走到这里说明 arthasReady=false，因此 RUNNING/IDLE 理论上不会出现，保守兜底到 STOPPED
+        default:
           reason = ReasonCode.ARTHAS_STOPPED;
           break;
       }
-    }
-
-    Readiness readiness;
-    if (arthasReady && !tunnelReady) {
-      readiness = Readiness.ARTHAS_READY_BUT_TUNNEL_NOT_READY;
-    } else if (tunnelReady && !arthasReady) {
       readiness = Readiness.TUNNEL_READY_BUT_ARTHAS_NOT_READY;
     } else {
-      readiness = Readiness.NOT_READY;
+      // tunnel 与 Arthas 都好，只差本地交互服务 listen：等待态，不应直接失败
+      reason = ReasonCode.TERMINAL_NOT_LISTENING;
+      readiness = Readiness.TERMINAL_NOT_LISTENING;
     }
 
     return new Result(readiness, reason, snapshot);
@@ -223,7 +238,7 @@ public final class ArthasReadinessGate {
               ArthasLifecycleManager.State st = s.getArthasState();
               boolean tunnelReady = s.isTunnelConnected() && s.isTunnelRegistered();
               boolean arthasReady = st == ArthasLifecycleManager.State.RUNNING || st == ArthasLifecycleManager.State.IDLE;
-              if (tunnelReady && arthasReady) {
+              if (tunnelReady && arthasReady && s.isShellServerReady()) {
                 return true;
               }
               // 快速失败：如果 Arthas 已 STOPPED/STOPPING，认为无法在当前窗口内变为可用

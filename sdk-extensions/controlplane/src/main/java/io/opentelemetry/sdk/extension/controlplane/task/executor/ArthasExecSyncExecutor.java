@@ -817,6 +817,8 @@ public final class ArthasExecSyncExecutor implements TaskExecutor {
       case TUNNEL_NOT_CONNECTED:
       case TUNNEL_NOT_REGISTERED:
         return ArthasTaskProtocol.ErrorCode.TUNNEL_NOT_READY;
+      case TERMINAL_NOT_LISTENING:
+        return ArthasTaskProtocol.ErrorCode.TERMINAL_NOT_LISTENING;
       case ARTHAS_STARTING:
       case ARTHAS_STOPPING:
         return ArthasTaskProtocol.ErrorCode.ARTHAS_NOT_READY;

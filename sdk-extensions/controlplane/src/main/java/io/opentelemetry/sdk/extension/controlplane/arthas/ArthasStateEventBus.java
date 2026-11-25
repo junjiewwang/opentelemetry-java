@@ -39,6 +39,8 @@ public final class ArthasStateEventBus {
     TUNNEL_CONNECTED,
     TUNNEL_DISCONNECTED,
     TUNNEL_REGISTERED,
+    /** ShellServer 本地交互服务 listen 状态变化（用于唤醒 awaitTerminalReady） */
+    SHELL_SERVER_READY,
 
     ARTHAS_STARTING,
     ARTHAS_STARTED,
@@ -54,11 +56,14 @@ public final class ArthasStateEventBus {
   public static final class State {
     private final boolean tunnelConnected;
     private final boolean tunnelRegistered;
+    private final boolean shellServerReady;
     private final ArthasLifecycleManager.State arthasState;
 
-    private State(boolean tunnelConnected, boolean tunnelRegistered, ArthasLifecycleManager.State arthasState) {
+    private State(boolean tunnelConnected, boolean tunnelRegistered, boolean shellServerReady,
+        ArthasLifecycleManager.State arthasState) {
       this.tunnelConnected = tunnelConnected;
       this.tunnelRegistered = tunnelRegistered;
+      this.shellServerReady = shellServerReady;
       this.arthasState = arthasState;
     }
 
@@ -68,6 +73,11 @@ public final class ArthasStateEventBus {
 
     public boolean isTunnelRegistered() {
       return tunnelRegistered;
+    }
+
+    /** ShellServer 是否已完成 listen（本地交互服务可输出）。 */
+    public boolean isShellServerReady() {
+      return shellServerReady;
     }
 
     public ArthasLifecycleManager.State getArthasState() {
@@ -80,21 +90,27 @@ public final class ArthasStateEventBus {
           + tunnelConnected
           + ", tunnelRegistered="
           + tunnelRegistered
+          + ", shellServerReady="
+          + shellServerReady
           + ", arthasState="
           + arthasState
           + '}';
     }
 
     private State withTunnelConnected(boolean connected) {
-      return new State(connected, tunnelRegistered, arthasState);
+      return new State(connected, tunnelRegistered, shellServerReady, arthasState);
     }
 
     private State withTunnelRegistered(boolean registered) {
-      return new State(tunnelConnected, registered, arthasState);
+      return new State(tunnelConnected, registered, shellServerReady, arthasState);
+    }
+
+    private State withShellServerReady(boolean ready) {
+      return new State(tunnelConnected, tunnelRegistered, ready, arthasState);
     }
 
     private State withArthasState(ArthasLifecycleManager.State state) {
-      return new State(tunnelConnected, tunnelRegistered, state);
+      return new State(tunnelConnected, tunnelRegistered, shellServerReady, state);
     }
   }
 
@@ -111,6 +127,7 @@ public final class ArthasStateEventBus {
       new AtomicReference<>(
           new State(/* tunnelConnected= */ false,
               /* tunnelRegistered= */ false,
+              /* shellServerReady= */ false,
               /* arthasState= */ ArthasLifecycleManager.State.STOPPED));
 
   private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
@@ -154,6 +171,9 @@ public final class ArthasStateEventBus {
     if (s.isTunnelRegistered()) {
       safeInvoke(listener, Event.TUNNEL_REGISTERED, s, null);
     }
+    if (s.isShellServerReady()) {
+      safeInvoke(listener, Event.SHELL_SERVER_READY, s, null);
+    }
 
     ArthasLifecycleManager.State as = s.getArthasState();
     // 只回放“结果态”或关键态，避免噪声
@@ -176,36 +196,62 @@ public final class ArthasStateEventBus {
   public void publishTunnelDisconnected(@Nullable String reason) {
     updateAndPublish(
         Event.TUNNEL_DISCONNECTED,
-        s -> s.withTunnelConnected(false).withTunnelRegistered(false),
+        s -> s.withTunnelConnected(false)
+            .withTunnelRegistered(false)
+            .withShellServerReady(false),
         reason);
   }
 
+  /**
+   * 发布 Tunnel 注册成功。
+   *
+   * <p>registered 蕴含 connected：现场 Bridge 可能直接从 DISCONNECTED 跳到 REGISTERED
+   * （跳过 CONNECTED 事件），若不联动置位 connected，就绪门闩会永远判定 tunnel 未就绪。
+   */
   public void publishTunnelRegistered() {
-    updateAndPublish(Event.TUNNEL_REGISTERED, s -> s.withTunnelRegistered(true), null);
+    updateAndPublish(
+        Event.TUNNEL_REGISTERED,
+        s -> s.withTunnelConnected(true).withTunnelRegistered(true),
+        null);
+  }
+
+  /** 发布 ShellServer listen 状态变化；每次变化都触发事件以唤醒 await predicate。 */
+  public void publishShellServerReady(boolean ready) {
+    updateAndPublish(Event.SHELL_SERVER_READY, s -> s.withShellServerReady(ready), null);
   }
 
   public void publishArthasState(ArthasLifecycleManager.State newState) {
     Objects.requireNonNull(newState, "newState");
 
     Event event;
+    boolean resetReady;
     switch (newState) {
       case STARTING:
         event = Event.ARTHAS_STARTING;
+        resetReady = true;
         break;
       case RUNNING:
       case IDLE:
         event = Event.ARTHAS_STARTED;
+        resetReady = false;
         break;
       case STOPPING:
         event = Event.ARTHAS_STOPPING;
+        resetReady = true;
         break;
       case STOPPED:
       default:
         event = Event.ARTHAS_STOPPED;
+        resetReady = true;
         break;
     }
 
-    updateAndPublish(event, s -> s.withArthasState(newState), null);
+    // STOPPED/STOPPING/STARTING 一律清掉 shellServerReady，避免二次 attach 残留上一次的 true
+    boolean clear = resetReady;
+    updateAndPublish(event,
+        s -> clear ? s.withArthasState(newState).withShellServerReady(false)
+            : s.withArthasState(newState),
+        null);
   }
 
   private interface StateUpdater {

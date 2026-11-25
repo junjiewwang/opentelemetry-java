@@ -50,11 +50,15 @@ public final class ArthasTunnelStatusBridge {
   private final ArthasBootstrap arthasBootstrap;
   private final TunnelStatusListener listener;
   private final ArthasLifecycleManager.StartupLogCollector startupLogCollector;
+  private final ShellServerReadinessProbe shellServerProbe;
 
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicReference<TunnelStatus> currentStatus =
       new AtomicReference<>(TunnelStatus.UNKNOWN);
   @Nullable private ScheduledFuture<?> pollTask;
+
+  /** 上一次观测到的 ShellServer listen 状态（volatile：轮询线程与回调线程共享） */
+  private volatile boolean lastShellServerReady = false;
 
   /** 最后一次断线时间（用于计算断线时长） */
   @Nullable private volatile Instant lastDisconnectedAt;
@@ -81,9 +85,20 @@ public final class ArthasTunnelStatusBridge {
       ArthasBootstrap arthasBootstrap,
       TunnelStatusListener listener,
       ArthasLifecycleManager.StartupLogCollector startupLogCollector) {
+    this(arthasBootstrap, listener, startupLogCollector,
+        new ShellServerReadinessProbe.Reflective(arthasBootstrap, startupLogCollector));
+  }
+
+  /** 可注入探测实现的构造函数（测试使用可控桩，不启动真实 Arthas）。 */
+  public ArthasTunnelStatusBridge(
+      ArthasBootstrap arthasBootstrap,
+      TunnelStatusListener listener,
+      ArthasLifecycleManager.StartupLogCollector startupLogCollector,
+      ShellServerReadinessProbe shellServerProbe) {
     this.arthasBootstrap = arthasBootstrap;
     this.listener = listener;
     this.startupLogCollector = startupLogCollector;
+    this.shellServerProbe = shellServerProbe;
   }
 
   /**
@@ -101,6 +116,7 @@ public final class ArthasTunnelStatusBridge {
     // 新一轮启动：重置诊断标记，避免仅记录一次后永久沉默
     loggedInitFailure = false;
     unchangedPollCount = 0;
+    lastShellServerReady = false;
 
     startupLogCollector.addLog("INFO", "Tunnel status bridge starting");
 
@@ -195,6 +211,10 @@ public final class ArthasTunnelStatusBridge {
     }
 
     try {
+      // ShellServer listen 状态独立于 tunnel 状态探测：必须每次轮询都发布变化，
+      // 否则 tunnel 稳定在 REGISTERED 时 awaitTerminalReady 等不到事件
+      pollShellServerReadiness();
+
       TunnelStatus newStatus = fetchTunnelStatus();
       TunnelStatus oldStatus = currentStatus.getAndSet(newStatus);
 
@@ -225,6 +245,28 @@ public final class ArthasTunnelStatusBridge {
       }
       logger.log(Level.FINE, "Error polling tunnel status: {0}", e.getMessage());
     }
+  }
+
+  /** 探测 ShellServer listen 状态，变化时通知监听器（失败保守 false）。 */
+  private void pollShellServerReadiness() {
+    boolean ready;
+    try {
+      ready = shellServerProbe.isListening();
+    } catch (RuntimeException e) {
+      ready = false;
+      if (!loggedInitFailure) {
+        loggedInitFailure = true;
+        startupLogCollector.addLog("WARN", "ShellServer readiness probe failed: " + e);
+      }
+    }
+    if (ready != lastShellServerReady) {
+      lastShellServerReady = ready;
+      startupLogCollector.addLog("INFO",
+          "ShellServer listening status: " + (ready ? "READY" : "NOT_READY"));
+    }
+    // 每次轮询都通知：总线可能在断连/重启时被清场，若只按本地变化通知，
+    // 探测值不变时会永久卡在 false。由 Integration 依据总线当前状态去重发布。
+    listener.onShellServerReady(ready);
   }
 
   /**
@@ -421,7 +463,7 @@ public final class ArthasTunnelStatusBridge {
     }
   }
 
-  /** Tunnel 状态监听器 */
+  /** Tunnel 与本地交互服务状态监听器 */
   public interface TunnelStatusListener {
     /** Tunnel 已连接（WebSocket 建立） */
     void onTunnelConnected();
@@ -431,5 +473,8 @@ public final class ArthasTunnelStatusBridge {
 
     /** Tunnel 已断开 */
     void onTunnelDisconnected(String reason);
+
+    /** ShellServer 本地交互服务 listen 状态变化 */
+    void onShellServerReady(boolean ready);
   }
 }

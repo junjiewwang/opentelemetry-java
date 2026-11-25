@@ -376,7 +376,11 @@ public final class ArthasBootstrap {
    * 检查 Arthas 实例是否真正在运行
    *
    * <p>通过反射调用 Arthas Bootstrap 的 isBind() 方法。
-   * isBind() 在 shellServer.listen() 成功后返回 true，在 destroy() 后返回 false。
+   *
+   * <p>注意：{@code isBindRef} 在 Arthas {@code bind()} 开头即置 true，早于
+   * {@code shellServer.listen()} 完成，因此 isBind() 只能判断「实例未 destroy」，
+   * 不能作为本地交互服务已就绪的信号；就绪判定请用
+   * {@link ShellServerReadinessProbe} 与 {@link ArthasReadinessGate}。
    *
    * @param bootstrap Arthas Bootstrap 实例
    * @return 是否真正在运行
