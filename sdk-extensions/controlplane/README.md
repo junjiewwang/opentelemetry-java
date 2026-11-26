@@ -46,15 +46,22 @@ Arthas is started lazily by an `arthas_attach` task. The WebSocket endpoint used
 by the embedded Arthas `TunnelClient` is resolved in this order:
 
 1. `otel.agent.arthas.tunnel.endpoint` — explicit WS URL, highest priority.
-2. Derived from `otel.agent.control.endpoint` / `otel.exporter.otlp.endpoint`:
-   `http(s)://host:port` becomes `ws(s)://host:port/v1/arthas/ws` (the port can
-   be overridden by `server_metadata.http_port` from the control plane).
+2. `ops.arthas.tunnel_base_url` — admin-managed base URL delivered via
+   `server_metadata`: the scheme is mapped to `ws`/`wss`, `host[:port]` and the
+   path prefix are kept, and the fixed `/v1/arthas/ws` path is appended. Query
+   strings, fragments and userinfo are rejected; invalid values fall back to the
+   derived endpoint.
+3. Derived from `otel.agent.control.endpoint` / `otel.exporter.otlp.endpoint`:
+   `http(s)://host:port` becomes `ws(s)://host:port/v1/arthas/ws`. The port is
+   replaced by `server_metadata.http_port` only when the original URL declares an
+   explicit port; domain / Ingress URLs keep their default 80/443.
 
 | Property | Default | Description |
 |----------|---------|-------------|
 | `otel.agent.control.arthas.enabled` | `true` | Master switch used by auto-configuration |
 | `otel.agent.arthas.enabled` | inherits the master switch | Explicit override; `false` disables Arthas integration |
 | `otel.agent.arthas.tunnel.endpoint` | derived | Explicit Tunnel WebSocket endpoint |
+| `ops.arthas.tunnel_base_url` | n/a | Admin-managed Tunnel base URL (from `server_metadata`) |
 
 Example when the collector is reached through a reverse proxy / Ingress:
 

@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.extension.controlplane.arthas;
 import io.opentelemetry.sdk.extension.controlplane.core.ControlPlaneComponent;
 import io.opentelemetry.sdk.extension.controlplane.core.InstrumentationProvider;
 import io.opentelemetry.sdk.extension.controlplane.core.TaskExecutorProvider;
+import io.opentelemetry.sdk.extension.controlplane.core.model.OpsTunnelOverride;
 import io.opentelemetry.sdk.extension.controlplane.core.model.ServerMetadata;
 import io.opentelemetry.sdk.extension.controlplane.dynamic.DynamicConfigManager.ServerMetadataListener;
 import io.opentelemetry.sdk.extension.controlplane.task.executor.ArthasAttachExecutor;
@@ -87,8 +88,8 @@ public final class ArthasIntegration
   /** 服务端下发的 HTTP 端口（用于修正 gRPC 场景下的 Tunnel 端口） */
   @Nullable private volatile Integer currentServerHttpPort;
 
-  /** 运营端下发的 Tunnel Endpoint（null 表示未配置或已删除） */
-  @Nullable private volatile String opsTunnelEndpoint;
+  /** 运营端下发的 Tunnel 覆盖快照（empty 表示未配置或已删除），整体替换避免中间态 */
+  private volatile OpsTunnelOverride opsOverride = OpsTunnelOverride.empty();
 
   /** 已应用的运维配置 revision，用于心跳上报 */
   @Nullable private volatile String appliedOpsRevision;
@@ -211,7 +212,7 @@ public final class ArthasIntegration
 
     // 初始化有效端点（静态配置 + 已缓存的运营端下发值，动态端口为 null）
     this.currentEffectiveTunnelEndpoint =
-        urlGenerator.resolveEffectiveEndpoint(config, null, opsTunnelEndpoint);
+        urlGenerator.resolveEffectiveEndpoint(config, null, opsOverride);
     this.tunnelEndpointSource = resolveEndpointSource();
     logger.log(Level.FINE, "Initial tunnel endpoint: {0}", currentEffectiveTunnelEndpoint);
 
@@ -317,16 +318,16 @@ public final class ArthasIntegration
 
     // 1. 解析服务端下发的全部相关字段
     Integer newPort = metadata.getHttpPort();
-    String newOpsEndpoint = metadata.getOpsTunnelEndpoint();
+    OpsTunnelOverride newOverride = OpsTunnelOverride.from(metadata);
     String newOpsRevision = metadata.getOpsRevision();
 
     // 2. 更新运行时状态（key 缺失时回退到推导结果）
     this.currentServerHttpPort = newPort;
-    this.opsTunnelEndpoint = newOpsEndpoint;
+    this.opsOverride = newOverride;
     this.appliedOpsRevision = newOpsRevision;
 
     // 3. 以"最终端点是否变化"作为唯一判据，避免端口不变时吞掉运营端变更
-    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newPort, newOpsEndpoint);
+    String newEndpoint = urlGenerator.resolveEffectiveEndpoint(config, newPort, newOverride);
     this.tunnelEndpointSource = resolveEndpointSource();
     if (!urlGenerator.hasEndpointChanged(currentEffectiveTunnelEndpoint, newEndpoint)) {
       return;
@@ -355,7 +356,8 @@ public final class ArthasIntegration
         && !config.getExplicitTunnelEndpoint().isEmpty()) {
       return "local";
     }
-    if (opsTunnelEndpoint != null && !opsTunnelEndpoint.isEmpty()) {
+    // 运营端 base URL 命中时归 ops，保证心跳来源统计与优先级链一致
+    if (opsOverride.hasBaseUrl()) {
       return "ops";
     }
     return currentEffectiveTunnelEndpoint == null ? "none" : "derived";
